@@ -244,7 +244,7 @@ def fetch_forward_messages(lark_client, message_id: str) -> Optional[str]:
         req.http_method = lark.HttpMethod.GET
         req.uri = (
             f"/open-apis/im/v1/messages/{safe_mid}"
-            f"?user_id_type=open_id"
+            f"?user_id_type=open_id&card_msg_content_type=raw_card_content"
         )
         req.token_types = {lark.AccessTokenType.TENANT}
         resp = lark_client.request(req)
@@ -328,9 +328,18 @@ def fetch_forward_messages(lark_client, message_id: str) -> Optional[str]:
                 elif msg_type == "post":
                     child_text = parse_post_content(ct)
                 elif msg_type == "interactive":
-                    child_text = (
-                        parse_interactive_content(ct) or "[卡片消息]"
-                    )
+                    child_text = parse_interactive_content(ct) or ""
+                    _CARD_FALLBACK = "请升级至最新版本客户端，以查看内容"
+                    if not child_text or child_text.strip() == _CARD_FALLBACK:
+                        child_msg_id = child.get("message_id")
+                        if child_msg_id:
+                            card_text = fetch_card_content(
+                                lark_client, child_msg_id,
+                            )
+                            if card_text:
+                                child_text = card_text
+                    if not child_text:
+                        child_text = "[卡片消息]"
                 elif msg_type == "image":
                     child_text = "[图片]"
                 elif msg_type == "file":
