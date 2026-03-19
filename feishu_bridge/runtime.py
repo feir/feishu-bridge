@@ -452,14 +452,24 @@ class ClaudeRunner:
             # main loop; the deferred timer no-ops via poll() check.
             ClaudeRunner._kill_proc_tree(proc)
 
+        # Idle timeout: resets on every stdout line from the CLI.
+        # This keeps long-running but active sessions alive (e.g. multi-hour
+        # tool-use chains) while still killing truly stuck processes.
         timer = threading.Timer(self.timeout, _timeout_kill)
         timer.start()
+
+        def _reset_idle_timer():
+            nonlocal timer
+            timer.cancel()
+            timer = threading.Timer(self.timeout, _timeout_kill)
+            timer.start()
 
         try:
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
                     continue
+                _reset_idle_timer()
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
