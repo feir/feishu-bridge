@@ -123,6 +123,13 @@ def fetch_quoted_message(lark_client, message_id: str) -> Optional[dict]:
             text = parse_post_content(content)
         elif msg_type == "interactive":
             text = parse_interactive_content(content)
+            # CardKit v2 cards are degraded in GetMessage responses;
+            # re-fetch with raw_card_content to get the full body.
+            _CARD_FALLBACK = "请升级至最新版本客户端，以查看内容"
+            if not text or text.strip() == _CARD_FALLBACK:
+                card_text = fetch_card_content(lark_client, message_id)
+                if card_text:
+                    text = card_text
         elif msg_type == "image":
             text = "[图片]"
         elif msg_type == "file":
