@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -174,8 +175,10 @@ def load_config(config_path: str, bot_name: str) -> dict:
     masked = {**bot, "app_secret": "***"}
     log.info("Bot config: %s", json.dumps(masked, ensure_ascii=False))
 
+    all_bot_names = [b["name"] for b in config.get("bots", []) if b.get("name")]
     return {"bot": bot, "claude": claude_cfg, "dedup": config.get("dedup", {}),
-            "todo_auto_drive": config.get("todo_auto_drive", True)}
+            "todo_auto_drive": config.get("todo_auto_drive", True),
+            "all_bot_names": all_bot_names}
 
 # ============================================================
 # Message Processing (Worker)
@@ -228,6 +231,7 @@ class FeishuBot:
         self.allowed_users = self.bot_config.get("allowed_users", ["*"])
         self.allowed_chats = self.bot_config.get("allowed_chats", ["*"])
         self._todo_auto_drive = config.get("todo_auto_drive", True)
+        self._all_bot_names = config.get("all_bot_names", [self.bot_id])
         self._session_cost: dict[str, dict] = {}  # sid -> last {usage, model_usage, total_cost_usd}
 
         # Components
@@ -509,6 +513,48 @@ class FeishuBot:
                     logging.shutdown()
                     os._exit(1)
                 threading.Timer(0.3, _deferred_exit).start()
+                return
+
+            elif cmd == "/restart-all":
+                # Restart all bot instances — restart others via systemctl,
+                # then exit self (systemd restarts this instance).
+                log.info("Restart-all requested by user %s in chat %s",
+                         sender_id, chat_id)
+                other_bots = [n for n in self._all_bot_names if n != self.bot_id]
+                try:
+                    from feishu_bridge.ui import build_restart_card
+                    handle = ResponseHandle(
+                        self.lark_client, chat_id, thread_id, message_id,
+                    )
+                    label = ", ".join(self._all_bot_names)
+                    msg_id = handle._send_card(build_restart_card(
+                        f"正在重启所有实例: {label}"))
+                    if msg_id:
+                        state_dir = Path(self.workspace) / "state" / "feishu-bridge"
+                        state_dir.mkdir(parents=True, exist_ok=True)
+                        restart_file = state_dir / f"restart-{self.bot_id}.json"
+                        restart_file.write_text(json.dumps({
+                            "message_id": msg_id,
+                        }))
+                except Exception:
+                    log.exception("Failed to send restart-all confirmation")
+                # Restart other instances first
+                for name in other_bots:
+                    try:
+                        subprocess.Popen(
+                            ["systemctl", "--user", "restart",
+                             f"feishu-bridge@{name}.service"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        log.info("Triggered restart for feishu-bridge@%s", name)
+                    except Exception:
+                        log.exception("Failed to restart feishu-bridge@%s", name)
+                # Then exit self
+                def _deferred_exit():
+                    logging.shutdown()
+                    os._exit(1)
+                threading.Timer(0.5, _deferred_exit).start()
                 return
 
             elif cmd in ("/new", "/reset", "/clear"):

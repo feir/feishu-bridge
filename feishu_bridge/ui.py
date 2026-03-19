@@ -55,8 +55,9 @@ def set_bot_display_name(name: str):
     _bot_display_name = name
 
 
-def build_restart_card() -> dict:
+def build_restart_card(message: str = "") -> dict:
     """Blue card shown when bridge is about to restart."""
+    text = message or "正在重启，约 10 秒后恢复..."
     return {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -65,7 +66,7 @@ def build_restart_card() -> dict:
         },
         "elements": [{
             "tag": "div",
-            "text": {"content": "正在重启，约 10 秒后恢复...", "tag": "lark_md"},
+            "text": {"content": text, "tag": "lark_md"},
         }],
     }
 
