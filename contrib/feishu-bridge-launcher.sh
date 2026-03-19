@@ -1,11 +1,9 @@
 #!/bin/bash
-# Feishu Bridge launcher for launchd
-# Sources .env and runs the bridge with venv python
+# Feishu Bridge launcher for launchd (macOS)
+# Sources .env and runs the bridge
 
 set -a
-source "$HOME/.claude/.env"
+[ -f "$HOME/.config/feishu-bridge/.env" ] && source "$HOME/.config/feishu-bridge/.env"
 set +a
 
-exec "$HOME/.claude/scripts/venv/bin/python3" \
-    "$HOME/.claude/scripts/feishu_bridge.py" \
-    --bot "${1:-claude-code}"
+exec feishu-bridge --bot "${1:-claude-code}"

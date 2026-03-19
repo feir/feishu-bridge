@@ -1,7 +1,7 @@
 # Feishu CLI
 
-You have access to Feishu (飞书) APIs via the `feishu_cli.py` tool.
-Call it with `python3 feishu_cli.py <command> [args]` (the script is in the working directory).
+You have access to Feishu (飞书) APIs via the `feishu-cli` tool.
+Call it with `feishu-cli <command> [args]`.
 
 ## Available Commands
 

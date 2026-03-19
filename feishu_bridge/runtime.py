@@ -1,5 +1,6 @@
-"""Runtime primitives for Feishu bridge."""
+"""Runtime primitives for Feishu Bridge."""
 
+import contextlib
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict, deque
+from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Optional
 
@@ -20,8 +22,32 @@ DEDUP_MAX = 5000
 QUEUE_MAX = 50
 MAX_PROMPT_CHARS = 50_000
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_BRIDGE_SETTINGS = str(_SCRIPT_DIR / "bridge-settings.json")
+# Static resources — materialized once at startup via ExitStack
+_DATA = files("feishu_bridge.data")
+_resource_stack = contextlib.ExitStack()
+_BRIDGE_SETTINGS_PATH: Optional[str] = None
+_CLI_PROMPT_PATH: Optional[str] = None
+
+
+def materialize_data_files():
+    """Call once at startup. Extracts data files and holds them for process lifetime."""
+    global _BRIDGE_SETTINGS_PATH, _CLI_PROMPT_PATH
+    _BRIDGE_SETTINGS_PATH = str(
+        _resource_stack.enter_context(as_file(_DATA.joinpath("bridge-settings.json")))
+    )
+    _CLI_PROMPT_PATH = str(
+        _resource_stack.enter_context(as_file(_DATA.joinpath("cli_prompt.md")))
+    )
+
+
+def get_bridge_settings_path() -> Optional[str]:
+    """Return materialized bridge-settings.json path."""
+    return _BRIDGE_SETTINGS_PATH
+
+
+def get_cli_prompt_path() -> Optional[str]:
+    """Return materialized cli_prompt.md path."""
+    return _CLI_PROMPT_PATH
 
 EMPTY_RESULT_MESSAGE = "Claude 本次未返回任何内容，请稍后重试。"
 SILENT_OK_MESSAGE = "✓ 操作已完成（无文本输出）"
@@ -213,7 +239,8 @@ class ClaudeRunner:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _kill_proc_tree(proc: subprocess.Popen):
+    def _force_kill(proc: subprocess.Popen):
+        """Send SIGKILL to process tree (last resort)."""
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -222,6 +249,30 @@ class ClaudeRunner:
             proc.kill()
         except ProcessLookupError:
             pass
+
+    @staticmethod
+    def _kill_proc_tree(proc: subprocess.Popen, graceful_timeout: float = 15):
+        """Non-blocking graceful kill: SIGTERM now, SIGKILL after grace period.
+
+        Does NOT call proc.wait() — the caller's main thread handles reaping.
+        This avoids concurrent proc.wait() races when called from a Timer thread.
+        """
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, PermissionError):
+            return
+        # Phase 1: send SIGTERM (non-blocking)
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            return
+        # Phase 2: schedule SIGKILL after grace period (non-blocking)
+        def _deferred_sigkill():
+            if proc.poll() is None:  # Still alive
+                log.warning("Process %d did not exit after SIGTERM (%ds), sending SIGKILL",
+                            proc.pid, graceful_timeout)
+                ClaudeRunner._force_kill(proc)
+        threading.Timer(graceful_timeout, _deferred_sigkill).start()
 
     def cancel(self, tag: str) -> bool:
         with self._lock:
@@ -255,7 +306,7 @@ class ClaudeRunner:
         args = [
             self.command, "-p",
             "--dangerously-skip-permissions",
-            "--settings", _BRIDGE_SETTINGS,
+            "--settings", get_bridge_settings_path(),
             "--model", self.model,
             "--append-system-prompt",
             self._build_system_prompt(),
@@ -313,6 +364,8 @@ class ClaudeRunner:
         try:
             stdout, stderr = proc.communicate(timeout=self.timeout)
         except subprocess.TimeoutExpired:
+            # Graceful kill: SIGTERM + deferred SIGKILL. proc.communicate()
+            # blocks until exit — will unblock after SIGTERM or deferred SIGKILL.
             self._kill_proc_tree(proc)
             proc.communicate()
             return {
@@ -376,6 +429,7 @@ class ClaudeRunner:
     def _run_streaming(self, proc, session_id, tag, on_output) -> dict:
         accumulated = ""
         final_result = None
+        last_call_usage = None  # per-call usage from last assistant event
         timed_out = False
         stderr_lines = []
 
@@ -408,7 +462,14 @@ class ClaudeRunner:
                 if etype == "result":
                     final_result = event
                     break
-                if etype == "stream_event":
+                if etype == "assistant":
+                    # Capture per-call usage from each assistant message.
+                    # The CLI emits one assistant event per API sub-call;
+                    # the last one reflects the actual context window fill.
+                    msg_usage = event.get("message", {}).get("usage")
+                    if msg_usage:
+                        last_call_usage = msg_usage
+                elif etype == "stream_event":
                     inner = event.get("event", {})
                     if (inner.get("type") == "content_block_delta"
                             and inner.get("delta", {}).get("type") == "text_delta"):
@@ -417,7 +478,7 @@ class ClaudeRunner:
 
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            self._kill_proc_tree(proc)
+            self._force_kill(proc)
             proc.wait()
             return {
                 "result": f"Claude 超时（{self.timeout}s）",
@@ -425,7 +486,7 @@ class ClaudeRunner:
                 "is_error": True,
             }
         except Exception:
-            self._kill_proc_tree(proc)
+            self._force_kill(proc)
             proc.wait()
             raise
         finally:
@@ -462,6 +523,7 @@ class ClaudeRunner:
                     "session_id": final_result.get("session_id", session_id),
                     "is_error": False,
                     "usage": final_result.get("usage"),
+                    "last_call_usage": last_call_usage,
                     "modelUsage": final_result.get("modelUsage"),
                     "total_cost_usd": final_result.get("total_cost_usd"),
                 }
@@ -476,6 +538,7 @@ class ClaudeRunner:
                 "session_id": final_result.get("session_id", session_id),
                 "is_error": final_result.get("is_error", False),
                 "usage": final_result.get("usage"),
+                "last_call_usage": last_call_usage,
                 "modelUsage": final_result.get("modelUsage"),
                 "total_cost_usd": final_result.get("total_cost_usd"),
             }

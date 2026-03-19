@@ -50,7 +50,14 @@ def _load_auth():
 def _load_config():
     """Load app credentials from bridge config."""
     bot_name = os.environ.get("FEISHU_BOT_NAME")
-    config_path = SCRIPT_DIR / "feishu_bridge_config.json"
+
+    # Use shared config discovery chain
+    from feishu_bridge.config import resolve_config_path
+    try:
+        config_path = resolve_config_path()
+    except SystemExit:
+        print(json.dumps({"error": "No config file found. Set $FEISHU_BRIDGE_CONFIG or create ~/.config/feishu-bridge/config.json"}))
+        sys.exit(1)
 
     try:
         with open(config_path) as f:

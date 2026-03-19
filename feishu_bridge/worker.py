@@ -5,11 +5,54 @@ import logging
 import os
 import uuid
 
-from feishu_bridge.parsers import download_image, fetch_quoted_message
+from feishu_bridge.parsers import (
+    download_image,
+    fetch_card_content,
+    fetch_forward_messages,
+    fetch_quoted_message,
+)
 from feishu_bridge.runtime import ClaudeRunner, SessionMap
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
 
 log = logging.getLogger("feishu-bridge")
+
+
+def _context_health_alert(result: dict) -> str | None:
+    """Check context utilization and return an alert suffix, or None.
+
+    Prefers ``last_call_usage`` (per-API-call metrics from the last
+    assistant event) over ``usage`` (which the CLI aggregates across
+    all sub-calls in a turn and therefore over-counts).
+    """
+    usage = result.get("last_call_usage") or result.get("usage")
+    if not usage:
+        return None
+    inp = usage.get("input_tokens", 0)
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    cache_create = usage.get("cache_creation_input_tokens", 0)
+    total_ctx = inp + cache_read + cache_create
+    if total_ctx == 0:
+        return None
+
+    # Determine context window from modelUsage
+    max_ctx = 200_000  # conservative default
+    model_usage = result.get("modelUsage", {})
+    for _model, mu in model_usage.items():
+        cw = mu.get("contextWindow", 0)
+        if cw > 0:
+            max_ctx = cw
+            break
+
+    pct = total_ctx / max_ctx * 100
+    if pct >= 85:
+        return (
+            f"\n\n---\n🔴 Context {pct:.0f}% — 建议 `/new` 新会话或 `/compact` 压缩"
+        )
+    if pct >= 70:
+        return (
+            f"\n\n---\n🟡 Context {pct:.0f}% — 可考虑 `/compact` 压缩上下文"
+        )
+    return None
 
 
 def format_task_detail_bridge(task: dict) -> str:
@@ -68,6 +111,8 @@ def process_message(
     feishu_api_error_cls=None,
     response_handle_cls=ResponseHandle,
     download_image_fn=download_image,
+    fetch_card_content_fn=fetch_card_content,
+    fetch_forward_messages_fn=fetch_forward_messages,
     fetch_quoted_message_fn=fetch_quoted_message,
     remove_typing_indicator_fn=remove_typing_indicator,
     session_not_found_signatures=None,
@@ -115,6 +160,41 @@ def process_message(
                 sender_label = "Bot" if st == "app" else ("User" if st == "user" else "Unknown")
                 quote_header = f"[引用消息 message_id={parent_id} from={sender_label}]"
                 text = f"{quote_header}\n{quoted['content']}\n[/引用消息]\n\n{text}"
+
+        # --- Re-fetch degraded card content via API ---
+        # Replace the placeholder (always at the end of text, after any quote prefix).
+        # Use rfind to target the last occurrence — avoids replacing identical text
+        # that might appear inside a prepended quote block.
+        card_mid = item.get("_card_message_id")
+        if card_mid and fetch_card_content_fn:
+            card_text = fetch_card_content_fn(lark_client, card_mid)
+            if card_text:
+                original_text = item.get("text", "")
+                if original_text:
+                    pos = text.rfind(original_text)
+                    if pos >= 0:
+                        text = text[:pos] + card_text + text[pos + len(original_text):]
+                    else:
+                        text = card_text
+                else:
+                    text = card_text
+                log.info("Re-fetched card content for %s", card_mid)
+
+        # --- Expand merge_forward sub-messages via API ---
+        forward_mid = item.get("_merge_forward_message_id")
+        if forward_mid and fetch_forward_messages_fn:
+            forward_text = fetch_forward_messages_fn(lark_client, forward_mid)
+            if forward_text:
+                original_text = item.get("text", "")
+                if original_text:
+                    pos = text.rfind(original_text)
+                    if pos >= 0:
+                        text = text[:pos] + forward_text + text[pos + len(original_text):]
+                    else:
+                        text = forward_text
+                else:
+                    text = forward_text
+                log.info("Expanded merge_forward for %s", forward_mid)
 
         # --- Auto-fetch Feishu doc/wiki/sheet content from URLs in message ---
         feishu_urls = item.get("_feishu_urls") or []
@@ -448,11 +528,21 @@ def process_message(
             if cost_store is not None and (
                 result.get("usage") or result.get("total_cost_usd")
             ):
+                existing = cost_store.get(effective_sid, {})
+                prev_accumulated = existing.get("accumulated_cost_usd", 0)
                 cost_store[effective_sid] = {
                     "usage": result.get("usage", {}),
+                    "last_call_usage": result.get("last_call_usage"),
                     "model_usage": result.get("modelUsage", {}),
                     "total_cost_usd": result.get("total_cost_usd", 0),
+                    "accumulated_cost_usd": prev_accumulated + (result.get("total_cost_usd") or 0),
                 }
+
+        # --- Context health alert ---
+        if effective_sid and not result.get("is_error"):
+            ctx_alert = _context_health_alert(result)
+            if ctx_alert:
+                result["result"] = (result.get("result") or "") + ctx_alert
 
         if not handle._terminated:
             handle.deliver(result["result"], is_error=result["is_error"])

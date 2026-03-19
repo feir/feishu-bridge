@@ -108,17 +108,19 @@ class BridgeCommandHandler:
             if cost_info:
                 usage = cost_info.get("usage", {})
                 model_usage = cost_info.get("model_usage", {})
-                total_cost = cost_info.get("total_cost_usd", 0)
+                turn_cost = cost_info.get("total_cost_usd", 0)
+                accumulated = cost_info.get("accumulated_cost_usd", turn_cost)
                 inp = usage.get("input_tokens", 0)
                 out = usage.get("output_tokens", 0)
                 cache_read = usage.get("cache_read_input_tokens", 0)
                 cache_create = usage.get("cache_creation_input_tokens", 0)
                 lines = [
-                    "**会话用量（最近一次调用）**",
+                    "**会话用量**",
                     f"输入: {inp:,} tokens",
                     f"  cache read: {cache_read:,} / cache create: {cache_create:,}",
                     f"输出: {out:,} tokens",
-                    f"费用: ${total_cost:.4f}",
+                    f"本次费用: ${turn_cost:.4f}",
+                    f"累计费用: **${accumulated:.4f}**",
                 ]
                 if model_usage:
                     lines.append("")
@@ -141,26 +143,41 @@ class BridgeCommandHandler:
             if not cost_info or not cost_info.get("usage"):
                 handle.deliver("暂无 context 数据（首次消息后可用）。")
                 return
-            usage = cost_info["usage"]
+            # Prefer last_call_usage (per-API-call) over cumulative usage
+            usage = cost_info.get("last_call_usage") or cost_info["usage"]
+            model_usage = cost_info.get("model_usage", {})
             inp = usage.get("input_tokens", 0)
             cache_read = usage.get("cache_read_input_tokens", 0)
-            max_ctx = 1_000_000
-            compact_pct = 85
-            pct = inp / max_ctx * 100 if max_ctx else 0
+            cache_create = usage.get("cache_creation_input_tokens", 0)
+            total_ctx = inp + cache_read + cache_create
+            # Use actual context window from modelUsage, fallback 200K
+            max_ctx = 200_000
+            model_name = ""
+            for m, mu in model_usage.items():
+                cw = mu.get("contextWindow", 0)
+                if cw > 0:
+                    max_ctx = cw
+                    model_name = m
+                    break
+            pct = total_ctx / max_ctx * 100 if max_ctx else 0
             filled = int(pct / 5)
             bar = "\u2593" * filled + "\u2591" * (20 - filled)
             lines = [
                 "**Context 使用率**",
                 f"`{bar}` {pct:.1f}%",
-                f"{inp:,} / {max_ctx:,} tokens",
+                f"{total_ctx:,} / {max_ctx:,} tokens",
             ]
+            if model_name:
+                lines.append(f"模型: {model_name}")
             if cache_read:
-                cache_pct = cache_read / inp * 100 if inp else 0
+                cache_pct = cache_read / total_ctx * 100 if total_ctx else 0
                 lines.append(f"cache hit: {cache_read:,} ({cache_pct:.0f}%)")
-            if pct >= compact_pct:
-                lines.append(f"\u26a0\ufe0f 已超过 {compact_pct}% 阈值，即将自动压缩")
-            elif pct >= compact_pct * 0.8:
-                lines.append(f"\U0001f4a1 接近 {compact_pct}% 自动压缩线，可考虑 `/compact`")
+            accumulated = cost_info.get("accumulated_cost_usd", cost_info.get("total_cost_usd", 0))
+            lines.append(f"累计费用: ${accumulated:.4f}")
+            if pct >= 85:
+                lines.append("\U0001f534 建议 `/new` 新会话或 `/compact` 压缩")
+            elif pct >= 70:
+                lines.append("\U0001f7e1 接近上限，可考虑 `/compact`")
             handle.deliver("\n".join(lines))
 
         elif cmd == "feishu-tasks":

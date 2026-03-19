@@ -2,6 +2,7 @@
 
 import json
 import logging
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -43,7 +44,33 @@ def parse_post_content(content: dict) -> str:
 
 
 def parse_interactive_content(content: dict) -> Optional[str]:
-    """Parse Feishu interactive (card) message content into plain text."""
+    """Parse Feishu interactive (card) message content into plain text.
+
+    Supports both legacy card format (schema 1.0: content.elements)
+    and CardKit v2 format (schema 2.0: content.body.elements with "tag": "markdown").
+    """
+    # CardKit v2: elements under body.elements, text in "content" key
+    body = content.get("body")
+    if content.get("schema") == "2.0" or (isinstance(body, dict) and "elements" in body):
+        elements = content.get("body", {}).get("elements", [])
+        parts = []
+        for el in elements:
+            if isinstance(el, dict):
+                tag = el.get("tag", "")
+                if tag == "markdown":
+                    parts.append(el.get("content", ""))
+                elif tag == "div":
+                    text_obj = el.get("text", {})
+                    if isinstance(text_obj, dict):
+                        parts.append(text_obj.get("content", ""))
+                    elif isinstance(text_obj, str):
+                        parts.append(text_obj)
+        text_result = "\n".join(p for p in parts if p)
+        if text_result:
+            return text_result
+        # Fall through to legacy parsing if v2 extraction yielded nothing
+
+    # Legacy card format: elements at top level
     elements = content.get("elements", [])
     parts = []
     for el in elements:
@@ -126,6 +153,217 @@ def fetch_quoted_message(lark_client, message_id: str) -> Optional[dict]:
         }
     except Exception:
         log.exception("Fetch quoted message error")
+        return None
+
+
+def fetch_card_content(lark_client, message_id: str) -> Optional[str]:
+    """Re-fetch an interactive message with raw_card_content to get full v2 card body.
+
+    Feishu event pushes for CardKit v2 cards may deliver degraded content
+    ("请升级至最新版本客户端，以查看内容"). Re-fetching via API with
+    card_msg_content_type=raw_card_content returns the full card JSON.
+
+    Returns formatted text (with title prefix) on success, None on failure.
+    """
+    try:
+        import lark_oapi as lark
+
+        safe_mid = urllib.parse.quote(message_id, safe="")
+        req = lark.BaseRequest()
+        req.http_method = lark.HttpMethod.GET
+        req.uri = (
+            f"/open-apis/im/v1/messages/{safe_mid}"
+            f"?user_id_type=open_id&card_msg_content_type=raw_card_content"
+        )
+        req.token_types = {lark.AccessTokenType.TENANT}
+        resp = lark_client.request(req)
+
+        if resp.code != 0:
+            log.debug("fetch_card_content: code=%s msg=%s",
+                      resp.code, getattr(resp, "msg", ""))
+            return None
+
+        body = json.loads(resp.raw.content)
+        items = body.get("data", {}).get("items", [])
+        if not items:
+            return None
+
+        raw_content = items[0].get("body", {}).get("content")
+        if not raw_content:
+            return None
+
+        card = json.loads(raw_content)
+        text = parse_interactive_content(card)
+        if not text:
+            return None
+
+        # Extract title from v2 card header or legacy title field
+        title = ""
+        header = card.get("header")
+        if isinstance(header, dict):
+            title_obj = header.get("title")
+            if isinstance(title_obj, dict):
+                title = title_obj.get("content", "")
+            elif isinstance(title_obj, str):
+                title = title_obj
+        if not title:
+            title = card.get("title", "")
+
+        if title:
+            return f"[转发卡片: {title}]\n{text}"
+        return f"[转发卡片]\n{text}"
+
+    except Exception:
+        log.exception("fetch_card_content error for %s", message_id)
+        return None
+
+
+def fetch_forward_messages(lark_client, message_id: str) -> Optional[str]:
+    """Fetch and expand sub-messages of a merge_forward message.
+
+    The Feishu API returns all nested sub-messages in a single flat items[]
+    array with upper_message_id for parent-child relationships. We build a
+    tree from this flat list and format recursively — one API call regardless
+    of nesting depth.
+
+    Returns XML-formatted text on success, None on failure.
+    """
+    try:
+        import lark_oapi as lark
+        from datetime import datetime, timezone, timedelta
+
+        safe_mid = urllib.parse.quote(message_id, safe="")
+        req = lark.BaseRequest()
+        req.http_method = lark.HttpMethod.GET
+        req.uri = (
+            f"/open-apis/im/v1/messages/{safe_mid}"
+            f"?user_id_type=open_id"
+        )
+        req.token_types = {lark.AccessTokenType.TENANT}
+        resp = lark_client.request(req)
+
+        if resp.code != 0:
+            log.debug("fetch_forward_messages: code=%s msg=%s",
+                      resp.code, getattr(resp, "msg", ""))
+            return None
+
+        body = json.loads(resp.raw.content)
+        items = body.get("data", {}).get("items", [])
+        if not items:
+            return None
+
+        # Build children map: parent_id -> [child_items]
+        children_map: dict[str, list] = {}
+        for item in items:
+            item_id = item.get("message_id", "")
+            upper = item.get("upper_message_id")
+            # Skip root container itself
+            if item_id == message_id and not upper:
+                continue
+            parent = upper or message_id
+            children_map.setdefault(parent, []).append(item)
+
+        # Sort each group by create_time ascending
+        def _safe_ts(x):
+            try:
+                return int(str(x.get("create_time") or "0")[:13])
+            except (ValueError, TypeError):
+                return 0
+
+        for children in children_map.values():
+            children.sort(key=_safe_ts)
+
+        bj_tz = timezone(timedelta(hours=8))
+        _MAX_DEPTH = 10
+
+        def _format_subtree(
+            parent_id: str, depth: int = 0,
+            _ancestors: frozenset = frozenset(),
+        ) -> str:
+            if depth > _MAX_DEPTH or parent_id in _ancestors:
+                return "[合并转发消息 (嵌套过深)]"
+            _ancestors = _ancestors | {parent_id}
+            children = children_map.get(parent_id, [])
+            if not children:
+                return ""
+            parts = []
+            indent = "  " * depth
+            for child in children:
+                msg_type = child.get("msg_type", "text")
+                sender = child.get("sender", {})
+                sender_id = sender.get("id", "unknown")
+                create_time = child.get("create_time")
+
+                ts_str = ""
+                if create_time:
+                    try:
+                        ts_ms = int(str(create_time)[:13])
+                        dt = datetime.fromtimestamp(ts_ms / 1000, tz=bj_tz)
+                        ts_str = dt.strftime("%m-%d %H:%M")
+                    except (ValueError, OSError):
+                        pass
+
+                raw = child.get("body", {}).get("content", "{}")
+                try:
+                    ct = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    ct = {}
+
+                if msg_type == "merge_forward":
+                    nested_id = child.get("message_id")
+                    nested = (
+                        _format_subtree(nested_id, depth + 1, _ancestors)
+                        if nested_id else ""
+                    )
+                    child_text = nested or "[合并转发消息]"
+                elif msg_type == "text":
+                    child_text = ct.get("text", "")
+                elif msg_type == "post":
+                    child_text = parse_post_content(ct)
+                elif msg_type == "interactive":
+                    child_text = (
+                        parse_interactive_content(ct) or "[卡片消息]"
+                    )
+                elif msg_type == "image":
+                    child_text = "[图片]"
+                elif msg_type == "file":
+                    child_text = f"[文件: {ct.get('file_name', '附件')}]"
+                elif msg_type == "sticker":
+                    child_text = "[表情]"
+                elif msg_type == "media":
+                    child_text = f"[媒体: {ct.get('file_name', '媒体')}]"
+                else:
+                    child_text = f"[{msg_type}]"
+
+                line_hdr = (
+                    f"{indent}[{ts_str}] {sender_id}:"
+                    if ts_str
+                    else f"{indent}{sender_id}:"
+                )
+                content_lines = child_text.split("\n")
+                indented = "\n".join(
+                    f"{indent}  {line}" for line in content_lines
+                )
+                parts.append(f"{line_hdr}\n{indented}")
+
+            return "\n".join(parts)
+
+        formatted = _format_subtree(message_id)
+        if not formatted:
+            return None
+
+        # Truncate based on final output length (including XML wrapper)
+        _WRAPPER_OVERHEAD = len("<forwarded_messages>\n\n</forwarded_messages>")
+        _SUFFIX = "\n... (转发消息过长，已截断)"
+        _MAX_LEN = 8000
+        budget = _MAX_LEN - _WRAPPER_OVERHEAD - len(_SUFFIX)
+        if len(formatted) > budget:
+            formatted = formatted[:budget] + _SUFFIX
+
+        return f"<forwarded_messages>\n{formatted}\n</forwarded_messages>"
+
+    except Exception:
+        log.exception("fetch_forward_messages error for %s", message_id)
         return None
 
 

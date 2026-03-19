@@ -31,7 +31,14 @@ _FEISHU_URL_RE = re.compile(
     r'/(?P<token>[A-Za-z0-9_-]+)',
 )
 
-from feishu_bridge.parsers import download_image, fetch_quoted_message, parse_post_content
+from feishu_bridge.parsers import (
+    download_image,
+    fetch_card_content,
+    fetch_forward_messages,
+    fetch_quoted_message,
+    parse_interactive_content,
+    parse_post_content,
+)
 from feishu_bridge.commands import BridgeCommandHandler
 from feishu_bridge.runtime import (
     ChatTaskQueue,
@@ -43,6 +50,9 @@ from feishu_bridge.runtime import (
     QUEUE_MAX,
     SessionMap,
     SessionQueueFull,
+    get_cli_prompt_path,
+    materialize_data_files,
+    _resource_stack,
 )
 from feishu_bridge.ui import (
     ResponseHandle,
@@ -62,6 +72,8 @@ from feishu_bridge.api.wiki import FeishuWiki
 from feishu_bridge.api.comments import FeishuComments
 from feishu_bridge.api.calendar import FeishuCalendar
 from feishu_bridge.api.search import FeishuSearch
+
+_FEISHU_SERVICES_OK = True  # All deps are declared in pyproject.toml
 
 # ============================================================
 # Constants
@@ -189,6 +201,8 @@ def process_message(item: dict, bot_config: dict, lark_client,
         feishu_api_error_cls=FeishuAPIError,
         response_handle_cls=ResponseHandle,
         download_image_fn=download_image,
+        fetch_card_content_fn=fetch_card_content,
+        fetch_forward_messages_fn=fetch_forward_messages,
         fetch_quoted_message_fn=fetch_quoted_message,
         remove_typing_indicator_fn=remove_typing_indicator,
         session_not_found_signatures=SESSION_NOT_FOUND_SIGNATURES,
@@ -224,13 +238,15 @@ class FeishuBot:
         self.session_map = SessionMap(
             Path(self.workspace) / "state" / "feishu-bridge" / f"sessions-{self.bot_id}.json"
         )
-        # Load CLI prompt for Feishu operations
-        _cli_prompt_path = Path(__file__).resolve().parent / "feishu_cli_prompt.md"
+        # Load CLI prompt for Feishu operations (materialized via importlib.resources)
         _extra_prompts = []
-        if _cli_prompt_path.exists():
-            _cli_text = _cli_prompt_path.read_text()
-            _cli_abs = str(Path(__file__).resolve().parent / "feishu_cli.py")
-            _cli_text = _cli_text.replace("python3 feishu_cli.py", f"python3 {_cli_abs}")
+        _cli_prompt = get_cli_prompt_path()
+        if _cli_prompt:
+            _cli_text = Path(_cli_prompt).read_text()
+            # Resolve feishu-cli to absolute path for subprocess invocation
+            _cli_abs = shutil.which("feishu-cli")
+            if _cli_abs:
+                _cli_text = _cli_text.replace("feishu-cli", _cli_abs)
             _extra_prompts.append(_cli_text)
 
         self.runner = ClaudeRunner(
@@ -369,6 +385,8 @@ class FeishuBot:
                 content = {}
 
             _todo_task_id = None  # set by todo branch when auto_drive=True
+            _card_message_id = None  # set for interactive msgs needing API re-fetch
+            _merge_forward_message_id = None  # set for merge_forward expansion
 
             if msg_type == "text":
                 text = content.get("text", "")
@@ -421,6 +439,29 @@ class FeishuBot:
                 # Config guard: auto-drive stores task_id for worker-thread API calls
                 if self._todo_auto_drive and task_id:
                     _todo_task_id = task_id
+
+            elif msg_type == "interactive":
+                # Forwarded card message — extract text from card elements
+                card_title = content.get("title", "")
+                card_text = parse_interactive_content(content)
+                # Feishu replaces CardKit v2 content with this unhelpful fallback
+                _CARD_FALLBACK = "请升级至最新版本客户端，以查看内容"
+                if card_text and card_text.strip() != _CARD_FALLBACK:
+                    text = card_text
+                    if card_title:
+                        text = f"[转发卡片: {card_title}]\n{text}"
+                else:
+                    # Content degraded — worker will re-fetch via API
+                    _card_message_id = message_id
+                    if card_title:
+                        text = f"[用户转发了一条卡片消息: {card_title}]"
+                    else:
+                        text = "[用户转发了一条卡片消息，内容无法解析]"
+
+            elif msg_type == "merge_forward":
+                # Forwarded message bundle — worker will expand via API
+                _merge_forward_message_id = message_id
+                text = "[用户转发了一条合并消息，正在展开...]"
 
             else:
                 log.info("Unsupported msg_type: %s content=%s",
@@ -567,6 +608,8 @@ class FeishuBot:
                 "image_key": image_key,
                 "_queued_reaction_id": None,
                 "_todo_task_id": _todo_task_id,
+                "_card_message_id": _card_message_id,
+                "_merge_forward_message_id": _merge_forward_message_id,
                 "_feishu_urls": _feishu_urls,
                 "_cost_store": self._session_cost,
             }
@@ -785,8 +828,8 @@ def main():
     parser.add_argument("--bot", required=True, help="Bot name from config")
     parser.add_argument(
         "--config",
-        default=str(Path("~/.claude/scripts/feishu_bridge_config.json").expanduser()),
-        help="Config file path",
+        default=None,
+        help="Config file path (default: $FEISHU_BRIDGE_CONFIG or ~/.config/feishu-bridge/config.json)",
     )
     parser.add_argument(
         "--log-level", default="INFO",
@@ -801,8 +844,15 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Materialize packaged data files (bridge-settings.json, cli_prompt.md)
+    import atexit
+    materialize_data_files()
+    atexit.register(_resource_stack.close)
+
     # Load config
-    config = load_config(args.config, args.bot)
+    from feishu_bridge.config import resolve_config_path
+    config_path = resolve_config_path(args.config)
+    config = load_config(config_path, args.bot)
 
     # Create bot and run startup tasks in parallel
     bot = FeishuBot(config)

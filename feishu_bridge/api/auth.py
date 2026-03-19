@@ -32,10 +32,32 @@ FEISHU_DEVICE_AUTH_URL = "https://accounts.feishu.cn/oauth/v1/device_authorizati
 FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
 FEISHU_USER_INFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
 
-TOKEN_DIR = Path.home() / ".claude" / "data" / "feishu-tokens"
+TOKEN_DIR = Path.home() / ".local" / "share" / "feishu-bridge" / "tokens"
+_OLD_TOKEN_DIR = Path.home() / ".claude" / "data" / "feishu-tokens"
+_migrated_dirs: set = set()
 REFRESH_AHEAD_S = 300  # refresh 5 min before expiry
 POLL_INTERVAL = 5      # seconds between token polls
 POLL_MAX_WAIT = 300    # 5 min max wait for user to authorize
+
+
+def _migrate_legacy_token_dir():
+    """One-time copy of .enc files from old path to new TOKEN_DIR (per target dir)."""
+    if TOKEN_DIR in _migrated_dirs:
+        return
+    _migrated_dirs.add(TOKEN_DIR)
+    if not _OLD_TOKEN_DIR.exists():
+        return
+    import shutil
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for enc_file in _OLD_TOKEN_DIR.glob("*.enc"):
+        dest = TOKEN_DIR / enc_file.name
+        if dest.exists():
+            continue  # skip if exists — 保证幂等
+        try:
+            shutil.copy2(enc_file, dest)
+            log.info("Migrated token: %s → %s", enc_file, dest)
+        except OSError as e:
+            log.warning("Token migration failed for %s: %s (will re-auth)", enc_file.name, e)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +126,7 @@ def save_token(app_id: str, user_open_id: str, token_data: dict):
 
 def load_token(app_id: str, user_open_id: str) -> Optional[dict]:
     """Load and decrypt token from disk. Returns None if missing/corrupt."""
+    _migrate_legacy_token_dir()
     path = _token_path(app_id, user_open_id)
     if not path.exists():
         return None

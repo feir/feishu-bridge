@@ -4,17 +4,18 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/.openclaw/workspace
-EnvironmentFile=%h/.claude/.env
-ExecStart=/usr/bin/python3 %h/.claude/scripts/feishu_bridge.py --bot %i
+ExecStart=%h/.local/bin/feishu-bridge --bot %i
 Restart=always
 RestartSec=2
+
+# Environment (adjust path as needed)
+EnvironmentFile=-%h/.config/feishu-bridge/.env
 
 # Security hardening
 MemoryMax=2G
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=%h/.openclaw %h/.claude %h/portfolio /tmp
+ReadWritePaths=%h/.local %h/.config /tmp
 StandardOutput=journal
 StandardError=journal
 
