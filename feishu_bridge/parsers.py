@@ -246,13 +246,22 @@ def fetch_card_content(lark_client, message_id: str) -> Optional[str]:
             return None
 
         card = json.loads(raw_content)
+
+        # Unwrap json_card wrapper (used by forwarded cards)
+        inner_card = card
+        if "json_card" in card:
+            try:
+                inner_card = json.loads(card["json_card"])
+            except (json.JSONDecodeError, TypeError):
+                inner_card = card
+
         text = parse_interactive_content(card)
         if not text:
             return None
 
         # Extract title from v2 card header or legacy title field
         title = ""
-        header = card.get("header")
+        header = inner_card.get("header")
         if isinstance(header, dict):
             title_obj = header.get("title")
             if isinstance(title_obj, dict):
@@ -260,7 +269,7 @@ def fetch_card_content(lark_client, message_id: str) -> Optional[str]:
             elif isinstance(title_obj, str):
                 title = title_obj
         if not title:
-            title = card.get("title", "")
+            title = inner_card.get("title", "")
 
         if title:
             return f"[转发卡片: {title}]\n{text}"
