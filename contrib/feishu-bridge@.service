@@ -1,0 +1,26 @@
+[Unit]
+Description=Feishu Bridge (%i)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.openclaw/workspace
+EnvironmentFile=%h/.claude/.env
+ExecStart=/usr/bin/python3 %h/.claude/scripts/feishu_bridge.py --bot %i
+Restart=always
+RestartSec=2
+
+# Security hardening
+MemoryMax=2G
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.openclaw %h/.claude %h/portfolio /tmp
+StandardOutput=journal
+StandardError=journal
+
+# Prevent infinite restart loops
+StartLimitIntervalSec=120
+StartLimitBurst=8
+
+[Install]
+WantedBy=default.target

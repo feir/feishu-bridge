@@ -1,0 +1,23 @@
+{
+  "env": {
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "85"
+  },
+  "permissions": {
+    "allow": [],
+    "deny": [
+      "Bash(systemctl *feishu-bridge*)",
+      "Bash(shutdown *)",
+      "Bash(reboot)",
+      "Bash(halt)",
+      "Bash(mkfs *)",
+      "Bash(dd if=*)",
+      "Bash(npm publish*)",
+      "Bash(kubectl *)",
+      "Bash(kill -9 *)",
+      "Bash(killall *)",
+      "Bash(curl *)",
+      "Bash(wget *)"
+    ],
+    "ask": []
+  }
+}
