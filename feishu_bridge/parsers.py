@@ -259,21 +259,7 @@ def fetch_card_content(lark_client, message_id: str) -> Optional[str]:
         if not text:
             return None
 
-        # Extract title from v2 card header or legacy title field
-        title = ""
-        header = inner_card.get("header")
-        if isinstance(header, dict):
-            title_obj = header.get("title")
-            if isinstance(title_obj, dict):
-                title = title_obj.get("content", "")
-            elif isinstance(title_obj, str):
-                title = title_obj
-        if not title:
-            title = inner_card.get("title", "")
-
-        if title:
-            return f"[转发卡片: {title}]\n{text}"
-        return f"[转发卡片]\n{text}"
+        return text
 
     except Exception:
         log.exception("fetch_card_content error for %s", message_id)
