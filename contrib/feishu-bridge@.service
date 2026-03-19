@@ -15,7 +15,7 @@ EnvironmentFile=-%h/.config/feishu-bridge/.env
 MemoryMax=2G
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=%h/.local %h/.config /tmp
+ReadWritePaths=%h/.local %h/.config %h/.openclaw %h/.claude /tmp
 StandardOutput=journal
 StandardError=journal
 
