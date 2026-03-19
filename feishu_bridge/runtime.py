@@ -266,7 +266,11 @@ class ClaudeRunner:
             os.killpg(pgid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             return
-        # Phase 2: schedule SIGKILL after grace period (non-blocking)
+        # Phase 2: schedule SIGKILL after grace period (non-blocking).
+        # The Timer is a non-daemon thread, so it keeps the process alive
+        # until it fires. If the child exits before the timer, poll()
+        # returns non-None and we skip the SIGKILL — the Timer then
+        # exits cleanly with no side effects.
         def _deferred_sigkill():
             if proc.poll() is None:  # Still alive
                 log.warning("Process %d did not exit after SIGTERM (%ds), sending SIGKILL",
@@ -443,6 +447,9 @@ class ClaudeRunner:
         def _timeout_kill():
             nonlocal timed_out
             timed_out = True
+            # Graceful kill spawns its own deferred SIGKILL Timer (15s).
+            # If the process exits from SIGTERM, stdout EOF unblocks the
+            # main loop; the deferred timer no-ops via poll() check.
             ClaudeRunner._kill_proc_tree(proc)
 
         timer = threading.Timer(self.timeout, _timeout_kill)
