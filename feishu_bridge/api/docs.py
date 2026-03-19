@@ -30,18 +30,20 @@ class FeishuDocs(FeishuAPI):
 
     def fetch(self, chat_id: str, user_open_id: str,
               doc_id: str, offset: int = None,
-              limit: int = None) -> Optional[dict]:
+              limit: int = None, *,
+              prefetched_token: str = None) -> Optional[dict]:
         """Fetch document content as Markdown.
 
         Args:
             doc_id: document ID or URL (MCP auto-parses URLs)
             offset: character offset for pagination (large docs)
             limit: max characters to return
+            prefetched_token: pre-fetched UAT — bypasses get_token() when set
 
         Returns:
             {"title": "...", "markdown": "...", ...} or None on auth failure
         """
-        token = self.get_token(chat_id, user_open_id)
+        token = prefetched_token or self.get_token(chat_id, user_open_id)
         if not token:
             return None
 

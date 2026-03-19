@@ -715,6 +715,125 @@ def test_cost_accumulation_across_turns():
     assert cost_store["sid-1"]["total_cost_usd"] == pytest.approx(0.05)
 
 
+def test_get_cached_token_never_triggers_ensure(monkeypatch):
+    """get_cached_token calls get_valid_token (no scopes), never ensure_user_token."""
+    from feishu_bridge.api.client import FeishuAPI
+
+    api = FeishuAPI.__new__(FeishuAPI)
+    api._token_override = None
+
+    class FakeAuth:
+        ensure_called = False
+        gvt_scopes = "NOT_CALLED"
+        def get_valid_token(self, user_open_id, required_scopes=None):
+            self.gvt_scopes = required_scopes
+            return "cached-token-123"
+        def ensure_user_token(self, chat_id, user_open_id, scopes):
+            self.ensure_called = True
+            return "prompted-token"
+
+    api.auth = FakeAuth()
+    api.SCOPES = ["docx:document:readonly"]
+
+    result = api.get_cached_token("user-1")
+    assert result == "cached-token-123"
+    assert not api.auth.ensure_called
+    # get_cached_token must NOT pass scopes — any valid token is accepted
+    assert api.auth.gvt_scopes is None
+
+
+def test_get_cached_token_returns_none_without_prompting(monkeypatch):
+    """get_cached_token returns None when no cached token — no auth card."""
+    from feishu_bridge.api.client import FeishuAPI
+
+    api = FeishuAPI.__new__(FeishuAPI)
+    api._token_override = None
+
+    class FakeAuth:
+        ensure_called = False
+        def get_valid_token(self, user_open_id, required_scopes=None):
+            return None  # no cached token
+        def ensure_user_token(self, chat_id, user_open_id, scopes):
+            self.ensure_called = True
+            return "prompted-token"
+
+    api.auth = FakeAuth()
+    api.SCOPES = ["docx:document:readonly"]
+
+    result = api.get_cached_token("user-1")
+    assert result is None
+    assert not api.auth.ensure_called
+
+
+def test_get_cached_token_returns_override_when_set():
+    """get_cached_token returns token_override if set (CLI mode)."""
+    from feishu_bridge.api.client import FeishuAPI
+
+    api = FeishuAPI.__new__(FeishuAPI)
+    api._token_override = "cli-token-abc"
+    api.auth = None  # should not be accessed
+    api.SCOPES = []
+
+    assert api.get_cached_token("user-1") == "cli-token-abc"
+
+
+def test_autofetch_skips_api_when_no_cached_token():
+    """Auto-fetch includes placeholder when no cached token, never calls API."""
+    api_called = {"docs": False, "sheets": False}
+
+    class FakeDocs:
+        def get_cached_token(self, user_open_id):
+            return None  # no cached token
+        def fetch(self, *args, **kwargs):
+            api_called["docs"] = True
+            return {"title": "test", "markdown": "# test"}
+
+    class FakeSheets:
+        def get_cached_token(self, user_open_id):
+            return None
+        def info(self, *args, **kwargs):
+            api_called["sheets"] = True
+            return {"spreadsheet": {"title": "test"}, "sheets": []}
+
+    class OKRunner:
+        def run(self, text, **kwargs):
+            return {"result": text, "session_id": "s", "is_error": False}
+
+    captured = {}
+    class CapturingRunner:
+        def run(self, text, **kwargs):
+            captured["text"] = text
+            return {"result": text, "session_id": "s", "is_error": False}
+
+    bridge_worker.process_message(
+        item={
+            "bot_id": "bot", "chat_id": "chat", "thread_id": None,
+            "message_id": "mid", "text": "check this doc",
+            "_feishu_urls": [("wiki", "wkcnXXX"), ("sheets", "shtcnYYY")],
+        },
+        bot_config={"workspace": "/tmp"},
+        lark_client=None,
+        session_map=DummySessionMap(),
+        runner=CapturingRunner(),
+        feishu_docs=FakeDocs(),
+        feishu_sheets=FakeSheets(),
+        feishu_api_error_cls=FeishuAPIError,
+        response_handle_cls=FakeHandle,
+        download_image_fn=lambda *a, **k: None,
+        fetch_card_content_fn=lambda *a, **k: None,
+        fetch_forward_messages_fn=lambda *a, **k: None,
+        fetch_quoted_message_fn=lambda *a, **k: None,
+        remove_typing_indicator_fn=lambda *a, **k: None,
+        session_not_found_signatures=[],
+    )
+
+    # API should NOT have been called
+    assert not api_called["docs"]
+    assert not api_called["sheets"]
+    # Placeholder text should mention authorization
+    assert "未授权" in captured["text"]
+
+
 def test_context_health_alert_prefers_last_call_usage():
     """Alert uses last_call_usage (per-API-call) over cumulative usage."""
     result = {
@@ -751,3 +870,238 @@ def test_context_health_alert_fallback_to_usage_when_no_last_call():
     alert = bridge_worker._context_health_alert(result)
     assert alert is not None
     assert "75%" in alert
+
+
+def test_context_health_alert_compact_detected_with_peak():
+    """When compact was detected, alert shows pre-compact peak percentage."""
+    result = {
+        "last_call_usage": {
+            "input_tokens": 50_000,  # post-compact: only 25%
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        },
+        "modelUsage": {"claude-opus-4-6": {"contextWindow": 200_000}},
+        "compact_detected": True,
+        "peak_context_tokens": 170_000,  # pre-compact: 85%
+    }
+    alert = bridge_worker._context_health_alert(result)
+    assert alert is not None
+    assert "自动压缩" in alert
+    assert "85%" in alert
+
+
+def test_context_health_alert_compact_detected_no_peak():
+    """When compact detected but no peak data, fall back to current usage."""
+    result = {
+        "last_call_usage": {
+            "input_tokens": 150_000,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        },
+        "modelUsage": {"claude-opus-4-6": {"contextWindow": 200_000}},
+        "compact_detected": True,
+        "peak_context_tokens": 0,
+    }
+    alert = bridge_worker._context_health_alert(result)
+    assert alert is not None
+    assert "75%" in alert  # falls back to current usage (150k/200k)
+
+
+def test_context_health_alert_no_compact_still_alerts():
+    """Without compact, normal threshold alerts still work."""
+    result = {
+        "last_call_usage": {
+            "input_tokens": 180_000,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        },
+        "modelUsage": {"claude-opus-4-6": {"contextWindow": 200_000}},
+        "compact_detected": False,
+        "peak_context_tokens": 180_000,
+    }
+    alert = bridge_worker._context_health_alert(result)
+    assert alert is not None
+    assert "🔴" in alert
+    assert "90%" in alert
+
+
+# ---------------------------------------------------------------------------
+# Auth locking: deadlock regression & concurrent refresh
+# ---------------------------------------------------------------------------
+
+def test_ensure_user_token_no_deadlock_on_expired_token(monkeypatch, tmp_path):
+    """ensure_user_token must not deadlock when cached token is expired.
+
+    Regression test: _ensure_user_token_inner previously called
+    get_valid_token() (which acquires the user lock) while already
+    holding the same lock from ensure_user_token().  Now it calls
+    _get_valid_token_unlocked() instead.
+    """
+    import threading
+
+    monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+    # Mock out network calls — we only care about the locking behaviour.
+    # Device flow is reached because expired token + no refresh → None.
+    # Return valid-looking data; _send_card will return None (no lark_client)
+    # → ensure_user_token returns None without blocking.
+    monkeypatch.setattr(feishu_auth, "request_device_authorization",
+                        lambda *a, **k: {
+                            "device_code": "dc", "user_code": "uc",
+                            "verification_uri": "", "verification_uri_complete": "",
+                            "expires_in": 60, "interval": 5,
+                        })
+
+    auth = feishu_auth.FeishuAuth("app1", "secret1", lark_client=None)
+
+    # Store an expired token with no refresh token
+    expired = {
+        "access_token": "old",
+        "refresh_token": "",  # no refresh — _get_valid_token_unlocked returns None
+        "expires_in": 1,
+        "refresh_expires_in": 1,
+        "obtained_at": 0,
+        "scope": "",
+    }
+    feishu_auth.save_token("app1", "user1", expired)
+
+    result = [None]
+    error = [None]
+
+    def _call():
+        try:
+            result[0] = auth.ensure_user_token("chat1", "user1", ["task:task:read"])
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_call)
+    t.start()
+    t.join(timeout=3)  # must complete within 3s; deadlock → timeout
+
+    assert not t.is_alive(), "ensure_user_token deadlocked!"
+    assert error[0] is None
+    # Token expired + no refresh → returns None (would start Device Flow,
+    # but no lark_client so _send_card returns None → returns None)
+    assert result[0] is None
+
+
+def test_concurrent_refresh_single_rotation(monkeypatch, tmp_path):
+    """Two threads calling get_valid_token with expired token: refresh once.
+
+    The class-level lock must ensure that refresh_access_token is called
+    exactly once, not twice (which would fail the second time since the
+    refresh token is single-use).
+    """
+    import threading
+
+    monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+
+    # Store an expired token with a valid refresh token
+    import time as _time
+    expired = {
+        "access_token": "expired-at",
+        "refresh_token": "rt-single-use",
+        "expires_in": 7200,
+        "refresh_expires_in": 604800,
+        "obtained_at": _time.time() - 8000,  # expired
+        "scope": "task:task:read",
+    }
+    feishu_auth.save_token("app2", "user2", expired)
+
+    refresh_calls = []
+    _original_refresh = feishu_auth.refresh_access_token
+
+    def _counting_refresh(app_id, app_secret, refresh_token):
+        refresh_calls.append(refresh_token)
+        return {
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "expires_in": 7200,
+            "refresh_expires_in": 604800,
+            "scope": "task:task:read",
+            "obtained_at": _time.time(),
+        }
+
+    monkeypatch.setattr(feishu_auth, "refresh_access_token", _counting_refresh)
+
+    auth1 = feishu_auth.FeishuAuth("app2", "secret2")
+    auth2 = feishu_auth.FeishuAuth("app2", "secret2")  # different instance, same app
+
+    results = [None, None]
+    barrier = threading.Barrier(2)
+
+    def _call(idx, auth_inst):
+        barrier.wait()  # synchronize start
+        results[idx] = auth_inst.get_valid_token("user2", ["task:task:read"])
+
+    t1 = threading.Thread(target=_call, args=(0, auth1))
+    t2 = threading.Thread(target=_call, args=(1, auth2))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert not t1.is_alive()
+    assert not t2.is_alive()
+
+    # Both threads should get a valid token
+    assert results[0] == "new-at"
+    assert results[1] == "new-at"
+
+    # refresh_access_token should be called exactly once (the second thread
+    # should find the already-refreshed token via double-check read)
+    assert len(refresh_calls) == 1
+
+
+def test_class_level_lock_shared_across_instances():
+    """_get_user_lock returns the same lock for same (app_id, user) across instances."""
+    auth1 = feishu_auth.FeishuAuth("app-shared", "s1")
+    auth2 = feishu_auth.FeishuAuth("app-shared", "s2")
+
+    lock1 = auth1._get_user_lock("user-x")
+    lock2 = auth2._get_user_lock("user-x")
+
+    assert lock1 is lock2, "Same (app_id, user) must share the same lock"
+
+    # Different app_id → different lock
+    auth3 = feishu_auth.FeishuAuth("app-other", "s3")
+    lock3 = auth3._get_user_lock("user-x")
+    assert lock3 is not lock1
+
+
+def test_autofetch_never_contains_auth_card_text():
+    """Auto-fetch placeholder must never contain '已发送授权卡片'."""
+    class FakeDocs:
+        def get_cached_token(self, user_open_id):
+            return None
+
+    captured = {}
+
+    class CapturingRunner:
+        def run(self, text, **kwargs):
+            captured["text"] = text
+            return {"result": text, "session_id": "s", "is_error": False}
+
+    bridge_worker.process_message(
+        item={
+            "bot_id": "bot", "chat_id": "chat", "thread_id": None,
+            "message_id": "mid", "text": "look at this",
+            "_feishu_urls": [("doc", "doxcnABC"), ("wiki", "wkcnDEF")],
+        },
+        bot_config={"workspace": "/tmp"},
+        lark_client=None,
+        session_map=DummySessionMap(),
+        runner=CapturingRunner(),
+        feishu_docs=FakeDocs(),
+        feishu_sheets=None,
+        feishu_api_error_cls=FeishuAPIError,
+        response_handle_cls=FakeHandle,
+        download_image_fn=lambda *a, **k: None,
+        fetch_card_content_fn=lambda *a, **k: None,
+        fetch_forward_messages_fn=lambda *a, **k: None,
+        fetch_quoted_message_fn=lambda *a, **k: None,
+        remove_typing_indicator_fn=lambda *a, **k: None,
+        session_not_found_signatures=[],
+    )
+
+    assert "已发送授权卡片" not in captured["text"]
+    assert "未授权" in captured["text"]

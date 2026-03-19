@@ -455,36 +455,72 @@ class FeishuAuth:
     Usage:
         auth = FeishuAuth(app_id, app_secret, lark_client)
         token = auth.ensure_user_token(chat_id, user_open_id, ["task:task:read"])
+
+    Locking contract:
+        _get_user_lock() returns a process-wide lock keyed by (app_id, user_open_id).
+        - get_valid_token()        acquires the lock for the refresh path.
+        - ensure_user_token()      acquires the lock for the full OAuth flow.
+        - _get_valid_token_unlocked()  assumes caller already holds the lock.
+        Neither get_valid_token nor ensure_user_token calls the other, so no
+        re-entrancy is needed and threading.Lock (non-reentrant) is correct.
     """
+
+    # Class-level lock registry — shared across ALL FeishuAuth instances so
+    # that FeishuDocs, FeishuSheets, etc. (each with their own FeishuAuth)
+    # coordinate refresh-token rotation for the same user.
+    _class_user_locks: dict[tuple, threading.Lock] = {}
+    _class_locks_lock = threading.Lock()
 
     def __init__(self, app_id: str, app_secret: str, lark_client=None):
         self.app_id = app_id
         self.app_secret = app_secret
         self.lark_client = lark_client  # lark_oapi.Client for sending cards
-        self._user_locks: dict[str, threading.Lock] = {}  # per-user OAuth lock
-        self._locks_lock = threading.Lock()  # protects _user_locks dict
 
     def get_valid_token(self, user_open_id: str,
                         required_scopes: list[str] = None) -> Optional[str]:
         """Return a valid access_token from cache, refreshing if needed.
 
-        Returns None if no token or refresh fails.
+        Thread-safe: acquires a per-user lock before refreshing to prevent
+        concurrent refresh-token rotation races.
+
+        Returns None if no token or refresh fails.  Never prompts the user.
         """
         stored = load_token(self.app_id, user_open_id)
         if not stored:
             return None
 
-        # Check expiry
+        # Fast path: token still valid
         obtained_at = stored.get("obtained_at", 0)
         expires_in = stored.get("expires_in", 7200)
         if time.time() < obtained_at + expires_in - REFRESH_AHEAD_S:
-            # Check scope coverage
             if required_scopes and not self._scopes_covered(stored, required_scopes):
                 log.info("Stored token missing required scopes, need re-auth")
                 return None
             return stored["access_token"]
 
-        # Try refresh
+        # Refresh path — acquire per-user lock to prevent concurrent
+        # rotation of the single-use refresh token.
+        with self._get_user_lock(user_open_id):
+            return self._get_valid_token_unlocked(user_open_id, required_scopes)
+
+    def _get_valid_token_unlocked(self, user_open_id: str,
+                                  required_scopes: list[str] = None) -> Optional[str]:
+        """Refresh-aware token retrieval — caller MUST hold the user lock.
+
+        Re-reads from disk (another thread may have refreshed), then
+        attempts refresh if still expired.  Never prompts the user.
+        """
+        stored = load_token(self.app_id, user_open_id)
+        if not stored:
+            return None
+        obtained_at = stored.get("obtained_at", 0)
+        expires_in = stored.get("expires_in", 7200)
+        # Double-check: if another thread refreshed, the token is fresh now
+        if time.time() < obtained_at + expires_in - REFRESH_AHEAD_S:
+            if required_scopes and not self._scopes_covered(stored, required_scopes):
+                return None
+            return stored["access_token"]
+
         refresh_token = stored.get("refresh_token", "")
         if not refresh_token:
             return None
@@ -495,18 +531,26 @@ class FeishuAuth:
             delete_token(self.app_id, user_open_id)
             return None
 
-        new_token = refresh_access_token(self.app_id, self.app_secret, refresh_token)
+        new_token = refresh_access_token(
+            self.app_id, self.app_secret, refresh_token)
         if new_token:
+            # Verify scopes are still covered after refresh
+            if required_scopes and not self._scopes_covered(
+                    new_token, required_scopes):
+                log.info("Refreshed token missing required scopes")
+                save_token(self.app_id, user_open_id, new_token)
+                return None
             save_token(self.app_id, user_open_id, new_token)
             return new_token["access_token"]
         return None
 
     def _get_user_lock(self, user_open_id: str) -> threading.Lock:
-        """Get or create a per-user lock."""
-        with self._locks_lock:
-            if user_open_id not in self._user_locks:
-                self._user_locks[user_open_id] = threading.Lock()
-            return self._user_locks[user_open_id]
+        """Get or create a process-wide per-(app_id, user) lock."""
+        key = (self.app_id, user_open_id)
+        with FeishuAuth._class_locks_lock:
+            if key not in FeishuAuth._class_user_locks:
+                FeishuAuth._class_user_locks[key] = threading.Lock()
+            return FeishuAuth._class_user_locks[key]
 
     def ensure_user_token(self, chat_id: str, user_open_id: str,
                           scopes: list[str],
@@ -527,8 +571,8 @@ class FeishuAuth:
                                  scopes: list[str],
                                  stop_flag=None) -> Optional[str]:
         """Inner implementation of ensure_user_token (called under lock)."""
-        # 1. Try cached token
-        token = self.get_valid_token(user_open_id, scopes)
+        # 1. Try cached token (unlocked — caller already holds the lock)
+        token = self._get_valid_token_unlocked(user_open_id, scopes)
         if token:
             log.info("Using cached token for %s", user_open_id[:8])
             return token

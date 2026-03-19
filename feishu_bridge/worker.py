@@ -20,21 +20,12 @@ log = logging.getLogger("feishu-bridge")
 def _context_health_alert(result: dict) -> str | None:
     """Check context utilization and return an alert suffix, or None.
 
-    Prefers ``last_call_usage`` (per-API-call metrics from the last
-    assistant event) over ``usage`` (which the CLI aggregates across
-    all sub-calls in a turn and therefore over-counts).
+    Uses ``peak_context_tokens`` (high-water mark before auto-compact)
+    when available, falling back to ``last_call_usage`` or ``usage``.
+    Also reports when auto-compact was detected so the user knows
+    earlier conversation turns may have been summarised.
     """
-    usage = result.get("last_call_usage") or result.get("usage")
-    if not usage:
-        return None
-    inp = usage.get("input_tokens", 0)
-    cache_read = usage.get("cache_read_input_tokens", 0)
-    cache_create = usage.get("cache_creation_input_tokens", 0)
-    total_ctx = inp + cache_read + cache_create
-    if total_ctx == 0:
-        return None
-
-    # Determine context window from modelUsage
+    # Determine context window size
     max_ctx = 200_000  # conservative default
     model_usage = result.get("modelUsage", {})
     for _model, mu in model_usage.items():
@@ -42,6 +33,26 @@ def _context_health_alert(result: dict) -> str | None:
         if cw > 0:
             max_ctx = cw
             break
+
+    # If auto-compact was detected, alert with pre-compact peak usage
+    compact_detected = result.get("compact_detected", False)
+    peak_tokens = result.get("peak_context_tokens", 0)
+    if compact_detected and peak_tokens > 0:
+        peak_pct = peak_tokens / max_ctx * 100
+        return (
+            f"\n\n---\n⚠️ 上下文已自动压缩（压缩前 {peak_pct:.0f}%）"
+            "— 早期对话可能被概括，建议关注上下文完整性"
+        )
+
+    # No compact — check current usage against thresholds
+    usage = result.get("last_call_usage") or result.get("usage")
+    if not usage:
+        return None
+    total_ctx = (usage.get("input_tokens", 0)
+                 + usage.get("cache_read_input_tokens", 0)
+                 + usage.get("cache_creation_input_tokens", 0))
+    if total_ctx == 0:
+        return None
 
     pct = total_ctx / max_ctx * 100
     if pct >= 85:
@@ -76,7 +87,7 @@ def format_task_detail_bridge(task: dict) -> str:
 
 
 
-def _write_auth_file(chat_id: str, sender_id: str, user_token: str) -> str:
+def _write_auth_file(chat_id: str, sender_id: str, user_token: str | None) -> str:
     """Write a temporary auth file for feishu_cli.py.
 
     Returns the file path. Caller must clean up in finally block.
@@ -201,23 +212,24 @@ def process_message(
         if feishu_urls and (feishu_docs or feishu_sheets) and feishu_api_error_cls:
             import requests as _requests
             sender_id = item.get("sender_id", "")
+            # Silent per-service token check: auto-fetch must NOT trigger OAuth.
+            # get_cached_token() returns None without sending auth cards.
+            _doc_token = feishu_docs.get_cached_token(sender_id) if feishu_docs else None
+            _sheet_token = feishu_sheets.get_cached_token(sender_id) if feishu_sheets else None
             fetched_parts = []
             for url_type, url_token in feishu_urls:
                 try:
                     if url_type == "wiki":
-                        # Wiki links need node resolution first
-                        if not feishu_docs:
-                            continue
-                        wiki_token = feishu_docs.get_token(chat_id, sender_id)
-                        if not wiki_token:
+                        # Wiki links need doc token for node resolution
+                        if not feishu_docs or not _doc_token:
                             fetched_parts.append(
-                                f"[飞书wiki {url_token}: 需要授权，已发送授权卡片，请完成授权后重试]"
+                                f"[飞书链接 wiki/{url_token}: 未授权，使用 feishu-cli 命令时将自动触发授权]"
                             )
                             continue
                         try:
                             node_data = feishu_docs.request(
-                                "GET", f"/open-apis/wiki/v2/spaces/get_node",
-                                wiki_token, params={"token": url_token})
+                                "GET", "/open-apis/wiki/v2/spaces/get_node",
+                                _doc_token, params={"token": url_token})
                             node = node_data.get("node", {})
                             obj_type = node.get("obj_type", "doc")
                             obj_token = node.get("obj_token", url_token)
@@ -233,14 +245,14 @@ def process_message(
                             continue
                         if obj_type == "sheet":
                             # Redirect to sheets handler
-                            if not feishu_sheets:
-                                fetched_parts.append(f"[飞书表格 {url_token}: sheets API 不可用]")
-                                continue
-                            result = feishu_sheets.info(chat_id, sender_id, obj_token)
-                            if result is None:
+                            if not feishu_sheets or not _sheet_token:
                                 fetched_parts.append(
-                                    f"[飞书表格 {url_token}: 需要授权，已发送授权卡片，请完成授权后重试]"
+                                    f"[飞书表格 {url_token}: 未授权，使用 feishu-cli 命令时将自动触发授权]"
                                 )
+                                continue
+                            result = feishu_sheets.info(
+                                chat_id, sender_id, obj_token, prefetched_token=_sheet_token)
+                            if result is None:
                                 continue
                             spreadsheet = result.get("spreadsheet", result)
                             title = spreadsheet.get("title", url_token)
@@ -254,11 +266,9 @@ def process_message(
                             )
                             continue
                         # doc/docx/wiki doc — fetch via MCP
-                        result = feishu_docs.fetch(chat_id, sender_id, doc_id=obj_token)
+                        result = feishu_docs.fetch(
+                            chat_id, sender_id, doc_id=obj_token, prefetched_token=_doc_token)
                         if result is None:
-                            fetched_parts.append(
-                                f"[飞书文档 {url_token}: 需要授权，已发送授权卡片，请完成授权后重试]"
-                            )
                             continue
                         title = result.get("title", "")
                         md = result.get("markdown", "")
@@ -270,13 +280,14 @@ def process_message(
                         fetched_parts.append(f"{header}\n{md}\n[/飞书文档]")
                         continue
                     if url_type in ("doc", "docx"):
-                        if not feishu_docs:
-                            continue
-                        result = feishu_docs.fetch(chat_id, sender_id, doc_id=url_token)
-                        if result is None:
+                        if not feishu_docs or not _doc_token:
                             fetched_parts.append(
-                                f"[飞书文档 {url_token}: 需要授权，已发送授权卡片，请完成授权后重试]"
+                                f"[飞书链接 {url_type}/{url_token}: 未授权，使用 feishu-cli 命令时将自动触发授权]"
                             )
+                            continue
+                        result = feishu_docs.fetch(
+                            chat_id, sender_id, doc_id=url_token, prefetched_token=_doc_token)
+                        if result is None:
                             continue
                         title = result.get("title", "")
                         md = result.get("markdown", "")
@@ -288,13 +299,14 @@ def process_message(
                         header = f"[飞书文档: {title}]" if title else f"[飞书文档 {url_token}]"
                         fetched_parts.append(f"{header}\n{md}\n[/飞书文档]")
                     elif url_type == "sheets":
-                        if not feishu_sheets:
-                            continue
-                        result = feishu_sheets.info(chat_id, sender_id, url_token)
-                        if result is None:
+                        if not feishu_sheets or not _sheet_token:
                             fetched_parts.append(
-                                f"[飞书表格 {url_token}: 需要授权，已发送授权卡片，请完成授权后重试]"
+                                f"[飞书链接 sheets/{url_token}: 未授权，使用 feishu-cli 命令时将自动触发授权]"
                             )
+                            continue
+                        result = feishu_sheets.info(
+                            chat_id, sender_id, url_token, prefetched_token=_sheet_token)
+                        if result is None:
                             continue
                         spreadsheet = result.get("spreadsheet", result)
                         title = spreadsheet.get("title", url_token)
@@ -458,18 +470,19 @@ def process_message(
             text = "\n".join(prompt_parts)
 
         # --- Auth file for feishu_cli.py ---
+        # Always create the auth file so feishu-cli is available.  The token
+        # may be None for first-time users — feishu-cli will trigger OAuth
+        # on-demand when it actually needs the token (not pre-emptively).
         env_extra = None
         sender_id = item.get("sender_id", "")
         try:
-            # Try to get user token for CLI auth
             if feishu_docs:
-                cli_token = feishu_docs.get_token(chat_id, sender_id)
-                if cli_token:
-                    auth_file_path = _write_auth_file(chat_id, sender_id, cli_token)
-                    env_extra = {
-                        "FEISHU_AUTH_FILE": auth_file_path,
-                        "FEISHU_BOT_NAME": bot_config.get("name", ""),
-                    }
+                cli_token = feishu_docs.get_cached_token(sender_id)
+                auth_file_path = _write_auth_file(chat_id, sender_id, cli_token)
+                env_extra = {
+                    "FEISHU_AUTH_FILE": auth_file_path,
+                    "FEISHU_BOT_NAME": bot_config.get("name", ""),
+                }
         except Exception:
             log.warning("Failed to create auth file for CLI", exc_info=True)
 

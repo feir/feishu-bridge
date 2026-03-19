@@ -365,15 +365,21 @@ class ClaudeRunner:
         return self._run_blocking(proc, session_id, tag)
 
     def _run_blocking(self, proc, session_id, tag) -> dict:
+        t0 = time.monotonic()
         try:
             stdout, stderr = proc.communicate(timeout=self.timeout)
         except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - t0
+            log.error(
+                "Claude blocking timeout: sid=%s elapsed=%.0fs limit=%ds",
+                (session_id or "-")[:8], elapsed, self.timeout,
+            )
             # Graceful kill: SIGTERM + deferred SIGKILL. proc.communicate()
             # blocks until exit — will unblock after SIGTERM or deferred SIGKILL.
             self._kill_proc_tree(proc)
             proc.communicate()
             return {
-                "result": f"Claude 超时（{self.timeout}s）",
+                "result": f"Claude 超时（已运行 {int(elapsed)}s，限制 {self.timeout}s）",
                 "session_id": session_id,
                 "is_error": True,
             }
@@ -435,7 +441,11 @@ class ClaudeRunner:
         final_result = None
         last_call_usage = None  # per-call usage from last assistant event
         timed_out = False
+        result_received = threading.Event()
         stderr_lines = []
+        peak_context_tokens = 0
+        compact_detected = False
+        t0 = time.monotonic()
 
         def _drain_stderr():
             for line in proc.stderr:
@@ -446,6 +456,8 @@ class ClaudeRunner:
 
         def _timeout_kill():
             nonlocal timed_out
+            if result_received.is_set():
+                return  # Result already received; don't flag as timeout.
             timed_out = True
             # Graceful kill spawns its own deferred SIGKILL Timer (15s).
             # If the process exits from SIGTERM, stdout EOF unblocks the
@@ -478,30 +490,71 @@ class ClaudeRunner:
                 etype = event.get("type", "")
                 if etype == "result":
                     final_result = event
+                    result_received.set()
                     break
                 if etype == "assistant":
-                    # Capture per-call usage from each assistant message.
-                    # The CLI emits one assistant event per API sub-call;
-                    # the last one reflects the actual context window fill.
                     msg_usage = event.get("message", {}).get("usage")
                     if msg_usage:
                         last_call_usage = msg_usage
+                        # Track peak context tokens (pre-compact high-water mark).
+                        ctx_tokens = (msg_usage.get("input_tokens", 0)
+                                      + msg_usage.get("cache_read_input_tokens", 0)
+                                      + msg_usage.get("cache_creation_input_tokens", 0))
+                        if ctx_tokens > peak_context_tokens:
+                            peak_context_tokens = ctx_tokens
                 elif etype == "stream_event":
                     inner = event.get("event", {})
                     if (inner.get("type") == "content_block_delta"
                             and inner.get("delta", {}).get("type") == "text_delta"):
                         accumulated += inner["delta"].get("text", "")
                         on_output(accumulated)
+                    elif inner.get("type") == "message_delta":
+                        edits = (inner.get("delta", {})
+                                 .get("context_management", {})
+                                 .get("applied_edits"))
+                        if edits:
+                            compact_detected = True
+                            log.info("Auto-compact detected: %d edit(s) applied", len(edits))
 
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            self._force_kill(proc)
-            proc.wait()
-            return {
-                "result": f"Claude 超时（{self.timeout}s）",
-                "session_id": session_id,
-                "is_error": True,
-            }
+            elapsed = time.monotonic() - t0
+            # Distinguish: idle timer kill (timed_out=True) vs proc.wait(30) hang.
+            if timed_out:
+                # The idle timer fired, killed the process, stdout EOF'd,
+                # and now proc.wait(30) also timed out — unusual but possible.
+                log.error(
+                    "Claude idle timeout + proc.wait hang: sid=%s elapsed=%.0fs idle_limit=%ds",
+                    (session_id or "-")[:8], elapsed, self.timeout,
+                )
+                self._force_kill(proc)
+                proc.wait()
+            elif final_result:
+                # Claude sent a result event (task completed!) but the process
+                # didn't exit within 30s. Treat as success, not timeout.
+                log.warning(
+                    "Claude process hung after result event: sid=%s elapsed=%.0fs, force-killing",
+                    (session_id or "-")[:8], elapsed,
+                )
+                self._force_kill(proc)
+                proc.wait()
+                # Fall through to the final_result handler below.
+            else:
+                # stdout closed without a result event and process won't exit.
+                # Likely a crash or abnormal termination.
+                log.error(
+                    "Claude process hung (no result): sid=%s elapsed=%.0fs accumulated=%d chars, force-killing",
+                    (session_id or "-")[:8], elapsed, len(accumulated),
+                )
+                self._force_kill(proc)
+                proc.wait()
+                return {
+                    "result": (accumulated + "\n\n⚠️ Claude 进程未正常退出（已运行 %ds）" % int(elapsed))
+                             if accumulated else
+                             "Claude 进程未正常退出（已运行 %ds，无输出）" % int(elapsed),
+                    "session_id": session_id,
+                    "is_error": True,
+                }
         except Exception:
             self._force_kill(proc)
             proc.wait()
@@ -519,13 +572,8 @@ class ClaudeRunner:
                 "cancelled": True,
             }
 
-        if timed_out:
-            return {
-                "result": f"Claude 超时（{self.timeout}s）",
-                "session_id": session_id,
-                "is_error": True,
-            }
-
+        # Check final_result BEFORE timed_out to handle the race where the
+        # idle timer fires during proc.wait(30) after result was received.
         if final_result:
             result_text = final_result.get("result") or accumulated
             if not final_result.get("is_error", False) and not result_text:
@@ -543,6 +591,8 @@ class ClaudeRunner:
                     "last_call_usage": last_call_usage,
                     "modelUsage": final_result.get("modelUsage"),
                     "total_cost_usd": final_result.get("total_cost_usd"),
+                    "peak_context_tokens": peak_context_tokens,
+                    "compact_detected": compact_detected,
                 }
             if accumulated and not final_result.get("result"):
                 log.info(
@@ -558,6 +608,20 @@ class ClaudeRunner:
                 "last_call_usage": last_call_usage,
                 "modelUsage": final_result.get("modelUsage"),
                 "total_cost_usd": final_result.get("total_cost_usd"),
+                "peak_context_tokens": peak_context_tokens,
+                "compact_detected": compact_detected,
+            }
+
+        if timed_out:
+            elapsed = time.monotonic() - t0
+            log.error(
+                "Claude idle timeout: sid=%s elapsed=%.0fs idle_limit=%ds",
+                (session_id or "-")[:8], elapsed, self.timeout,
+            )
+            return {
+                "result": f"Claude 空闲超时（连续无输出超过 {self.timeout}s，已运行 {int(elapsed)}s）",
+                "session_id": session_id,
+                "is_error": True,
             }
 
         stderr = "".join(stderr_lines)
@@ -584,4 +648,6 @@ class ClaudeRunner:
             "result": accumulated,
             "session_id": session_id,
             "is_error": False,
+            "peak_context_tokens": peak_context_tokens,
+            "compact_detected": compact_detected,
         }

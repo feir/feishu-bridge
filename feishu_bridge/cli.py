@@ -87,10 +87,15 @@ def _load_config():
     sys.exit(1)
 
 
-def _init_module(cls, config, user_token=None):
-    """Initialize a FeishuAPI module with app credentials."""
+def _init_module(cls, config, user_token=None, lark_client=None):
+    """Initialize a FeishuAPI module with app credentials.
+
+    When user_token is provided, it is used directly (no auth flow).
+    When user_token is None and lark_client is set, the module can
+    trigger on-demand OAuth via Device Flow (sends auth card to chat).
+    """
     return cls(config["app_id"], config["app_secret"],
-               token_override=user_token)
+               lark_client=lark_client, token_override=user_token)
 
 
 def _output(result):
@@ -431,24 +436,39 @@ def main():
     sender_id = auth.get("sender_id", "")
     _user_token = auth.get("user_access_token")
 
+    # When no pre-authed token, build a lark_client so modules can trigger
+    # on-demand OAuth (Device Flow auth card sent to the user's chat).
+    _lark_client = None
+    if not _user_token:
+        try:
+            import lark_oapi as lark
+            _lark_client = lark.Client.builder() \
+                .app_id(config["app_id"]) \
+                .app_secret(config["app_secret"]) \
+                .domain(lark.FEISHU_DOMAIN) \
+                .log_level(lark.LogLevel.WARNING) \
+                .build()
+        except Exception:
+            pass  # Graceful degradation — auth will fail with clear error
+
     cmd = args.command
 
     # --- Dispatch ---
 
     # Doc commands
     if cmd == "read-doc":
-        mod = _init_module(FeishuDocs, config, _user_token)
+        mod = _init_module(FeishuDocs, config, _user_token, _lark_client)
         _output(mod.fetch(chat_id, sender_id, doc_id=args.token))
 
     elif cmd == "create-doc":
-        mod = _init_module(FeishuDocs, config, _user_token)
+        mod = _init_module(FeishuDocs, config, _user_token, _lark_client)
         _output(mod.create(chat_id, sender_id, title=args.title,
                            markdown=args.markdown,
                            folder_token=args.folder_token,
                            wiki_space=args.wiki_space))
 
     elif cmd == "update-doc":
-        mod = _init_module(FeishuDocs, config, _user_token)
+        mod = _init_module(FeishuDocs, config, _user_token, _lark_client)
         _output(mod.update(chat_id, sender_id, doc_id=args.token,
                            markdown=args.markdown, mode=args.mode,
                            selection=args.selection,
@@ -456,23 +476,23 @@ def main():
 
     elif cmd == "delete-doc":
         _confirm_guard(args, args.token, "doc_token")
-        mod = _init_module(FeishuDocs, config, _user_token)
+        mod = _init_module(FeishuDocs, config, _user_token, _lark_client)
         _output(mod.delete(chat_id, sender_id, doc_token=args.token))
 
     # Sheet commands
     elif cmd == "read-sheet":
-        mod = _init_module(FeishuSheets, config, _user_token)
+        mod = _init_module(FeishuSheets, config, _user_token, _lark_client)
         _output(mod.read(chat_id, sender_id,
                          spreadsheet_token=args.token,
                          range_=getattr(args, "range")))
 
     elif cmd == "sheet-info":
-        mod = _init_module(FeishuSheets, config, _user_token)
+        mod = _init_module(FeishuSheets, config, _user_token, _lark_client)
         _output(mod.info(chat_id, sender_id,
                          spreadsheet_token=args.token))
 
     elif cmd == "write-sheet":
-        mod = _init_module(FeishuSheets, config, _user_token)
+        mod = _init_module(FeishuSheets, config, _user_token, _lark_client)
         values = _safe_json_loads(args.values, "--values")
         _output(mod.write(chat_id, sender_id,
                           spreadsheet_token=args.token,
@@ -480,7 +500,7 @@ def main():
                           values=values))
 
     elif cmd == "append-sheet":
-        mod = _init_module(FeishuSheets, config, _user_token)
+        mod = _init_module(FeishuSheets, config, _user_token, _lark_client)
         values = _safe_json_loads(args.values, "--values")
         _output(mod.append(chat_id, sender_id,
                            spreadsheet_token=args.token,
@@ -488,25 +508,25 @@ def main():
                            values=values))
 
     elif cmd == "create-sheet":
-        mod = _init_module(FeishuSheets, config, _user_token)
+        mod = _init_module(FeishuSheets, config, _user_token, _lark_client)
         _output(mod.create(chat_id, sender_id, title=args.title,
                            folder_token=args.folder_token))
 
     elif cmd == "delete-sheet":
         _confirm_guard(args, args.token, "sheet_token")
-        mod = _init_module(FeishuSheets, config, _user_token)
+        mod = _init_module(FeishuSheets, config, _user_token, _lark_client)
         _output(mod.delete(chat_id, sender_id,
                            spreadsheet_token=args.token))
 
     # Wiki commands
     elif cmd == "list-wiki-spaces":
-        mod = _init_module(FeishuWiki, config, _user_token)
+        mod = _init_module(FeishuWiki, config, _user_token, _lark_client)
         _output(mod.list_spaces(chat_id, sender_id,
                                 page_size=args.page_size,
                                 page_token=args.page_token))
 
     elif cmd == "list-wiki-nodes":
-        mod = _init_module(FeishuWiki, config, _user_token)
+        mod = _init_module(FeishuWiki, config, _user_token, _lark_client)
         _output(mod.list_nodes(chat_id, sender_id,
                                space_id=args.space_id,
                                parent_node_token=args.parent_node_token,
@@ -514,12 +534,12 @@ def main():
                                page_token=args.page_token))
 
     elif cmd == "get-wiki-node":
-        mod = _init_module(FeishuWiki, config, _user_token)
+        mod = _init_module(FeishuWiki, config, _user_token, _lark_client)
         _output(mod.get_node(chat_id, sender_id,
                              node_token=args.token))
 
     elif cmd == "create-wiki-node":
-        mod = _init_module(FeishuWiki, config, _user_token)
+        mod = _init_module(FeishuWiki, config, _user_token, _lark_client)
         _output(mod.create_node(chat_id, sender_id,
                                 space_id=args.space_id,
                                 title=args.title,
@@ -528,14 +548,14 @@ def main():
 
     elif cmd == "delete-wiki-node":
         _confirm_guard(args, args.token, "node_token")
-        mod = _init_module(FeishuWiki, config, _user_token)
+        mod = _init_module(FeishuWiki, config, _user_token, _lark_client)
         _output(mod.delete_node(chat_id, sender_id,
                                 space_id=args.space_id,
                                 node_token=args.token))
 
     # Comment commands
     elif cmd == "list-comments":
-        mod = _init_module(FeishuComments, config, _user_token)
+        mod = _init_module(FeishuComments, config, _user_token, _lark_client)
         is_solved = None
         if args.is_solved:
             is_solved = args.is_solved == "true"
@@ -547,14 +567,14 @@ def main():
                                   page_token=args.page_token))
 
     elif cmd == "add-comment":
-        mod = _init_module(FeishuComments, config, _user_token)
+        mod = _init_module(FeishuComments, config, _user_token, _lark_client)
         _output(mod.add_comment(chat_id, sender_id,
                                 file_token=args.file_token,
                                 file_type=args.file_type,
                                 content=args.content))
 
     elif cmd == "reply-comment":
-        mod = _init_module(FeishuComments, config, _user_token)
+        mod = _init_module(FeishuComments, config, _user_token, _lark_client)
         _output(mod.reply_comment(chat_id, sender_id,
                                   file_token=args.file_token,
                                   file_type=args.file_type,
@@ -562,7 +582,7 @@ def main():
                                   content=args.content))
 
     elif cmd == "resolve-comment":
-        mod = _init_module(FeishuComments, config, _user_token)
+        mod = _init_module(FeishuComments, config, _user_token, _lark_client)
         _output(mod.resolve_comment(chat_id, sender_id,
                                     file_token=args.file_token,
                                     file_type=args.file_type,
@@ -570,7 +590,7 @@ def main():
 
     elif cmd == "delete-comment":
         _confirm_guard(args, args.comment_id, "comment_id")
-        mod = _init_module(FeishuComments, config, _user_token)
+        mod = _init_module(FeishuComments, config, _user_token, _lark_client)
         _output(mod.delete_comment(chat_id, sender_id,
                                    file_token=args.file_token,
                                    file_type=args.file_type,
@@ -578,13 +598,13 @@ def main():
 
     # Calendar commands
     elif cmd == "list-calendars":
-        mod = _init_module(FeishuCalendar, config, _user_token)
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
         _output(mod.list_calendars(chat_id, sender_id,
                                    page_size=args.page_size,
                                    page_token=args.page_token))
 
     elif cmd == "list-events":
-        mod = _init_module(FeishuCalendar, config, _user_token)
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
         _output(mod.list_events(chat_id, sender_id,
                                 calendar_id=args.calendar_id,
                                 start_time=args.start_time,
@@ -593,13 +613,13 @@ def main():
                                 page_token=args.page_token))
 
     elif cmd == "get-event":
-        mod = _init_module(FeishuCalendar, config, _user_token)
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
         _output(mod.get_event(chat_id, sender_id,
                               calendar_id=args.calendar_id,
                               event_id=args.event_id))
 
     elif cmd == "create-event":
-        mod = _init_module(FeishuCalendar, config, _user_token)
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
         attendees = None
         if args.attendees:
             attendees = _safe_json_loads(args.attendees, "--attendees")
@@ -612,7 +632,7 @@ def main():
                                  attendees=attendees))
 
     elif cmd == "update-event":
-        mod = _init_module(FeishuCalendar, config, _user_token)
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
         kwargs = {}
         for k in ("summary", "description", "start_time", "end_time"):
             v = getattr(args, k.replace("-", "_"), None)
@@ -625,13 +645,13 @@ def main():
 
     elif cmd == "delete-event":
         _confirm_guard(args, args.event_id, "event_id")
-        mod = _init_module(FeishuCalendar, config, _user_token)
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
         _output(mod.delete_event(chat_id, sender_id,
                                  calendar_id=args.calendar_id,
                                  event_id=args.event_id))
 
     elif cmd == "reply-event":
-        mod = _init_module(FeishuCalendar, config, _user_token)
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
         _output(mod.reply_event(chat_id, sender_id,
                                 calendar_id=args.calendar_id,
                                 event_id=args.event_id,
@@ -639,7 +659,7 @@ def main():
 
     # Search commands
     elif cmd == "search-docs":
-        mod = _init_module(FeishuSearch, config, _user_token)
+        mod = _init_module(FeishuSearch, config, _user_token, _lark_client)
         _output(mod.search_docs(chat_id, sender_id,
                                 query=args.query,
                                 docs_type=args.type,
@@ -647,7 +667,7 @@ def main():
                                 page_token=args.page_token))
 
     elif cmd == "search-messages":
-        mod = _init_module(FeishuSearch, config, _user_token)
+        mod = _init_module(FeishuSearch, config, _user_token, _lark_client)
         _output(mod.search_messages(chat_id, sender_id,
                                     query=args.query,
                                     target_chat_id=args.chat_id,
@@ -655,7 +675,7 @@ def main():
                                     page_token=args.page_token))
 
     elif cmd == "list-messages":
-        mod = _init_module(FeishuSearch, config, _user_token)
+        mod = _init_module(FeishuSearch, config, _user_token, _lark_client)
         _output(mod.list_messages(chat_id, sender_id,
                                   container_id=args.container_id,
                                   start_time=args.start_time,
@@ -664,7 +684,7 @@ def main():
                                   page_token=args.page_token))
 
     elif cmd == "list-files":
-        mod = _init_module(FeishuSearch, config, _user_token)
+        mod = _init_module(FeishuSearch, config, _user_token, _lark_client)
         _output(mod.list_files(chat_id, sender_id,
                                folder_token=args.folder_token,
                                page_size=args.page_size,
@@ -672,7 +692,7 @@ def main():
 
     # Bitable commands
     elif cmd == "list-bitable-records":
-        mod = _init_module(FeishuBitable, config, _user_token)
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         _output(mod.list_records(chat_id, sender_id,
                                  app_token=args.app_token,
                                  table_id=args.table_id,
@@ -681,14 +701,14 @@ def main():
                                  page_token=args.page_token))
 
     elif cmd == "get-bitable-record":
-        mod = _init_module(FeishuBitable, config, _user_token)
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         _output(mod.get_record(chat_id, sender_id,
                                app_token=args.app_token,
                                table_id=args.table_id,
                                record_id=args.record_id))
 
     elif cmd == "create-bitable-records":
-        mod = _init_module(FeishuBitable, config, _user_token)
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         records = _safe_json_loads(args.records, "--records")
         _output(mod.create_records(chat_id, sender_id,
                                    app_token=args.app_token,
@@ -696,7 +716,7 @@ def main():
                                    records=records))
 
     elif cmd == "update-bitable-records":
-        mod = _init_module(FeishuBitable, config, _user_token)
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         records = _safe_json_loads(args.records, "--records")
         _output(mod.update_records(chat_id, sender_id,
                                    app_token=args.app_token,
@@ -709,33 +729,33 @@ def main():
             print(json.dumps({"error": "record_ids is empty"}))
             sys.exit(1)
         _confirm_guard(args, str(record_ids[0]), "record_id")
-        mod = _init_module(FeishuBitable, config, _user_token)
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         _output(mod.delete_records(chat_id, sender_id,
                                    app_token=args.app_token,
                                    table_id=args.table_id,
                                    record_ids=record_ids))
 
     elif cmd == "create-bitable-app":
-        mod = _init_module(FeishuBitable, config, _user_token)
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         _output(mod.create_app(chat_id, sender_id,
                                name=args.name,
                                folder_token=args.folder_token))
 
     elif cmd == "create-bitable-table":
-        mod = _init_module(FeishuBitable, config, _user_token)
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         _output(mod.create_table(chat_id, sender_id,
                                  app_token=args.app_token,
                                  name=args.name))
 
     elif cmd == "delete-bitable-table":
         _confirm_guard(args, args.table_id, "table_id")
-        mod = _init_module(FeishuBitable, config, _user_token)
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         _output(mod.delete_table(chat_id, sender_id,
                                  app_token=args.app_token,
                                  table_id=args.table_id))
 
     elif cmd == "list-bitable-fields":
-        mod = _init_module(FeishuBitable, config, _user_token)
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         _output(mod.list_fields(chat_id, sender_id,
                                 app_token=args.app_token,
                                 table_id=args.table_id))
@@ -743,7 +763,7 @@ def main():
 
     # Task commands
     elif cmd == "list-tasks":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         completed = None
         if args.completed:
             completed = args.completed == "true"
@@ -753,22 +773,22 @@ def main():
                                page_token=args.page_token))
 
     elif cmd == "get-task":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.get_task(chat_id, sender_id, task_guid=args.guid))
 
     elif cmd == "list-tasklists":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.list_tasklists(chat_id, sender_id,
                                    page_size=args.page_size,
                                    page_token=args.page_token))
 
     elif cmd == "get-tasklist":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.get_tasklist(chat_id, sender_id,
                                  tasklist_guid=args.guid))
 
     elif cmd == "list-tasklist-tasks":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         completed = None
         if args.completed:
             completed = args.completed == "true"
@@ -779,18 +799,18 @@ def main():
                                        page_token=args.page_token))
 
     elif cmd == "complete-task":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.complete_task(chat_id, sender_id, task_guid=args.guid))
 
     elif cmd == "list-subtasks":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.list_subtasks(chat_id, sender_id,
                                   task_guid=args.guid,
                                   page_size=args.page_size,
                                   page_token=args.page_token))
 
     elif cmd == "create-task":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.create_task(chat_id, sender_id,
                                 summary=args.summary,
                                 description=args.description,
@@ -798,7 +818,7 @@ def main():
                                 tasklist_guid=args.tasklist_guid))
 
     elif cmd == "create-subtask":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.create_subtask(chat_id, sender_id,
                                    parent_guid=args.parent_guid,
                                    summary=args.summary,
@@ -807,42 +827,42 @@ def main():
 
 
     elif cmd == "create-tasklist":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.create_tasklist(chat_id, sender_id, name=args.name))
 
     elif cmd == "update-tasklist":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.update_tasklist(chat_id, sender_id,
                                     tasklist_guid=args.guid, name=args.name))
 
     elif cmd == "delete-tasklist":
         _confirm_guard(args, args.guid, "tasklist_guid")
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.delete_tasklist(chat_id, sender_id,
                                     tasklist_guid=args.guid))
 
     elif cmd == "add-task-to-tasklist":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.add_task_to_tasklist(chat_id, sender_id,
                                          task_guid=args.task_guid,
                                          tasklist_guid=args.tasklist_guid))
 
     elif cmd == "remove-task-from-tasklist":
-        mod = _init_module(FeishuTasks, config, _user_token)
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
         _output(mod.remove_task_from_tasklist(chat_id, sender_id,
                                               task_guid=args.task_guid,
                                               tasklist_guid=args.tasklist_guid))
 
     # Drive upload commands
     elif cmd == "upload-file":
-        mod = _init_module(FeishuDrive, config, _user_token)
+        mod = _init_module(FeishuDrive, config, _user_token, _lark_client)
         _output(mod.upload_file(chat_id, sender_id,
                                 file_path=args.file,
                                 folder_token=args.folder_token,
                                 file_name=args.file_name))
 
     elif cmd == "upload-url":
-        mod = _init_module(FeishuDrive, config, _user_token)
+        mod = _init_module(FeishuDrive, config, _user_token, _lark_client)
         _output(mod.upload_from_url(chat_id, sender_id,
                                     url=args.url,
                                     folder_token=args.folder_token,

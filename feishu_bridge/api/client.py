@@ -64,6 +64,18 @@ class FeishuAPI:
             return self._token_override
         return self.auth.ensure_user_token(chat_id, user_open_id, self.SCOPES)
 
+    def get_cached_token(self, user_open_id: str) -> Optional[str]:
+        """Return a valid UAT from cache/refresh only — never prompts.
+
+        Used by background features (auto-fetch URLs) that should not
+        interrupt the user with an auth card.  Does NOT check scopes —
+        auto-fetch only performs reads, and the server enforces scope
+        boundaries, so any valid token is sufficient here.
+        """
+        if self._token_override is not None:
+            return self._token_override
+        return self.auth.get_valid_token(user_open_id)
+
     # HTTP status codes that warrant automatic retry
     _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
     _MAX_RETRIES = 3

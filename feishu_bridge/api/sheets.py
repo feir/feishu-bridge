@@ -49,9 +49,10 @@ class FeishuSheets(FeishuAPI):
     # -------------------------------------------------------------------
 
     def info(self, chat_id: str, user_open_id: str,
-             spreadsheet_token: str) -> Optional[dict]:
+             spreadsheet_token: str, *,
+             prefetched_token: str = None) -> Optional[dict]:
         """Get spreadsheet metadata (title, sheets list, etc.)."""
-        token = self.get_token(chat_id, user_open_id)
+        token = prefetched_token or self.get_token(chat_id, user_open_id)
         if not token:
             return None
 
