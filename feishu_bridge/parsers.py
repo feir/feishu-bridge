@@ -43,12 +43,47 @@ def parse_post_content(content: dict) -> str:
     return "\n".join(parts)
 
 
+def _walk_property_elements(elements: list, parts: list) -> None:
+    """Recursively extract text from CardKit raw format elements.
+
+    CardKit raw format wraps every element in a ``property`` dict:
+    ``element.property.content`` for leaf text, ``element.property.elements``
+    for nested containers.  This is the structure returned by Feishu API
+    for cross-bot forwarded cards (via ``json_card``).
+    """
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        prop = el.get("property", {})
+        if not isinstance(prop, dict):
+            continue
+        # Leaf text
+        if "content" in prop:
+            parts.append(prop["content"])
+        # Nested container
+        if "elements" in prop:
+            _walk_property_elements(prop["elements"], parts)
+
+
 def parse_interactive_content(content: dict) -> Optional[str]:
     """Parse Feishu interactive (card) message content into plain text.
 
-    Supports both legacy card format (schema 1.0: content.elements)
-    and CardKit v2 format (schema 2.0: content.body.elements with "tag": "markdown").
+    Supports three formats:
+    - json_card wrapper: cross-bot forwarded cards with ``json_card`` string field
+    - CardKit v2: ``content.body.elements`` with ``tag: "markdown"``
+    - Legacy (schema 1.0): ``content.elements``
     """
+    if not content or not isinstance(content, dict):
+        return None
+
+    # json_card wrapper: cross-bot forwarded cards wrap content in a
+    # stringified JSON field.  Unwrap before proceeding.
+    if "json_card" in content:
+        try:
+            content = json.loads(content["json_card"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     # CardKit v2: elements under body.elements, text in "content" key
     body = content.get("body")
     if content.get("schema") == "2.0" or (isinstance(body, dict) and "elements" in body):
@@ -68,7 +103,18 @@ def parse_interactive_content(content: dict) -> Optional[str]:
         text_result = "\n".join(p for p in parts if p)
         if text_result:
             return text_result
-        # Fall through to legacy parsing if v2 extraction yielded nothing
+        # Fall through to try raw property format or legacy parsing
+
+    # CardKit raw format: body.property.elements with nested property dicts.
+    # Used by cross-bot forwarded cards returned via json_card.
+    if isinstance(body, dict):
+        prop_elements = body.get("property", {}).get("elements", [])
+        if prop_elements:
+            parts: list[str] = []
+            _walk_property_elements(prop_elements, parts)
+            text_result = "\n".join(p for p in parts if p)
+            if text_result:
+                return text_result
 
     # Legacy card format: elements at top level
     elements = content.get("elements", [])
