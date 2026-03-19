@@ -348,7 +348,7 @@ def build_streaming_card(content: str) -> dict:
     }
 
 
-def build_cardkit_streaming_card(initial_content: str = "") -> dict:
+def build_cardkit_streaming_card() -> dict:
     return {
         "schema": "2.0",
         "config": {
@@ -357,16 +357,33 @@ def build_cardkit_streaming_card(initial_content: str = "") -> dict:
             "summary": {"content": "思考中..."},
         },
         "body": {
-            "elements": [{
-                "tag": "markdown",
-                "element_id": CARDKIT_ELEMENT_ID,
-                "content": initial_content,
-            }],
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "element_id": CARDKIT_ELEMENT_ID,
+                    "content": "",
+                },
+                {
+                    "tag": "note",
+                    "elements": [
+                        {"tag": "plain_text", "content": "⏳ 生成中..."},
+                    ],
+                },
+            ],
         },
     }
 
 
-def build_cardkit_final_card(content: str, is_error: bool = False) -> dict:
+def _format_elapsed(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes}m{secs:.0f}s"
+
+
+def build_cardkit_final_card(content: str, is_error: bool = False,
+                             elapsed_s: float = 0) -> dict:
     chunks: list[str] = []
     remaining = content
     while remaining:
@@ -393,6 +410,19 @@ def build_cardkit_final_card(content: str, is_error: bool = False) -> dict:
         }
         for i, chunk in enumerate(chunks)
     ]
+
+    # Footer with status and elapsed time
+    status = "❌ 出错" if is_error else "✅ 完成"
+    footer_parts = [status]
+    if elapsed_s > 0:
+        footer_parts.append(f"耗时 {_format_elapsed(elapsed_s)}")
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "note",
+        "elements": [
+            {"tag": "plain_text", "content": " · ".join(footer_parts)},
+        ],
+    })
 
     summary_text = re.sub(r"[*`#>\[\]()~_]", "", content)
     summary_text = re.sub(r"\s+", " ", summary_text).strip()
@@ -480,6 +510,7 @@ class ResponseHandle:
         self._card_fallback_timeout = 8
         self._summary_updated = False
         self._terminated = False
+        self._stream_start_time: Optional[float] = None
         self._runner: Optional[ClaudeRunner] = None
         self._runner_tag: Optional[str] = None
 
@@ -525,15 +556,14 @@ class ResponseHandle:
                     self.client, self.source_message_id, self._typing_reaction_id)
                 self._typing_reaction_id = None
 
-            card_id = self._try_create_cardkit(initial_content)
+            card_id = self._try_create_cardkit()
             if card_id:
                 self._use_cardkit = True
                 self._cardkit_card_id = card_id
-                if initial_content:
-                    self._pre_send_content(card_id, initial_content)
                 msg_id = self._send_cardkit_im(card_id)
                 if msg_id:
                     self.card_message_id = msg_id
+                    self._stream_start_time = time.time()
                     log.info("CardKit card created (deferred): card_id=%s msg_id=%s",
                              card_id, msg_id)
                     self._flush_ctrl = FlushController(self._perform_flush, use_cardkit=True)
@@ -605,8 +635,11 @@ class ResponseHandle:
             self._deliver_im_patch(content, is_error)
             return
 
+        elapsed_s = 0.0
+        if self._stream_start_time:
+            elapsed_s = time.time() - self._stream_start_time
         seq = self._next_seq()
-        final_card_json = build_cardkit_final_card(content, is_error)
+        final_card_json = build_cardkit_final_card(content, is_error, elapsed_s=elapsed_s)
         try:
             card_obj = Card.builder() \
                 .type("card_json") \
@@ -714,9 +747,9 @@ class ResponseHandle:
         except Exception:
             log.debug("Pre-send content push failed", exc_info=True)
 
-    def _try_create_cardkit(self, initial_content: str = "") -> Optional[str]:
+    def _try_create_cardkit(self) -> Optional[str]:
         try:
-            card_json = build_cardkit_streaming_card(initial_content)
+            card_json = build_cardkit_streaming_card()
             body = CreateCardRequestBody.builder() \
                 .type("card_json") \
                 .data(json.dumps(card_json, ensure_ascii=False)) \
