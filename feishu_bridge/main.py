@@ -89,7 +89,7 @@ log = logging.getLogger("feishu-bridge")
 # Known bridge commands (exact-match whitelist for gate exemption).
 _BRIDGE_CMD_EXACT = frozenset({
     "/help", "/new", "/clear", "/reset", "/stop", "/cancel",
-    "/compact", "/model", "/cost", "/context",
+    "/compact", "/model", "/status",
     "/restart-all", "/restart",
 })
 
@@ -827,8 +827,8 @@ class FeishuBot:
                 bridge_cmd = "compact"
             elif cmd == "/model":
                 bridge_cmd = "model"
-            elif cmd == "/cost":
-                bridge_cmd = "cost"
+            elif cmd in ("/status", "/cost", "/context"):
+                bridge_cmd = "status"
             elif cmd == "/feishu-tasks":
                 bridge_cmd = "feishu-tasks"
             elif cmd == "/feishu-doc":
@@ -849,11 +849,11 @@ class FeishuBot:
                     "sender_id": sender_id,
                     "_queued_reaction_id": None,
                 }
-                # Heavy commands (/compact, /new, /reset, /clear, /cost)
+                # Heavy commands (/compact, /new, /reset, /clear, /status)
                 # serialize with normal messages via ChatTaskQueue.
-                # Light commands (/help, /stop, /cancel, /status, /model,
-                # /feishu-*) go directly to work queue.
-                _heavy_cmds = {"new", "compact", "cost"}
+                # Light commands (/help, /stop, /cancel, /model, /feishu-*)
+                # go directly to work queue.
+                _heavy_cmds = {"new", "compact", "status"}
                 if bridge_cmd in _heavy_cmds:
                     bc_key = SessionMap._key_str(
                         (self.bot_id, chat_id, thread_id))

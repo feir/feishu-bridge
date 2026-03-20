@@ -55,8 +55,7 @@ class BridgeCommandHandler:
                 lines.append("`/compact [指示]` — 压缩当前会话上下文")
             lines.extend([
                 "`/model [模型名]` — 查看或切换模型",
-                "`/cost` — 查看当前会话 token 用量",
-                "`/context` — 查看当前 context 使用率",
+                "`/status` — 查看会话状态（context / 费用 / 配额）",
                 "`/feishu-tasks [命令]` — 飞书任务管理（list/get/subtasks/add-subtask）",
                 "`/feishu-doc` — 云文档读写（Markdown）",
                 "`/feishu-sheet` — 电子表格读写",
@@ -125,118 +124,8 @@ class BridgeCommandHandler:
                 self.bot.runner.model = arg
                 handle.deliver(f"模型已设置为 `{arg}`（未识别的名称，将直接传递给 CLI）")
 
-        elif cmd == "cost":
-            key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
-            sid = self.bot.session_map.get(key)
-            if not sid:
-                handle.deliver("当前没有活跃会话。")
-                return
-            cost_info = self.bot._session_cost.get(sid)
-            if cost_info:
-                usage = cost_info.get("usage", {})
-                model_usage = cost_info.get("model_usage", {})
-                turn_cost = cost_info.get("total_cost_usd", 0)
-                accumulated = cost_info.get("accumulated_cost_usd", turn_cost)
-                inp = usage.get("input_tokens", 0)
-                out = usage.get("output_tokens", 0)
-                cache_read = usage.get("cache_read_input_tokens", 0)
-                cache_create = usage.get("cache_creation_input_tokens", 0)
-                lines = [
-                    "**会话用量**",
-                    f"输入: {inp:,} tokens",
-                    f"  cache read: {cache_read:,} / cache create: {cache_create:,}",
-                    f"输出: {out:,} tokens",
-                ]
-                if turn_cost is not None:
-                    lines.append(f"本次费用: ${turn_cost:.4f}")
-                    lines.append(f"累计费用: **${accumulated:.4f}**")
-                else:
-                    lines.append("费用: —（此 Agent 不提供费用数据）")
-                if model_usage:
-                    lines.append("")
-                    for model, mu in model_usage.items():
-                        lines.append(
-                            f"  {model}: in={mu.get('inputTokens', 0):,} out={mu.get('outputTokens', 0):,}"
-                        )
-                handle.deliver("\n".join(lines))
-            else:
-                handle.deliver("暂无用量数据（首次消息后可用）。")
-
-
-        elif cmd == "context":
-            key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
-            sid = self.bot.session_map.get(key)
-            if not sid:
-                handle.deliver("当前没有活跃会话。")
-                return
-            cost_info = self.bot._session_cost.get(sid)
-            if not cost_info or not cost_info.get("usage"):
-                handle.deliver("暂无 context 数据（首次消息后可用）。")
-                return
-            # Prefer last_call_usage (per-API-call) over cumulative usage
-            usage = cost_info.get("last_call_usage") or cost_info["usage"]
-            model_usage = cost_info.get("model_usage", {})
-            inp = usage.get("input_tokens", 0)
-            cache_read = usage.get("cache_read_input_tokens", 0)
-            cache_create = usage.get("cache_creation_input_tokens", 0)
-            total_ctx = inp + cache_read + cache_create
-            # Use actual context window from modelUsage, fallback to runner default
-            max_ctx = self.bot.runner.get_default_context_window()
-            model_name = ""
-            for m, mu in model_usage.items():
-                cw = mu.get("contextWindow", 0)
-                if cw > 0:
-                    max_ctx = cw
-                    model_name = m
-                    break
-            pct = total_ctx / max_ctx * 100 if max_ctx else 0
-            filled = int(pct / 5)
-            bar = "\u2593" * filled + "\u2591" * (20 - filled)
-            lines = [
-                "**Context 使用率**",
-                f"`{bar}` {pct:.1f}%",
-                f"{total_ctx:,} / {max_ctx:,} tokens",
-            ]
-            if model_name:
-                lines.append(f"模型: {model_name}")
-            if cache_read:
-                cache_pct = cache_read / total_ctx * 100 if total_ctx else 0
-                lines.append(f"cache hit: {cache_read:,} ({cache_pct:.0f}%)")
-            accumulated = cost_info.get("accumulated_cost_usd", cost_info.get("total_cost_usd") or 0)
-            if accumulated is not None and accumulated > 0:
-                lines.append(f"累计费用: ${accumulated:.4f}")
-            compact_hint = " 或 `/compact` 压缩" if self.bot.runner.supports_compact() else ""
-            if pct >= 85:
-                lines.append(f"\U0001f534 建议 `/new` 新会话{compact_hint}")
-            elif pct >= 70:
-                compact_short = "，可考虑 `/compact`" if self.bot.runner.supports_compact() else ""
-                lines.append(f"\U0001f7e1 接近上限{compact_short}")
-            # Rate limit info
-            rli = cost_info.get("rate_limit_info")
-            if rli:
-                utilization = rli.get("utilization", 0)
-                status = rli.get("status", "")
-                limit_type = rli.get("rateLimitType", "")
-                label = "7 天" if "seven_day" in limit_type else "5 小时"
-                pct_str = f"{utilization:.0%}"
-                if status == "rejected":
-                    import time as _time
-                    resets_at = rli.get("resetsAt", 0)
-                    remaining = max(0, resets_at - _time.time()) if resets_at else 0
-                    hours, mins = divmod(int(remaining) // 60, 60)
-                    reset_str = f"，{hours}h{mins:02d}m 后重置" if remaining > 0 else ""
-                    lines.append(f"\n**配额**\n🚫 {label}配额已用尽（{pct_str}）{reset_str}")
-                elif utilization > 0:
-                    icon = "🔴" if utilization >= 0.8 else "🟡" if utilization >= 0.5 else "🟢"
-                    lines.append(f"\n**配额**\n{icon} {label}: {pct_str}")
-                    resets_at = rli.get("resetsAt", 0)
-                    if resets_at:
-                        import time as _time
-                        remaining = max(0, resets_at - _time.time())
-                        hours, mins = divmod(int(remaining) // 60, 60)
-                        if remaining > 0:
-                            lines.append(f"  重置: {hours}h{mins:02d}m 后")
-            handle.deliver("\n".join(lines))
+        elif cmd == "status":
+            self._handle_status(item, handle)
 
         elif cmd == "feishu-tasks":
             self._handle_feishu_tasks(item, handle)
@@ -269,6 +158,104 @@ class BridgeCommandHandler:
         if action == "help":
             return self._task_help()
         return self._task_help()
+
+    def _handle_status(self, item: dict, handle):
+        """Unified /status: context + cost + quota in one view."""
+        key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
+        sid = self.bot.session_map.get(key)
+        if not sid:
+            handle.deliver("当前没有活跃会话。")
+            return
+        cost_info = self.bot._session_cost.get(sid)
+        if not cost_info:
+            handle.deliver("暂无数据（首次消息后可用）。")
+            return
+
+        lines: list[str] = []
+
+        # --- Section 1: Context ---
+        usage = cost_info.get("last_call_usage") or cost_info.get("usage") or {}
+        model_usage = cost_info.get("model_usage", {})
+        inp = usage.get("input_tokens", 0)
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        cache_create = usage.get("cache_creation_input_tokens", 0)
+        total_ctx = inp + cache_read + cache_create
+
+        max_ctx = self.bot.runner.get_default_context_window()
+        model_name = self.bot.runner.model or ""
+        for m, mu in model_usage.items():
+            cw = mu.get("contextWindow", 0)
+            if cw > 0:
+                max_ctx = cw
+                model_name = m
+                break
+
+        pct = total_ctx / max_ctx * 100 if max_ctx else 0
+        filled = int(pct / 5)
+        bar = "\u2593" * filled + "\u2591" * (20 - filled)
+
+        # Context header with bar
+        lines.append(f"**Context** `{bar}` **{pct:.0f}%**")
+        meta_parts = [f"{total_ctx:,} / {max_ctx:,} tokens"]
+        if model_name:
+            meta_parts.append(model_name)
+        lines.append(" · ".join(meta_parts))
+        if cache_read and total_ctx:
+            cache_pct = cache_read / total_ctx * 100
+            lines.append(f"cache hit: {cache_read:,} ({cache_pct:.0f}%)")
+
+        # Context warning
+        compact_hint = " 或 `/compact`" if self.bot.runner.supports_compact() else ""
+        if pct >= 85:
+            lines.append(f"\U0001f534 建议 `/new`{compact_hint}")
+        elif pct >= 70:
+            lines.append(f"\U0001f7e1 接近上限{compact_hint}")
+
+        # --- Section 2: Cost ---
+        turn_cost = cost_info.get("total_cost_usd")
+        accumulated = cost_info.get("accumulated_cost_usd", turn_cost or 0)
+        out_tokens = usage.get("output_tokens", 0)
+
+        if turn_cost is not None:
+            lines.append("")
+            cost_parts = []
+            if turn_cost > 0:
+                cost_parts.append(f"本次 ${turn_cost:.4f}")
+            if accumulated and accumulated > 0:
+                cost_parts.append(f"累计 **${accumulated:.4f}**")
+            if cost_parts:
+                lines.append("**费用** " + " · ".join(cost_parts))
+            lines.append(f"in: {inp + cache_read + cache_create:,} · out: {out_tokens:,}")
+
+        # --- Section 3: Quota ---
+        rli = cost_info.get("rate_limit_info")
+        if rli:
+            utilization = rli.get("utilization", 0)
+            status = rli.get("status", "")
+            limit_type = rli.get("rateLimitType", "")
+            label = "7d" if "seven_day" in limit_type else "5h"
+
+            lines.append("")
+            if status == "rejected":
+                import time as _time
+                resets_at = rli.get("resetsAt", 0)
+                remaining = max(0, resets_at - _time.time()) if resets_at else 0
+                hours, mins = divmod(int(remaining) // 60, 60)
+                reset_str = f" · 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
+                lines.append(f"**配额** \U0001f6ab {label} 已用尽（{utilization:.0%}）{reset_str}")
+            elif utilization > 0:
+                icon = "\U0001f534" if utilization >= 0.8 else "\U0001f7e1" if utilization >= 0.5 else "\U0001f7e2"
+                line = f"**配额** {icon} {label}: {utilization:.0%}"
+                resets_at = rli.get("resetsAt", 0)
+                if resets_at:
+                    import time as _time
+                    remaining = max(0, resets_at - _time.time())
+                    hours, mins = divmod(int(remaining) // 60, 60)
+                    if remaining > 0:
+                        line += f" · 重置 {hours}h{mins:02d}m"
+                lines.append(line)
+
+        handle.deliver("\n".join(lines))
 
     def _handle_feishu_tasks(self, item: dict, handle):
         if not self.bot.feishu_tasks:
