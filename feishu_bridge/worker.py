@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import uuid
 
 from feishu_bridge.parsers import (
@@ -584,6 +585,15 @@ def process_message(
                     "accumulated_cost_usd": prev_accumulated + (result.get("total_cost_usd") or 0),
                     "rate_limit_info": result.get("rate_limit_info") or existing.get("rate_limit_info"),
                 }
+
+        # --- Strip trailing Status: line (redundant with card footer) ---
+        _text = result.get("result") or ""
+        _text = re.sub(
+            r"\n*Status: (?:DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT)\b[^\n]*$",
+            "", _text,
+        ).rstrip()
+        if _text:
+            result["result"] = _text
 
         # --- Context health alert ---
         if effective_sid and not result.get("is_error"):
