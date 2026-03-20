@@ -83,11 +83,17 @@ Call it with `feishu-cli <command> [args]`.
 - `delete-bitable-table --app-token <token> --table-id <id> --confirm <id_prefix>` ⚠️
 
 **Record**
-- `list-bitable-records --app-token <token> --table-id <id> [--filter <expr>]`
+- `list-bitable-records --app-token <token> --table-id <id> [--filter <expr>] [--sort '<json>'] [--field-names '<json>']`
+  - `--filter`: JSON filter object. Operators: `is`, `isNot`, `contains`, `doesNotContain`, `isEmpty`, `isNotEmpty`, `isGreater`, `isLess`
+    - Single: `'{"conjunction":"and","conditions":[{"field_name":"Status","operator":"is","value":["Done"]}]}'`
+    - Multi: `'{"conjunction":"and","conditions":[{"field_name":"Priority","operator":"is","value":["High"]},{"field_name":"Status","operator":"isNot","value":["Done"]}]}'`
+  - `--sort`: e.g. `'[{"field_name":"Created","desc":true}]'`
+  - `--field-names`: e.g. `'["Name","Status"]'` — only return listed fields (reduces payload)
 - `get-bitable-record --app-token <token> --table-id <id> --record-id <id>`
 - `create-bitable-records --app-token <token> --table-id <id> --records '<json_array>'`
 - `update-bitable-records --app-token <token> --table-id <id> --records '<json_array>'`
 - `delete-bitable-records --app-token <token> --table-id <id> --record-ids '<json_array>' --confirm <id_prefix>` ⚠️
+- Field value formats for records: Text→`"plain string"`, Number→`123`, SingleSelect→`"option name"`, MultiSelect→`["opt1","opt2"]`, Checkbox→`true/false`, DateTime→`unix_ms`, URL→`{"link":"...","text":"..."}`, User→`[{"id":"ou_xxx"}]`
 
 **Field**
 - `list-bitable-fields --app-token <token> --table-id <id>`

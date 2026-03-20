@@ -444,7 +444,9 @@ def main():
     p = sub.add_parser("list-bitable-records", help="List bitable records")
     p.add_argument("--app-token", required=True)
     p.add_argument("--table-id", required=True)
-    p.add_argument("--filter")
+    p.add_argument("--filter", help='JSON filter object, e.g. \'{"conjunction":"and","conditions":[{"field_name":"Status","operator":"is","value":["Done"]}]}\'')
+    p.add_argument("--sort", help='JSON array of sort specs, e.g. \'[{"field_name":"Created","desc":true}]\'')
+    p.add_argument("--field-names", help="JSON array of field names to return (reduces payload)")
     p.add_argument("--page-size", type=int, default=100)
     p.add_argument("--page-token")
 
@@ -996,10 +998,17 @@ def main():
     # Bitable commands — Record
     elif cmd == "list-bitable-records":
         mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        filter_ = (_safe_json_loads(args.filter, "--filter")
+                   if args.filter else None)
+        sort = _safe_json_loads(args.sort, "--sort") if args.sort else None
+        field_names = (_safe_json_loads(args.field_names, "--field-names")
+                       if args.field_names else None)
         _output(mod.list_records(chat_id, sender_id,
                                  app_token=args.app_token,
                                  table_id=args.table_id,
-                                 filter_=args.filter,
+                                 filter_=filter_,
+                                 sort=sort,
+                                 field_names=field_names,
                                  page_size=args.page_size,
                                  page_token=args.page_token))
 
