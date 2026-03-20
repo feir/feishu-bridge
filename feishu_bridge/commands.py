@@ -211,6 +211,31 @@ class BridgeCommandHandler:
             elif pct >= 70:
                 compact_short = "，可考虑 `/compact`" if self.bot.runner.supports_compact() else ""
                 lines.append(f"\U0001f7e1 接近上限{compact_short}")
+            # Rate limit info
+            rli = cost_info.get("rate_limit_info")
+            if rli:
+                utilization = rli.get("utilization", 0)
+                status = rli.get("status", "")
+                limit_type = rli.get("rateLimitType", "")
+                label = "7 天" if "seven_day" in limit_type else "5 小时"
+                pct_str = f"{utilization:.0%}"
+                if status == "rejected":
+                    import time as _time
+                    resets_at = rli.get("resetsAt", 0)
+                    remaining = max(0, resets_at - _time.time()) if resets_at else 0
+                    hours, mins = divmod(int(remaining) // 60, 60)
+                    reset_str = f"，{hours}h{mins:02d}m 后重置" if remaining > 0 else ""
+                    lines.append(f"\n**配额**\n🚫 {label}配额已用尽（{pct_str}）{reset_str}")
+                elif utilization > 0:
+                    icon = "🔴" if utilization >= 0.8 else "🟡" if utilization >= 0.5 else "🟢"
+                    lines.append(f"\n**配额**\n{icon} {label}: {pct_str}")
+                    resets_at = rli.get("resetsAt", 0)
+                    if resets_at:
+                        import time as _time
+                        remaining = max(0, resets_at - _time.time())
+                        hours, mins = divmod(int(remaining) // 60, 60)
+                        if remaining > 0:
+                            lines.append(f"  重置: {hours}h{mins:02d}m 后")
             handle.deliver("\n".join(lines))
 
         elif cmd == "feishu-tasks":

@@ -55,14 +55,42 @@ def _context_health_alert(result: dict) -> str | None:
         return None
 
     pct = total_ctx / max_ctx * 100
+
+    # Rate limit alert (append to context alert if applicable)
+    rate_alert = ""
+    rli = result.get("rate_limit_info")
+    if rli:
+        utilization = rli.get("utilization", 0)
+        status = rli.get("status", "")
+        if status == "rejected":
+            resets_at = rli.get("resetsAt", 0)
+            limit_type = rli.get("rateLimitType", "")
+            label = "7 天" if "seven_day" in limit_type else "5 小时"
+            if resets_at:
+                import time as _time
+                remaining = max(0, resets_at - _time.time())
+                hours, mins = divmod(int(remaining) // 60, 60)
+                reset_str = f"，约 {hours}h{mins:02d}m 后重置" if remaining > 0 else ""
+            else:
+                reset_str = ""
+            rate_alert = f"\n🚫 {label}配额已用尽（{utilization:.0%}）{reset_str}"
+        elif status == "allowed_warning" and utilization >= 0.75:
+            limit_type = rli.get("rateLimitType", "")
+            label = "7 天" if "seven_day" in limit_type else "5 小时"
+            rate_alert = f"\n⚠️ {label}配额 {utilization:.0%}"
+
     if pct >= 85:
         return (
             f"\n\n---\n🔴 Context {pct:.0f}% — 建议 `/new` 新会话或 `/compact` 压缩"
+            + rate_alert
         )
     if pct >= 70:
         return (
             f"\n\n---\n🟡 Context {pct:.0f}% — 可考虑 `/compact` 压缩上下文"
+            + rate_alert
         )
+    if rate_alert:
+        return f"\n\n---{rate_alert}"
     return None
 
 
@@ -554,6 +582,7 @@ def process_message(
                     "model_usage": result.get("modelUsage", {}),
                     "total_cost_usd": result.get("total_cost_usd"),
                     "accumulated_cost_usd": prev_accumulated + (result.get("total_cost_usd") or 0),
+                    "rate_limit_info": result.get("rate_limit_info") or existing.get("rate_limit_info"),
                 }
 
         # --- Context health alert ---

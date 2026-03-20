@@ -74,6 +74,7 @@ class RunResult:
     peak_context_tokens: int = 0
     compact_detected: bool = False
     default_context_window: int = 200_000
+    rate_limit_info: Optional[dict] = None
 
     def to_dict(self) -> dict:
         """向后兼容：转为 dict，保持 camelCase key。"""
@@ -93,6 +94,7 @@ class StreamState:
     last_call_usage: Optional[dict] = None
     peak_context_tokens: int = 0
     compact_detected: bool = False
+    rate_limit_info: Optional[dict] = None
     is_error: bool = False
     done: bool = False
     pending_output: list[str] = field(default_factory=list)
@@ -693,6 +695,7 @@ class BaseRunner(ABC):
             "is_error": state.is_error,
             "peak_context_tokens": state.peak_context_tokens,
             "compact_detected": state.compact_detected,
+            "rate_limit_info": state.rate_limit_info,
         }
 
 
@@ -759,6 +762,10 @@ class ClaudeRunner(BaseRunner):
                               + msg_usage.get("cache_creation_input_tokens", 0))
                 if ctx_tokens > state.peak_context_tokens:
                     state.peak_context_tokens = ctx_tokens
+        elif etype == "rate_limit_event":
+            rli = event.get("rate_limit_info")
+            if rli:
+                state.rate_limit_info = rli
         elif etype == "stream_event":
             inner = event.get("event", {})
             if (inner.get("type") == "content_block_delta"
@@ -832,6 +839,7 @@ class ClaudeRunner(BaseRunner):
                 "total_cost_usd": fr.get("total_cost_usd"),
                 "peak_context_tokens": state.peak_context_tokens,
                 "compact_detected": state.compact_detected,
+                "rate_limit_info": state.rate_limit_info,
             }
 
         if state.accumulated_text and not fr.get("result"):
@@ -851,6 +859,7 @@ class ClaudeRunner(BaseRunner):
             "total_cost_usd": fr.get("total_cost_usd"),
             "peak_context_tokens": state.peak_context_tokens,
             "compact_detected": state.compact_detected,
+            "rate_limit_info": state.rate_limit_info,
         }
 
     def get_model_aliases(self):
