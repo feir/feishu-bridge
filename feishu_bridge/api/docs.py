@@ -57,19 +57,20 @@ class FeishuDocs(FeishuAPI):
         return self.mcp_call("fetch-doc", args, token)
 
     def update(self, chat_id: str, user_open_id: str,
-               doc_id: str, markdown: str,
+               doc_id: str, markdown: str = "",
                mode: str = "overwrite",
                selection: str = None,
+               selection_by_title: str = None,
                new_title: str = None) -> Optional[dict]:
         """Update document content with Markdown.
 
         Args:
             doc_id: document ID or URL
-            markdown: Markdown content to write
+            markdown: Markdown content to write (not required for delete_range/replace_all)
             mode: one of "overwrite", "append", "replace_range",
                   "replace_all", "insert_before", "insert_after", "delete_range"
-            selection: text selection for range-based modes
-                       (use "selection_with_ellipsis" format)
+            selection: text selection via ellipsis format (mutually exclusive with selection_by_title)
+            selection_by_title: heading-based section selection, e.g. "## 章节标题"
             new_title: optional new document title
 
         Returns:
@@ -79,9 +80,13 @@ class FeishuDocs(FeishuAPI):
         if not token:
             return None
 
-        args = {"doc_id": doc_id, "markdown": markdown, "mode": mode}
+        args = {"doc_id": doc_id, "mode": mode}
+        if mode != "delete_range":
+            args["markdown"] = markdown
         if selection:
             args["selection_with_ellipsis"] = selection
+        elif selection_by_title:
+            args["selection_by_title"] = selection_by_title
         if new_title:
             args["new_title"] = new_title
 

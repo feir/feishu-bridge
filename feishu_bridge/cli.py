@@ -152,9 +152,12 @@ def main():
 
     p = sub.add_parser("update-doc", help="Update document content")
     p.add_argument("--token", required=True)
-    p.add_argument("--markdown", required=True)
-    p.add_argument("--mode", default="overwrite")
-    p.add_argument("--selection")
+    p.add_argument("--markdown")
+    _UPDATE_MODES = ("overwrite", "append", "replace_range", "replace_all",
+                     "insert_before", "insert_after", "delete_range")
+    p.add_argument("--mode", required=True, choices=_UPDATE_MODES)
+    p.add_argument("--selection", help="Text selection (ellipsis format)")
+    p.add_argument("--selection-by-title", help="Section heading selection")
     p.add_argument("--new-title")
 
     p = sub.add_parser("delete-doc", help="Delete a document")
@@ -473,10 +476,28 @@ def main():
                            wiki_space=args.wiki_space))
 
     elif cmd == "update-doc":
+        need_sel = args.mode in ('replace_range', 'insert_before',
+                                 'insert_after', 'delete_range')
+        has_sel = bool(args.selection)
+        has_title = bool(getattr(args, 'selection_by_title', None))
+        if need_sel and not has_sel and not has_title:
+            _output({"error": f"--mode {args.mode} requires --selection or --selection-by-title"})
+            sys.exit(1)
+        if has_sel and has_title:
+            _output({"error": "--selection and --selection-by-title are mutually exclusive"})
+            sys.exit(1)
+        if args.mode not in ('delete_range', 'replace_all') and not args.markdown:
+            _output({"error": f"--mode {args.mode} requires --markdown"})
+            sys.exit(1)
+        if args.mode in ('overwrite', 'append') and (has_sel or has_title):
+            log.warning("--selection/--selection-by-title ignored for mode '%s'",
+                        args.mode)
         mod = _init_module(FeishuDocs, config, _user_token, _lark_client)
         _output(mod.update(chat_id, sender_id, doc_id=args.token,
-                           markdown=args.markdown, mode=args.mode,
+                           markdown=args.markdown or "",
+                           mode=args.mode,
                            selection=args.selection,
+                           selection_by_title=getattr(args, 'selection_by_title', None),
                            new_title=args.new_title))
 
     elif cmd == "delete-doc":
