@@ -827,7 +827,7 @@ class FeishuBot:
                 bridge_cmd = "compact"
             elif cmd == "/model":
                 bridge_cmd = "model"
-            elif cmd in ("/status", "/cost", "/context"):
+            elif cmd == "/status":
                 bridge_cmd = "status"
             elif cmd == "/feishu-tasks":
                 bridge_cmd = "feishu-tasks"
