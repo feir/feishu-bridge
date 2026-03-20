@@ -124,6 +124,82 @@ $ feishu-bridge --bot my-bot
 - `allowed_users`：允许使用的用户 ID 列表，`["*"]` 表示所有人
 - `allowed_chats`（可选）：允许的群聊 ID 列表
 - `model`（可选）：默认 Claude 模型，默认 `claude-opus-4-6`
+- `group_policy`（可选）：群聊响应策略，详见下方说明
+
+### 群聊响应策略
+
+通过 `group_policy` 配置 bot 在群聊中的响应行为。不配置时为兼容模式（响应所有消息）。
+
+```json
+{
+  "name": "my-bot",
+  "allowed_users": "*",
+  "group_policy": {
+    "default_mode": "mention-all",
+    "owner": "ou_xxx",
+    "groups": {
+      "oc_group_id_1": { "mode": "auto-reply" },
+      "oc_group_id_2": { "mode": "disabled" }
+    }
+  }
+}
+```
+
+#### 四种模式
+
+| 模式 | 行为 | 适用场景 |
+|------|------|----------|
+| `owner-only` | 仅 owner @bot 时响应 | 个人专属 bot，拉入群仅供自己使用 |
+| `mention-all` | 任何人 @bot 时响应 | 团队共享 bot |
+| `auto-reply` | 响应群内所有消息（无需 @） | 小群或专用工作群 |
+| `disabled` | 不响应群消息 | 配合 per-group 覆盖实现"仅指定群" |
+
+#### 配置字段
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `default_mode` | 是 | 默认模式，所有群生效 |
+| `owner` | `owner-only` 时必填 | owner 的 `open_id`（如 `ou_xxx`） |
+| `groups` | 否 | 按 `chat_id` 覆盖特定群的模式 |
+
+#### 配置示例
+
+**个人 bot（默认）**：所有群仅 owner @bot 响应
+```json
+"group_policy": {
+  "default_mode": "owner-only",
+  "owner": "ou_your_open_id"
+}
+```
+
+**团队共享 bot**：所有人 @bot 可触发
+```json
+"allowed_users": "*",
+"group_policy": {
+  "default_mode": "mention-all",
+  "owner": "ou_admin_open_id"
+}
+```
+
+**仅指定群响应**：默认不响应，特定群开放
+```json
+"group_policy": {
+  "default_mode": "disabled",
+  "owner": "ou_admin_open_id",
+  "groups": {
+    "oc_allowed_group": { "mode": "mention-all" }
+  }
+}
+```
+
+#### 注意事项
+
+- **私聊不受影响** — `group_policy` 仅控制群聊行为，私聊始终正常响应
+- **`allowed_users` 前置过滤** — `mention-all` 和 `auto-reply` 模式需要 `allowed_users: "*"`，否则非白名单用户的消息在到达门控前就被拒绝
+- **DM 副作用** — 将 `allowed_users` 设为 `"*"` 时，私聊也会对所有飞书用户开放
+- **破坏性命令保护** — 群内 `/restart`、`/restart-all`、`/stop` 仅 owner 可执行
+- **bridge 命令豁免** — `/help`、`/model` 等非破坏性命令不受门控限制
+- **回滚方式** — 删除 `group_policy` 配置块并重启即可恢复原始行为
 
 ### CLI 工具
 
@@ -173,7 +249,8 @@ pytest tests/unit/ -v
 
 ## TODO
 
-- [ ] 群聊设定和优化
+- [x] 群聊响应策略（owner-only / mention-all / auto-reply / disabled + per-group 覆盖）
+- [ ] 独立 DM 策略（解耦 `allowed_users` 对私聊和群聊的双重控制）
 
 ## License
 

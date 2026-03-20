@@ -91,6 +91,42 @@ WORKER_COUNT = 4
 
 log = logging.getLogger("feishu-bridge")
 
+# Known bridge commands (exact-match whitelist for gate exemption).
+_BRIDGE_CMD_EXACT = frozenset({
+    "/help", "/new", "/clear", "/reset", "/stop", "/cancel",
+    "/compact", "/model", "/cost", "/context",
+    "/restart-all", "/restart",
+})
+
+
+def _strip_mentions(raw_text: str, mentions) -> str:
+    """Remove @mention placeholder keys from text."""
+    for mention in (mentions or []):
+        mk = getattr(mention, 'key', '')
+        if mk:
+            raw_text = raw_text.replace(mk, '')
+    return raw_text.strip()
+
+
+def _is_bridge_command(text: str) -> bool:
+    """Check if text is a known bridge command (exact first-token match).
+
+    Only /feishu- uses prefix matching (covers /feishu-tasks, /feishu-doc, etc.).
+    All other commands require exact match to prevent gate bypass via crafted prefixes.
+    """
+    t = text.lstrip().lower()
+    first_token = t.split(None, 1)[0] if t else ""
+    return first_token in _BRIDGE_CMD_EXACT or first_token.startswith("/feishu-")
+
+
+def _reject_not_owner(client, chat_id, thread_id, message_id):
+    """Send rejection for non-owner destructive command attempt."""
+    try:
+        ResponseHandle(client, chat_id, thread_id, message_id).deliver(
+            "该命令仅限 bot 管理员使用。")
+    except Exception:
+        log.warning("Failed to send owner-reject message", exc_info=True)
+
 
 # ============================================================
 # Config
@@ -171,6 +207,57 @@ def load_config(config_path: str, bot_name: str) -> dict:
     claude_cfg["_resolved_command"] = resolved_cmd
     log.info("Claude CLI: %s", resolved_cmd)
 
+    # ------------------------------------------------------------------
+    # group_policy validation
+    # ------------------------------------------------------------------
+    _VALID_MODES = {"owner-only", "mention-all", "auto-reply", "disabled"}
+    gp = bot.get("group_policy")
+    if gp is not None:
+        dm = gp.get("default_mode")
+        if not dm:
+            log.error("group_policy requires 'default_mode' field")
+            sys.exit(1)
+        if dm not in _VALID_MODES:
+            log.error("group_policy.default_mode '%s' invalid; must be one of %s",
+                      dm, _VALID_MODES)
+            sys.exit(1)
+        owner = gp.get("owner")
+        allowed = bot.get("allowed_users", ["*"])
+
+        # owner-only without owner
+        if dm == "owner-only" and not owner:
+            log.warning("group_policy.default_mode is 'owner-only' but 'owner' "
+                        "is not set — all owner-only groups will reject messages")
+
+        # mention-all / auto-reply with restricted allowed_users
+        if dm in ("mention-all", "auto-reply") and allowed != ["*"]:
+            log.warning("group_policy.default_mode '%s' with restricted "
+                        "allowed_users — non-listed users will be silently "
+                        "rejected before group gate", dm)
+
+        # owner-only with restricted allowed_users that doesn't include owner
+        if dm == "owner-only" and owner and allowed != ["*"] and owner not in allowed:
+            log.warning("group_policy owner '%s' not in allowed_users — "
+                        "owner messages will be rejected before gate", owner)
+
+        # Per-group overrides validation
+        for gid, gcfg in gp.get("groups", {}).items():
+            gmode = gcfg.get("mode")
+            if not gmode or gmode not in _VALID_MODES:
+                log.warning("group_policy.groups['%s'] has invalid mode '%s', "
+                            "will fall back to default_mode '%s'", gid, gmode, dm)
+                gcfg["mode"] = dm  # normalize to default
+            resolved = gcfg.get("mode", dm)
+            if resolved in ("mention-all", "auto-reply") and allowed != ["*"]:
+                log.warning("group '%s' mode '%s' with restricted allowed_users "
+                            "— non-listed users silently rejected", gid, resolved)
+            if resolved == "owner-only" and not owner:
+                log.warning("group '%s' mode 'owner-only' but owner not set "
+                            "— group messages will be rejected", gid)
+            if resolved == "owner-only" and owner and allowed != ["*"] and owner not in allowed:
+                log.warning("group '%s' mode 'owner-only' but owner '%s' not in "
+                            "allowed_users — owner messages will be rejected before gate", gid, owner)
+
     # Log config (mask secrets)
     masked = {**bot, "app_secret": "***"}
     log.info("Bot config: %s", json.dumps(masked, ensure_ascii=False))
@@ -232,6 +319,18 @@ class FeishuBot:
         self.allowed_chats = self.bot_config.get("allowed_chats", ["*"])
         self._todo_auto_drive = config.get("todo_auto_drive", True)
         self._all_bot_names = config.get("all_bot_names", [self.bot_id])
+        self.bot_open_id: str | None = None  # set by main() via fetch_bot_info
+
+        # Group policy (None = legacy/compat mode: process all messages)
+        gp = self.bot_config.get("group_policy")
+        if gp:
+            self._group_default_mode = gp.get("default_mode", "auto-reply")
+            self._group_owner = gp.get("owner")
+            self._group_overrides: dict = gp.get("groups", {})
+        else:
+            self._group_default_mode = None
+            self._group_owner = None
+            self._group_overrides = {}
         self._session_cost: dict[str, dict] = {}  # sid -> last {usage, model_usage, total_cost_usd}
 
         # Components
@@ -299,6 +398,73 @@ class FeishuBot:
             self.feishu_calendar = None
             self.feishu_search = None
             log.warning("Feishu API services unavailable (missing dependencies)")
+
+    def _check_group_gate(self, chat_type, sender_id, mentions, chat_id) -> bool:
+        """Group chat gate policy. Returns True to allow, False to reject."""
+        # p2p (DM) — always pass, no group gate
+        if chat_type == "p2p":
+            return True
+
+        # No group_policy configured — compat mode, pass all
+        if self._group_default_mode is None:
+            return True
+
+        # Resolve mode for this chat (per-group override or default)
+        override = self._group_overrides.get(chat_id)
+        mode = (override.get("mode", self._group_default_mode)
+                if override else self._group_default_mode)
+
+        if mode == "auto-reply":
+            return True
+
+        if mode == "disabled":
+            log.debug("Group gate REJECT (disabled): chat=%s", chat_id)
+            return False
+
+        # Check if bot was @mentioned
+        bot_mentioned = False
+        if self.bot_open_id:
+            for m in (mentions or []):
+                mid = getattr(m, 'id', None)
+                if mid and getattr(mid, 'open_id', None) == self.bot_open_id:
+                    bot_mentioned = True
+                    break
+
+        if mode == "mention-all":
+            if not self.bot_open_id:
+                # Degradation: pass-through when bot_open_id unknown
+                log.warning("Group gate pass-through (mention-all, "
+                            "bot_open_id=None): chat=%s", chat_id)
+                return True
+            if bot_mentioned:
+                return True
+            log.debug("Group gate REJECT (mention-all, no @bot): "
+                      "chat=%s sender=%s", chat_id, sender_id)
+            return False
+
+        if mode == "owner-only":
+            is_owner = ((sender_id == self._group_owner)
+                        if self._group_owner else False)
+            if not is_owner:
+                log.debug("Group gate REJECT (owner-only, not owner): "
+                          "chat=%s sender=%s", chat_id, sender_id)
+                return False
+            # Owner must also @bot (AND semantics)
+            if not self.bot_open_id:
+                # Degradation: skip @bot check, keep sender=owner
+                log.warning("Group gate pass (owner-only, bot_open_id=None, "
+                            "sender=owner): chat=%s", chat_id)
+                return True
+            if bot_mentioned:
+                return True
+            log.debug("Group gate REJECT (owner-only, owner but no @bot): "
+                      "chat=%s", chat_id)
+            return False
+
+        # Unknown mode (should not happen after validation) — reject
+        log.warning("Group gate REJECT (unknown mode '%s'): chat=%s",
+                    mode, chat_id)
+        return False
 
     def start(self):
         """Start worker threads and WebSocket connection (blocking)."""
@@ -379,27 +545,46 @@ class FeishuBot:
                 log.debug("Unauthorized chat: %s", chat_id)
                 return
 
-            # Lightweight parse (no network I/O)
-            text = ""
-            image_key = None
+            # ----------------------------------------------------------
+            # Group chat gate (after allowed_chats, before msg parse)
+            # ----------------------------------------------------------
+            chat_type = getattr(msg, 'chat_type', None)
 
             try:
                 content = json.loads(msg.content)
             except (json.JSONDecodeError, TypeError):
                 content = {}
 
+            # Command exemption: known bridge commands skip gate
+            _skip_gate = False
+            _msg_mentions = getattr(msg, 'mentions', None) or []
+            if msg_type == "text":
+                _pre_text = _strip_mentions(
+                    content.get("text", ""), _msg_mentions)
+                if _is_bridge_command(_pre_text):
+                    _skip_gate = True
+            elif msg_type == "post":
+                _pre_text = _strip_mentions(
+                    parse_post_content(content), _msg_mentions)
+                if _is_bridge_command(_pre_text):
+                    _skip_gate = True
+
+            if not _skip_gate:
+                if not self._check_group_gate(
+                        chat_type, sender_id, _msg_mentions, chat_id):
+                    return
+
+            # Lightweight parse (no network I/O)
+            text = ""
+            image_key = None
+
             _todo_task_id = None  # set by todo branch when auto_drive=True
             _card_message_id = None  # set for interactive msgs needing API re-fetch
             _merge_forward_message_id = None  # set for merge_forward expansion
 
             if msg_type == "text":
-                text = content.get("text", "")
-                # Strip @mentions
-                mentions = getattr(msg, 'mentions', None) or []
-                for mention in mentions:
-                    mk = getattr(mention, 'key', '')
-                    if mk:
-                        text = text.replace(mk, '').strip()
+                text = _strip_mentions(
+                    content.get("text", ""), _msg_mentions)
                 if not text:
                     return
 
@@ -409,15 +594,9 @@ class FeishuBot:
                     return
 
             elif msg_type == "post":
-                # Rich-text message — use shared parser
-                text = parse_post_content(content)
-                # Strip @mentions from text (defensive: _parse_post_content
-                # skips 'at' tags so keys won't appear, but kept for safety)
-                mentions = getattr(msg, 'mentions', None) or []
-                for mention in mentions:
-                    mk = getattr(mention, 'key', '')
-                    if mk:
-                        text = text.replace(mk, '').strip()
+                # Rich-text message — use shared parser + strip mentions
+                text = _strip_mentions(
+                    parse_post_content(content), _msg_mentions)
                 if not text:
                     return
 
@@ -486,6 +665,17 @@ class FeishuBot:
 
             bridge_cmd = None
             if cmd == "/restart":
+                # Owner guard: destructive command in group chat
+                if (self._group_default_mode is not None
+                        and chat_type != "p2p"
+                        and sender_id != self._group_owner):
+                    log.info("Destructive cmd /restart rejected: "
+                             "sender %s not owner in group %s",
+                             sender_id, chat_id)
+                    self._io_executor.submit(
+                        _reject_not_owner, self.lark_client,
+                        chat_id, thread_id, message_id)
+                    return
                 # Restart bridge — handled inline (not via queue) because
                 # sys.exit() kills workers before they can process the item.
                 log.info("Restart requested by user %s in chat %s",
@@ -516,6 +706,17 @@ class FeishuBot:
                 return
 
             elif cmd == "/restart-all":
+                # Owner guard: destructive command in group chat
+                if (self._group_default_mode is not None
+                        and chat_type != "p2p"
+                        and sender_id != self._group_owner):
+                    log.info("Destructive cmd /restart-all rejected: "
+                             "sender %s not owner in group %s",
+                             sender_id, chat_id)
+                    self._io_executor.submit(
+                        _reject_not_owner, self.lark_client,
+                        chat_id, thread_id, message_id)
+                    return
                 # Restart all bot instances — restart others via systemctl,
                 # then exit self (systemd restarts this instance).
                 log.info("Restart-all requested by user %s in chat %s",
@@ -565,6 +766,17 @@ class FeishuBot:
                 self.runner.cancel(tag)
                 # Session delete deferred to worker under chat lock
             elif cmd in ("/stop", "/cancel"):
+                # Owner guard: destructive command in group chat
+                if (self._group_default_mode is not None
+                        and chat_type != "p2p"
+                        and sender_id != self._group_owner):
+                    log.info("Destructive cmd %s rejected: "
+                             "sender %s not owner in group %s",
+                             cmd, sender_id, chat_id)
+                    self._io_executor.submit(
+                        _reject_not_owner, self.lark_client,
+                        chat_id, thread_id, message_id)
+                    return
                 # Kill active process immediately (non-blocking, safe here)
                 key = (self.bot_id, chat_id, thread_id)
                 tag = SessionMap._key_str(key)
@@ -806,13 +1018,12 @@ def validate_feishu_token(client) -> bool:
 
 
 
-def fetch_bot_display_name(client) -> str:
-    """Fetch bot display name from Feishu API (GET /open-apis/bot/v3/info/).
+def fetch_bot_info(client) -> tuple[str, str | None]:
+    """Fetch bot display name and open_id from Feishu API.
 
-    Returns the app_name registered in Feishu Open Platform,
-    or 'Claude Code' as fallback on any failure.
+    Returns (app_name, open_id). Falls back to ('Claude Code', None) on failure.
     """
-    fallback = 'Claude Code'
+    fallback_name = 'Claude Code'
     try:
         req = lark.BaseRequest()
         req.http_method = lark.HttpMethod.GET
@@ -821,14 +1032,15 @@ def fetch_bot_display_name(client) -> str:
         resp = client.request(req)
         if resp.code == 0:
             bot_info = json.loads(resp.raw.content).get('bot', {})
-            name = bot_info.get('app_name', '').strip()
-            if name:
-                log.info('Bot display name from API: %s', name)
-                return name
-        log.warning('fetch_bot_display_name: code=%s, using fallback', resp.code)
+            name = bot_info.get('app_name', '').strip() or fallback_name
+            open_id = bot_info.get('open_id', '').strip() or None
+            log.info('Bot info from API: name=%s open_id=%s', name, open_id)
+            return name, open_id
+        log.warning('fetch_bot_info: code=%s, using fallback', resp.code)
     except Exception:
-        log.warning('Failed to fetch bot display name, using fallback', exc_info=True)
-    return fallback
+        log.warning('Failed to fetch bot info, using fallback', exc_info=True)
+    return fallback_name, None
+
 
 def _notify_restart_complete(bot):
     """Patch the pre-restart card to show completion, if one exists."""
@@ -914,12 +1126,16 @@ def main():
     def _startup_restart_card():
         _notify_restart_complete(bot)
 
-    # Fetch display name first (fast) to avoid race with restart card
+    # Fetch bot info (name + open_id) before parallel startup tasks
     try:
-        name = fetch_bot_display_name(bot.lark_client)
+        name, open_id = fetch_bot_info(bot.lark_client)
         set_bot_display_name(name)
+        bot.bot_open_id = open_id
+        if not open_id:
+            log.warning("Bot open_id not available — mention detection will "
+                        "use per-mode degradation (see group_policy design)")
     except Exception as e:
-        log.warning("Failed to fetch bot display name: %s", e)
+        log.warning("Failed to fetch bot info: %s", e)
 
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="startup") as pool:
         futures = [pool.submit(fn) for fn in (

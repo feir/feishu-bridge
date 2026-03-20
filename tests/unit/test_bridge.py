@@ -1068,6 +1068,485 @@ def test_class_level_lock_shared_across_instances():
     assert lock3 is not lock1
 
 
+# ---------------------------------------------------------------------------
+# Group chat gate: _check_group_gate + helpers
+# ---------------------------------------------------------------------------
+
+class _NS:
+    """Simple namespace for mocking SDK objects."""
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def _make_bot(default_mode=None, owner=None, overrides=None, bot_open_id=None):
+    """Create a minimal FeishuBot stub for gate testing."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot._group_default_mode = default_mode
+    bot._group_owner = owner
+    bot._group_overrides = overrides or {}
+    bot.bot_open_id = bot_open_id
+    return bot
+
+
+def _mention(open_id, key="@_user_1"):
+    """Create a mock SDK MentionEvent."""
+    return _NS(id=_NS(open_id=open_id), key=key)
+
+
+# --- p2p / compat mode ---
+
+def test_gate_p2p_always_passes():
+    bot = _make_bot(default_mode="disabled")
+    assert bot._check_group_gate("p2p", "ou_any", [], "chat") is True
+
+
+def test_gate_no_policy_passes_all():
+    bot = _make_bot(default_mode=None)
+    assert bot._check_group_gate("group", "ou_any", [], "chat") is True
+
+
+# --- auto-reply ---
+
+def test_gate_auto_reply_passes():
+    bot = _make_bot(default_mode="auto-reply")
+    assert bot._check_group_gate("group", "ou_any", [], "chat") is True
+
+
+# --- disabled ---
+
+def test_gate_disabled_rejects():
+    bot = _make_bot(default_mode="disabled")
+    assert bot._check_group_gate("group", "ou_any", [], "chat") is False
+
+
+# --- mention-all ---
+
+def test_gate_mention_all_with_bot_mention():
+    bot = _make_bot(default_mode="mention-all", bot_open_id="ob_bot")
+    mentions = [_mention("ob_bot")]
+    assert bot._check_group_gate("group", "ou_any", mentions, "chat") is True
+
+
+def test_gate_mention_all_without_mention():
+    bot = _make_bot(default_mode="mention-all", bot_open_id="ob_bot")
+    assert bot._check_group_gate("group", "ou_any", [], "chat") is False
+
+
+def test_gate_mention_all_wrong_mention():
+    bot = _make_bot(default_mode="mention-all", bot_open_id="ob_bot")
+    mentions = [_mention("ob_other_user")]
+    assert bot._check_group_gate("group", "ou_any", mentions, "chat") is False
+
+
+def test_gate_mention_all_no_bot_open_id_passthrough():
+    """When bot_open_id is None, mention-all degrades to pass-through."""
+    bot = _make_bot(default_mode="mention-all", bot_open_id=None)
+    assert bot._check_group_gate("group", "ou_any", [], "chat") is True
+
+
+# --- owner-only ---
+
+def test_gate_owner_only_owner_with_mention():
+    bot = _make_bot(default_mode="owner-only", owner="ou_owner",
+                    bot_open_id="ob_bot")
+    mentions = [_mention("ob_bot")]
+    assert bot._check_group_gate("group", "ou_owner", mentions, "chat") is True
+
+
+def test_gate_owner_only_owner_without_mention():
+    """Owner must @bot — AND semantics."""
+    bot = _make_bot(default_mode="owner-only", owner="ou_owner",
+                    bot_open_id="ob_bot")
+    assert bot._check_group_gate("group", "ou_owner", [], "chat") is False
+
+
+def test_gate_owner_only_not_owner():
+    bot = _make_bot(default_mode="owner-only", owner="ou_owner",
+                    bot_open_id="ob_bot")
+    mentions = [_mention("ob_bot")]
+    assert bot._check_group_gate("group", "ou_other", mentions, "chat") is False
+
+
+def test_gate_owner_only_no_owner_configured():
+    """No owner set → fail-closed (reject all)."""
+    bot = _make_bot(default_mode="owner-only", owner=None,
+                    bot_open_id="ob_bot")
+    mentions = [_mention("ob_bot")]
+    assert bot._check_group_gate("group", "ou_any", mentions, "chat") is False
+
+
+def test_gate_owner_only_no_bot_open_id_owner_passes():
+    """bot_open_id=None degradation: skip @bot check, keep sender=owner."""
+    bot = _make_bot(default_mode="owner-only", owner="ou_owner",
+                    bot_open_id=None)
+    assert bot._check_group_gate("group", "ou_owner", [], "chat") is True
+
+
+def test_gate_owner_only_no_bot_open_id_non_owner_rejects():
+    bot = _make_bot(default_mode="owner-only", owner="ou_owner",
+                    bot_open_id=None)
+    assert bot._check_group_gate("group", "ou_other", [], "chat") is False
+
+
+# --- per-group overrides ---
+
+def test_gate_per_group_override():
+    overrides = {"oc_special": {"mode": "auto-reply"}}
+    bot = _make_bot(default_mode="disabled", overrides=overrides)
+    assert bot._check_group_gate("group", "ou_any", [], "oc_special") is True
+    assert bot._check_group_gate("group", "ou_any", [], "oc_other") is False
+
+
+def test_gate_per_group_override_with_mention():
+    overrides = {"oc_mention": {"mode": "mention-all"}}
+    bot = _make_bot(default_mode="disabled", overrides=overrides,
+                    bot_open_id="ob_bot")
+    mentions = [_mention("ob_bot")]
+    assert bot._check_group_gate("group", "ou_any", mentions, "oc_mention") is True
+    assert bot._check_group_gate("group", "ou_any", [], "oc_mention") is False
+
+
+# --- non-text messages (empty mentions) in mention-required modes ---
+
+def test_gate_mention_required_no_mentions_rejects():
+    """Non-text messages have no mentions → rejected in mention-all/owner-only."""
+    bot = _make_bot(default_mode="mention-all", bot_open_id="ob_bot")
+    assert bot._check_group_gate("group", "ou_any", None, "chat") is False
+
+    bot2 = _make_bot(default_mode="owner-only", owner="ou_owner",
+                     bot_open_id="ob_bot")
+    assert bot2._check_group_gate("group", "ou_owner", None, "chat") is False
+
+
+# --- unknown chat_type treated as group ---
+
+def test_gate_unknown_chat_type_treated_as_group():
+    bot = _make_bot(default_mode="disabled")
+    assert bot._check_group_gate("group_chat", "ou_any", [], "chat") is False
+    assert bot._check_group_gate(None, "ou_any", [], "chat") is False
+
+
+# --- helpers ---
+
+def test_strip_mentions():
+    mentions = [_NS(key="@_user_1"), _NS(key="@_user_2")]
+    result = bridge._strip_mentions("@_user_1 hello @_user_2 world", mentions)
+    assert result == "hello  world"
+
+
+def test_strip_mentions_empty():
+    assert bridge._strip_mentions("hello", []) == "hello"
+    assert bridge._strip_mentions("hello", None) == "hello"
+
+
+def test_is_bridge_command():
+    assert bridge._is_bridge_command("/help") is True
+    assert bridge._is_bridge_command("/restart") is True
+    assert bridge._is_bridge_command("/restart-all") is True
+    assert bridge._is_bridge_command("/feishu-tasks list") is True
+    assert bridge._is_bridge_command("  /help  ") is True
+    assert bridge._is_bridge_command("/stop all") is True
+    assert bridge._is_bridge_command("/HELP") is True  # case-insensitive
+    assert bridge._is_bridge_command("/unknown-cmd") is False
+    assert bridge._is_bridge_command("hello /help") is False
+    assert bridge._is_bridge_command("") is False
+    # Prefix-collision attacks must NOT bypass gate (R6 HIGH)
+    assert bridge._is_bridge_command("/helpful message") is False
+    assert bridge._is_bridge_command("/stopwatch 10min") is False
+    assert bridge._is_bridge_command("/restartx the server") is False
+    assert bridge._is_bridge_command("/cancel-my-order") is False
+    assert bridge._is_bridge_command("/newbie question") is False
+
+
+# ---------------------------------------------------------------------------
+# Integration: _on_message with group gate
+# ---------------------------------------------------------------------------
+
+def _make_full_bot(default_mode=None, owner=None, overrides=None,
+                   bot_open_id=None, allowed_users=None, tmp_path=None):
+    """Create a FeishuBot stub with enough internals for _on_message."""
+    from pathlib import Path as _Path
+
+    bot = object.__new__(bridge.FeishuBot)
+    bot.bot_id = "test-bot"
+    bot._all_bot_names = ["test-bot"]
+    bot.workspace = "/tmp"
+    bot.allowed_users = allowed_users or ["*"]
+    bot.allowed_chats = ["*"]
+    bot._todo_auto_drive = False
+    bot._startup_ms = "0"
+    bot.bot_open_id = bot_open_id
+    bot._session_cost = {}
+
+    # Group policy
+    bot._group_default_mode = default_mode
+    bot._group_owner = owner
+    bot._group_overrides = overrides or {}
+
+    # Minimal dedup (never dedup in tests)
+    bot.dedup = bridge.MessageDedup(ttl=1, max_entries=10)
+
+    # Track enqueued items
+    bot._enqueued_items = []
+
+    class FakeChatQueue:
+        def enqueue(self, key, item):
+            bot._enqueued_items.append(item)
+            return 'active'
+        def drain(self, key):
+            return []
+
+    class FakeWorkQueue:
+        def put_nowait(self, item):
+            bot._enqueued_items.append(item)
+
+    bot._chat_queue = FakeChatQueue()
+    bot._work_queue = FakeWorkQueue()
+
+    # Track _reject_not_owner calls
+    bot._reject_calls = []
+
+    class FakeExecutor:
+        def submit(self, fn, *args, **kwargs):
+            if fn is bridge._reject_not_owner:
+                bot._reject_calls.append(args)
+            # Don't actually execute I/O
+    bot._io_executor = FakeExecutor()
+
+    # Dummy runner (cancel is a no-op)
+    class FakeRunner:
+        def cancel(self, tag):
+            return False
+    bot.runner = FakeRunner()
+
+    # Dummy command handler
+    class FakeCmdHandler:
+        def reply_queue_full(self, *a):
+            pass
+        def add_queued_reaction_to_item(self, *a):
+            pass
+    bot.command_handler = FakeCmdHandler()
+
+    # session_map needs a real Path (it calls .parent.mkdir)
+    _sm_path = _Path(tmp_path or "/tmp") / "test-sessions.json"
+    _sm_path.parent.mkdir(parents=True, exist_ok=True)
+    bot.session_map = bridge.SessionMap(_sm_path)
+
+    # lark_client stub (used by _reject_not_owner)
+    bot.lark_client = None
+
+    return bot
+
+
+def _make_event_data(text, chat_type="group", sender_id="ou_user",
+                     msg_type="text", mentions=None, message_id=None):
+    """Build a mock SDK event data object for _on_message.
+
+    Uses _NS (namespace) instances to avoid class-variable scoping issues.
+    """
+    _mid = message_id or f"om_{abs(hash(text))}"
+    content = json.dumps({"text": text}) if msg_type == "text" else json.dumps({})
+    mention_objs = mentions or []
+
+    sender_id_obj = _NS(open_id=sender_id)
+    sender_obj = _NS(sender_id=sender_id_obj)
+    msg_obj = _NS(
+        message_id=_mid,
+        chat_id="oc_group1",
+        message_type=msg_type,
+        thread_id=None,
+        parent_id=None,
+        content=content,
+        create_time="9999999999999",
+        mentions=mention_objs,
+        chat_type=chat_type,
+    )
+    event_obj = _NS(message=msg_obj, sender=sender_obj)
+    return _NS(event=event_obj)
+
+
+def test_on_message_gate_rejects_disabled_group():
+    """Group message in disabled mode is silently dropped (not enqueued)."""
+    bot = _make_full_bot(default_mode="disabled")
+    data = _make_event_data("hello world", chat_type="group")
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 0
+
+
+def test_on_message_gate_passes_auto_reply():
+    """Group message in auto-reply mode is enqueued."""
+    bot = _make_full_bot(default_mode="auto-reply")
+    data = _make_event_data("hello world", chat_type="group")
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 1
+    assert bot._enqueued_items[0]["text"] == "hello world"
+
+
+def test_on_message_gate_passes_p2p_even_when_disabled():
+    """DM messages always pass regardless of group policy."""
+    bot = _make_full_bot(default_mode="disabled")
+    data = _make_event_data("hello from dm", chat_type="p2p")
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 1
+
+
+def test_on_message_command_bypasses_gate_in_disabled_group():
+    """Bridge command /help in disabled group should bypass gate and enqueue."""
+    bot = _make_full_bot(default_mode="disabled")
+    data = _make_event_data("/help", chat_type="group")
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 1
+    assert bot._enqueued_items[0].get("_bridge_command") == "help"
+
+
+def test_on_message_crafted_prefix_does_not_bypass_gate():
+    """/helpful should NOT be treated as /help command — gate applies."""
+    bot = _make_full_bot(default_mode="disabled")
+    data = _make_event_data("/helpful tips", chat_type="group")
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 0
+
+
+def test_on_message_mention_all_with_bot_mention():
+    """mention-all group passes when @bot is present."""
+    bot = _make_full_bot(default_mode="mention-all", bot_open_id="ob_bot")
+    mentions = [_NS(id=_NS(open_id="ob_bot"), key="@_user_1")]
+    data = _make_event_data("@_user_1 hello", chat_type="group",
+                            mentions=mentions)
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 1
+
+
+def test_on_message_mention_all_without_mention_rejects():
+    """mention-all group rejects when no @bot."""
+    bot = _make_full_bot(default_mode="mention-all", bot_open_id="ob_bot")
+    data = _make_event_data("hello without mention", chat_type="group")
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 0
+
+
+def test_on_message_owner_guard_rejects_non_owner_restart():
+    """Non-owner sending /restart in group with group_policy is rejected."""
+    bot = _make_full_bot(default_mode="auto-reply", owner="ou_owner")
+    data = _make_event_data("/restart", chat_type="group",
+                            sender_id="ou_non_owner")
+    bot._on_message(data)
+    # Not enqueued (restart is inline, not via queue)
+    assert len(bot._enqueued_items) == 0
+    # Rejection message should have been submitted
+    assert len(bot._reject_calls) == 1
+
+
+def test_on_message_owner_guard_allows_owner_restart(monkeypatch):
+    """Owner sending /restart in group with group_policy proceeds."""
+    bot = _make_full_bot(default_mode="auto-reply", owner="ou_owner")
+    # Prevent actual sys.exit
+    exit_called = []
+    monkeypatch.setattr(bridge, "ResponseHandle", FakeHandle)
+    monkeypatch.setattr(bridge.threading, "Timer",
+                        lambda *a, **k: type('T', (), {'start': lambda s: None})())
+    data = _make_event_data("/restart", chat_type="group",
+                            sender_id="ou_owner")
+    bot._on_message(data)
+    # Should NOT have rejection
+    assert len(bot._reject_calls) == 0
+
+
+def test_on_message_compat_mode_no_gate():
+    """Without group_policy (compat mode), group messages pass through."""
+    bot = _make_full_bot(default_mode=None)
+    data = _make_event_data("hello compat", chat_type="group")
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 1
+
+
+def test_on_message_per_group_override_auto_reply_in_disabled_default():
+    """Per-group override allows a specific group even when default is disabled."""
+    overrides = {"oc_group1": {"mode": "auto-reply"}}
+    bot = _make_full_bot(default_mode="disabled", overrides=overrides)
+    data = _make_event_data("hello override", chat_type="group")
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 1
+
+
+# ---------------------------------------------------------------------------
+# load_config validation
+# ---------------------------------------------------------------------------
+
+def _base_bot_config(**extra):
+    """Build minimal valid bot config dict, merging extras."""
+    base = {
+        "name": "test", "app_id": "a", "app_secret": "s",
+        "workspace": "/tmp", "allowed_users": ["*"],
+    }
+    base.update(extra)
+    return base
+
+
+def test_load_config_missing_default_mode_exits(tmp_path):
+    """group_policy without default_mode causes sys.exit(1)."""
+    config = {
+        "bots": [_base_bot_config(group_policy={})],
+        "claude": {"command": "python3"}
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    with pytest.raises(SystemExit):
+        bridge.load_config(str(cfg_file), "test")
+
+
+def test_load_config_invalid_mode_exits(tmp_path):
+    """group_policy with invalid default_mode causes sys.exit(1)."""
+    config = {
+        "bots": [_base_bot_config(
+            group_policy={"default_mode": "invalid-mode"})],
+        "claude": {"command": "python3"}
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    with pytest.raises(SystemExit):
+        bridge.load_config(str(cfg_file), "test")
+
+
+def test_load_config_valid_group_policy(tmp_path):
+    """Valid group_policy is accepted and returned in config."""
+    config = {
+        "bots": [_base_bot_config(group_policy={
+            "default_mode": "mention-all",
+            "owner": "ou_owner",
+            "groups": {"oc_g1": {"mode": "auto-reply"}}
+        })],
+        "claude": {"command": "python3"}
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    result = bridge.load_config(str(cfg_file), "test")
+    gp = result["bot"]["group_policy"]
+    assert gp["default_mode"] == "mention-all"
+    assert gp["owner"] == "ou_owner"
+
+
+def test_load_config_invalid_per_group_mode_falls_back(tmp_path):
+    """Per-group override with invalid mode is normalized to default_mode."""
+    config = {
+        "bots": [_base_bot_config(group_policy={
+            "default_mode": "auto-reply",
+            "groups": {"oc_g1": {"mode": "bogus"}}
+        })],
+        "claude": {"command": "python3"}
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    result = bridge.load_config(str(cfg_file), "test")
+    # Invalid mode should be normalized to default
+    assert result["bot"]["group_policy"]["groups"]["oc_g1"]["mode"] == "auto-reply"
+
+
 def test_autofetch_never_contains_auth_card_text():
     """Auto-fetch placeholder must never contain '已发送授权卡片'."""
     class FakeDocs:
