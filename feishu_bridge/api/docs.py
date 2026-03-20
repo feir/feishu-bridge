@@ -22,6 +22,7 @@ class FeishuDocs(FeishuAPI):
     """Feishu cloud document read/write via MCP Markdown interface."""
 
     SCOPES = [
+        "docx:document",
         "docx:document:readonly",
         "docx:document:create",
         "wiki:wiki:readonly",

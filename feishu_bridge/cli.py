@@ -436,20 +436,25 @@ def main():
     sender_id = auth.get("sender_id", "")
     _user_token = auth.get("user_access_token")
 
-    # When no pre-authed token, build a lark_client so modules can trigger
-    # on-demand OAuth (Device Flow auth card sent to the user's chat).
+    # Always build lark_client so modules can fall back to on-demand OAuth
+    # when the pre-authed token lacks required scopes.
     _lark_client = None
-    if not _user_token:
-        try:
-            import lark_oapi as lark
-            _lark_client = lark.Client.builder() \
-                .app_id(config["app_id"]) \
-                .app_secret(config["app_secret"]) \
-                .domain(lark.FEISHU_DOMAIN) \
-                .log_level(lark.LogLevel.WARNING) \
-                .build()
-        except Exception:
-            pass  # Graceful degradation — auth will fail with clear error
+    try:
+        import lark_oapi as lark
+        _lark_client = lark.Client.builder() \
+            .app_id(config["app_id"]) \
+            .app_secret(config["app_secret"]) \
+            .domain(lark.FEISHU_DOMAIN) \
+            .log_level(lark.LogLevel.WARNING) \
+            .build()
+    except Exception:
+        pass  # Graceful degradation — auth will fail with clear error
+
+    # When lark_client is available, don't use token_override — let modules
+    # do full scope-aware auth via ensure_user_token().  The pre-authed token
+    # from the auth file may lack scopes added after the session started.
+    if _lark_client:
+        _user_token = None
 
     cmd = args.command
 
