@@ -71,9 +71,6 @@ class BridgeCommandHandler:
                 "`mention-all` — 任何人 @机器人并附上消息时响应",
                 "`auto-reply` — 群内所有消息自动响应（无需 @）",
                 "`disabled` — 不响应该群消息",
-                "",
-                f"**Skill 命令**（透传给 {self.bot.runner.get_display_name()}）",
-                "`/plan` `/done` `/save` `/social-feed` 等已注册 skill 正常使用",
             ])
             handle.deliver("\n".join(lines))
 
