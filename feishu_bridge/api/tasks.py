@@ -25,7 +25,8 @@ class FeishuTasks(FeishuAPI):
     """Feishu Task API v2 with auto-auth."""
 
     SCOPES = ["task:task:read", "task:task:write",
-              "task:tasklist:read", "task:tasklist:write"]
+              "task:tasklist:read", "task:tasklist:write",
+              "task:section:read", "task:section:write"]
     BASE_PATH = "/open-apis/task/v2"
 
     # -------------------------------------------------------------------
@@ -245,7 +246,8 @@ class FeishuTasks(FeishuAPI):
     def create_task(self, chat_id: str, user_open_id: str,
                     summary: str, description: str = None,
                     due_timestamp: str = None,
-                    tasklist_guid: str = None) -> dict:
+                    tasklist_guid: str = None,
+                    section_guid: str = None) -> dict:
         """Create a new task.
 
         Args:
@@ -253,6 +255,7 @@ class FeishuTasks(FeishuAPI):
             description: optional description
             due_timestamp: optional Unix timestamp in **milliseconds** as string
             tasklist_guid: optional tasklist to add the task to
+            section_guid: optional section within the tasklist
 
         Returns:
             API response (contains the created task object).
@@ -267,7 +270,10 @@ class FeishuTasks(FeishuAPI):
         if due_timestamp:
             body["due"] = {"timestamp": due_timestamp}
         if tasklist_guid:
-            body["tasklists"] = [{"tasklist_guid": tasklist_guid}]
+            tl_entry = {"tasklist_guid": tasklist_guid}
+            if section_guid:
+                tl_entry["section_guid"] = section_guid
+            body["tasklists"] = [tl_entry]
 
         return self.request("POST", "/tasks", token,
                             params={"user_id_type": "open_id"},

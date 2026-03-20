@@ -36,7 +36,7 @@ def _parse_due(value: str) -> str:
 
     Accepts:
       - Human-readable: "2026-03-31", "2026-03-31 23:59", "2026-03-31 23:59:00"
-        (interpreted as **UTC**; date-only defaults to 23:59:59 UTC)
+        (interpreted as **local timezone**; date-only defaults to 23:59:59)
       - Unix seconds (10 digits): "1775001599" → auto-converted to ms
       - Unix milliseconds (13 digits): "1775001599000" → passed through
 
@@ -58,14 +58,15 @@ def _parse_due(value: str) -> str:
             f"Ambiguous numeric timestamp ({n} digits): {value!r}. "
             "Use 10-digit (seconds) or 13-digit (milliseconds).")
 
-    # Try human-readable date formats
+    # Try human-readable date formats (local timezone)
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(value, fmt)
             # If no time specified, default to end of day
             if fmt == "%Y-%m-%d":
                 dt = dt.replace(hour=23, minute=59, second=59)
-            dt = dt.replace(tzinfo=timezone.utc)
+            # Use local timezone so the date displays correctly in user's Feishu
+            dt = dt.astimezone()
             return str(int(dt.timestamp() * 1000))
         except ValueError:
             continue
@@ -460,6 +461,7 @@ def main():
     p.add_argument("--description", help="Task description")
     p.add_argument("--due", help="Due date (UTC): YYYY-MM-DD, 'YYYY-MM-DD HH:MM', or Unix timestamp")
     p.add_argument("--tasklist-guid", help="Add to a specific task list")
+    p.add_argument("--section-guid", help="Section within the task list")
 
     p = sub.add_parser("create-subtask", help="Create a subtask")
     p.add_argument("--parent-guid", required=True, help="Parent task GUID")
@@ -905,7 +907,8 @@ def main():
                                 summary=args.summary,
                                 description=args.description,
                                 due_timestamp=due_ms,
-                                tasklist_guid=args.tasklist_guid))
+                                tasklist_guid=args.tasklist_guid,
+                                section_guid=args.section_guid))
 
     elif cmd == "create-subtask":
         mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
