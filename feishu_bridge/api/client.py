@@ -90,12 +90,12 @@ class FeishuAPI:
         last_exc = None
         for attempt in range(self._MAX_RETRIES + 1):
             try:
+                headers = {"Authorization": f"Bearer {token}"}
+                if json_body is not None:
+                    headers["Content-Type"] = "application/json; charset=utf-8"
                 resp = requests.request(
                     method, url,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json; charset=utf-8",
-                    },
+                    headers=headers,
                     params=params,
                     json=json_body,
                     timeout=15,

@@ -9,9 +9,53 @@ Usage:
 """
 
 import logging
+import re
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from feishu_bridge.api.client import FeishuAPI
+
+_TZ_CST = timezone(timedelta(hours=8))
+
+
+def _to_unix_ts(value: str) -> str:
+    """Convert time value to Unix timestamp string.
+
+    Accepts:
+      - Unix timestamp (digits only, 10 or 13 digits) — returned as-is (seconds)
+      - RFC3339 / ISO8601 with tz — parsed and converted
+      - "YYYY-MM-DD HH:MM[:SS]" — assumed Asia/Shanghai (UTC+8)
+    """
+    value = value.strip()
+    # Already a unix timestamp
+    if re.fullmatch(r"\d{10,13}", value):
+        ts = int(value)
+        return str(ts // 1000 if ts > 9_999_999_999 else ts)
+    # Try ISO8601 / RFC3339 with timezone
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M%z",
+    ):
+        try:
+            dt = datetime.strptime(value, fmt)
+            return str(int(dt.timestamp()))
+        except ValueError:
+            continue
+    # Without timezone — assume UTC+8
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+    ):
+        try:
+            dt = datetime.strptime(value, fmt).replace(tzinfo=_TZ_CST)
+            return str(int(dt.timestamp()))
+        except ValueError:
+            continue
+    # Fallback: return as-is, let API report the error
+    return value
 
 log = logging.getLogger("feishu-calendar")
 
@@ -33,7 +77,8 @@ class FeishuCalendar(FeishuAPI):
         if not token:
             return None
 
-        params = {"page_size": page_size}
+        # Feishu API requires page_size >= 50 for this endpoint
+        params = {"page_size": max(page_size, 50)}
         if page_token:
             params["page_token"] = page_token
 
@@ -55,8 +100,8 @@ class FeishuCalendar(FeishuAPI):
             return None
 
         params = {
-            "start_time": start_time,
-            "end_time": end_time,
+            "start_time": _to_unix_ts(start_time),
+            "end_time": _to_unix_ts(end_time),
             "page_size": page_size,
         }
         if page_token:
@@ -97,8 +142,8 @@ class FeishuCalendar(FeishuAPI):
 
         body = {
             "summary": summary,
-            "start_time": {"timestamp": start_time},
-            "end_time": {"timestamp": end_time},
+            "start_time": {"timestamp": _to_unix_ts(start_time)},
+            "end_time": {"timestamp": _to_unix_ts(end_time)},
         }
         if description:
             body["description"] = description
@@ -126,9 +171,9 @@ class FeishuCalendar(FeishuAPI):
         if "description" in kwargs:
             body["description"] = kwargs["description"]
         if "start_time" in kwargs:
-            body["start_time"] = {"timestamp": kwargs["start_time"]}
+            body["start_time"] = {"timestamp": _to_unix_ts(kwargs["start_time"])}
         if "end_time" in kwargs:
-            body["end_time"] = {"timestamp": kwargs["end_time"]}
+            body["end_time"] = {"timestamp": _to_unix_ts(kwargs["end_time"])}
         if "attendees" in kwargs:
             body["attendees"] = kwargs["attendees"]
 
@@ -186,8 +231,8 @@ class FeishuCalendar(FeishuAPI):
             return None
 
         params = {
-            "start_time": start_time,
-            "end_time": end_time,
+            "start_time": _to_unix_ts(start_time),
+            "end_time": _to_unix_ts(end_time),
             "page_size": page_size,
         }
         if page_token:
@@ -276,8 +321,8 @@ class FeishuCalendar(FeishuAPI):
             return None
 
         body = {
-            "time_min": start_time,
-            "time_max": end_time,
+            "time_min": _to_unix_ts(start_time),
+            "time_max": _to_unix_ts(end_time),
             "user_ids": user_ids,
         }
         return self.request(
