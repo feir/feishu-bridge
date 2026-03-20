@@ -343,6 +343,39 @@ def main():
     p.add_argument("--event-id", required=True)
     p.add_argument("--status", required=True, choices=["accept", "decline", "tentative"])
 
+    p = sub.add_parser("list-event-instances", help="List instances of a recurring event")
+    p.add_argument("--calendar-id", required=True)
+    p.add_argument("--event-id", required=True)
+    p.add_argument("--start-time", required=True, help="RFC3339 timestamp")
+    p.add_argument("--end-time", required=True, help="RFC3339 timestamp (max 40-day window)")
+    p.add_argument("--page-size", type=int, default=50)
+    p.add_argument("--page-token")
+
+    p = sub.add_parser("list-attendees", help="List event attendees")
+    p.add_argument("--calendar-id", required=True)
+    p.add_argument("--event-id", required=True)
+    p.add_argument("--page-size", type=int, default=50)
+    p.add_argument("--page-token")
+
+    p = sub.add_parser("create-attendees", help="Add attendees to an event")
+    p.add_argument("--calendar-id", required=True)
+    p.add_argument("--event-id", required=True)
+    p.add_argument("--attendees", required=True,
+                   help='JSON array, e.g. [{"type":"user","user_id":"ou_xxx"}]')
+
+    p = sub.add_parser("delete-attendees", help="Remove attendees from an event")
+    p.add_argument("--calendar-id", required=True)
+    p.add_argument("--event-id", required=True)
+    p.add_argument("--attendee-ids", required=True,
+                   help="JSON array of attendee_id strings")
+    p.add_argument("--confirm", required=True)
+
+    p = sub.add_parser("list-freebusy", help="Query free/busy for 1-10 users")
+    p.add_argument("--user-ids", required=True,
+                   help="JSON array of user open_ids (max 10)")
+    p.add_argument("--start-time", required=True, help="RFC3339 timestamp")
+    p.add_argument("--end-time", required=True, help="RFC3339 timestamp")
+
     # --- Search ---
     p = sub.add_parser("search-docs", help="Search documents")
     p.add_argument("--query", required=True)
@@ -747,6 +780,49 @@ def main():
                                 calendar_id=args.calendar_id,
                                 event_id=args.event_id,
                                 status=args.status))
+
+    elif cmd == "list-event-instances":
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
+        _output(mod.list_event_instances(chat_id, sender_id,
+                                         calendar_id=args.calendar_id,
+                                         event_id=args.event_id,
+                                         start_time=args.start_time,
+                                         end_time=args.end_time,
+                                         page_size=args.page_size,
+                                         page_token=args.page_token))
+
+    elif cmd == "list-attendees":
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
+        _output(mod.list_attendees(chat_id, sender_id,
+                                   calendar_id=args.calendar_id,
+                                   event_id=args.event_id,
+                                   page_size=args.page_size,
+                                   page_token=args.page_token))
+
+    elif cmd == "create-attendees":
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
+        attendees = _safe_json_loads(args.attendees, "--attendees")
+        _output(mod.create_attendees(chat_id, sender_id,
+                                     calendar_id=args.calendar_id,
+                                     event_id=args.event_id,
+                                     attendees=attendees))
+
+    elif cmd == "delete-attendees":
+        _confirm_guard(args, args.event_id, "event_id")
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
+        attendee_ids = _safe_json_loads(args.attendee_ids, "--attendee-ids")
+        _output(mod.delete_attendees(chat_id, sender_id,
+                                     calendar_id=args.calendar_id,
+                                     event_id=args.event_id,
+                                     attendee_ids=attendee_ids))
+
+    elif cmd == "list-freebusy":
+        mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
+        user_ids = _safe_json_loads(args.user_ids, "--user-ids")
+        _output(mod.list_freebusy(chat_id, sender_id,
+                                  user_ids=user_ids,
+                                  start_time=args.start_time,
+                                  end_time=args.end_time))
 
     # Search commands
     elif cmd == "search-docs":

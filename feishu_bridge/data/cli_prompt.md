@@ -56,6 +56,11 @@ Call it with `feishu-cli <command> [args]`.
 - `update-event --calendar-id <id> --event-id <id> [--summary <title>] [--start-time <t>] [--end-time <t>]`
 - `delete-event --calendar-id <id> --event-id <id> --confirm <id_prefix>` ⚠️
 - `reply-event --calendar-id <id> --event-id <id> --status accept|decline|tentative`
+- `list-event-instances --calendar-id <id> --event-id <id> --start-time <rfc3339> --end-time <rfc3339>` — Expand recurring event instances (max 40-day window)
+- `list-attendees --calendar-id <id> --event-id <id>` — List event attendees
+- `create-attendees --calendar-id <id> --event-id <id> --attendees '<json_array>'` — Add attendees (user/resource/third_party)
+- `delete-attendees --calendar-id <id> --event-id <id> --attendee-ids '<json_array>' --confirm <id_prefix>` ⚠️
+- `list-freebusy --user-ids '<json_array>' --start-time <rfc3339> --end-time <rfc3339>` — Query free/busy for 1-10 users
 
 ### Search
 - `search-docs --query <keyword> [--type doc|sheet|bitable]`
