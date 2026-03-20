@@ -32,6 +32,91 @@ log = logging.getLogger("feishu-bridge")
 
 MESSAGE_TERMINAL_CODES = {230011, 231003}
 
+# ---------------------------------------------------------------------------
+# Markdown style optimization for Feishu CardKit v2
+# ---------------------------------------------------------------------------
+# Feishu markdown renders a limited subset of standard markdown.
+# This adapter handles: heading downgrade, table/code-block spacing,
+# invalid image cleanup, and blank-line compression.
+# Ported from openclaw-lark/src/card/markdown-style.js.
+
+_CB_MARK = "___CB_"
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
+
+
+def optimize_markdown_style(text: str) -> str:
+    """Adapt standard markdown for Feishu CardKit v2 rendering."""
+    try:
+        r = _optimize_impl(text)
+        r = _strip_invalid_image_keys(r)
+        return r
+    except Exception:
+        return text
+
+
+def _optimize_impl(text: str) -> str:
+    # 1. Extract code blocks → placeholders
+    code_blocks: list[str] = []
+
+    def _save(m):
+        code_blocks.append(m.group(0))
+        return f"{_CB_MARK}{len(code_blocks) - 1}___"
+
+    r = re.sub(r"```[\s\S]*?```", _save, text)
+
+    # 2. Heading downgrade: H1→H4, H2-H6→H5 (only when H1-H3 present)
+    if re.search(r"^#{1,3} ", r, re.MULTILINE):
+        r = re.sub(r"^#{2,6} (.+)$", r"##### \1", r, flags=re.MULTILINE)
+        r = re.sub(r"^# (.+)$", r"#### \1", r, flags=re.MULTILINE)
+
+    # 3. Consecutive headings: insert <br> gap
+    r = re.sub(
+        r"^(#{4,5} .+)\n{1,2}(#{4,5} )",
+        r"\1\n<br>\n\2", r, flags=re.MULTILINE,
+    )
+
+    # 4. Table spacing
+    # 4a. Non-table line → table: ensure blank line
+    r = re.sub(r"^([^|\n].*)\n(\|.+\|)", r"\1\n\n\2", r, flags=re.MULTILINE)
+    # 4b. Blank line before table block → insert <br>
+    r = re.sub(r"\n\n((?:\|.+\|[^\S\n]*\n?)+)", r"\n\n<br>\n\n\1", r)
+    # 4c. After table block → append <br>
+    r = re.sub(
+        r"((?:^\|.+\|[^\S\n]*\n?)+)", r"\1\n<br>\n", r, flags=re.MULTILINE,
+    )
+    # 4d. Plain text before table: tighten spacing
+    r = re.sub(
+        r"^((?!#{4,5} )(?!\*\*).+)\n\n(<br>)\n\n(\|)",
+        r"\1\n\2\n\3", r, flags=re.MULTILINE,
+    )
+    # 4d2. Bold line before table
+    r = re.sub(
+        r"^(\*\*.+)\n\n(<br>)\n\n(\|)",
+        r"\1\n\2\n\n\3", r, flags=re.MULTILINE,
+    )
+    # 4e. Table → plain text: tighten spacing
+    r = re.sub(
+        r"(\|[^\n]*\n)\n(<br>\n)((?!#{4,5} )(?!\*\*))",
+        r"\1\2\3", r, flags=re.MULTILINE,
+    )
+
+    # 5. Restore code blocks with <br> spacing
+    for i, block in enumerate(code_blocks):
+        r = r.replace(f"{_CB_MARK}{i}___", f"\n<br>\n{block}\n<br>\n")
+
+    # 6. Compress 3+ newlines → 2
+    r = re.sub(r"\n{3,}", "\n\n", r)
+    return r
+
+
+def _strip_invalid_image_keys(text: str) -> str:
+    """Remove ![alt](url) where url is not a Feishu img_xxx key."""
+    if "![" not in text:
+        return text
+    return _IMAGE_RE.sub(
+        lambda m: m.group(0) if m.group(2).startswith("img_") else "", text,
+    )
+
 _unavailable_messages: dict[str, dict] = {}
 _UNAVAILABLE_TTL = 30 * 60
 _UNAVAILABLE_MAX_SIZE = 512
@@ -379,6 +464,7 @@ def _format_elapsed(seconds: float) -> str:
 
 def build_cardkit_final_card(content: str, is_error: bool = False,
                              elapsed_s: float = 0) -> dict:
+    content = optimize_markdown_style(content)
     chunks: list[str] = []
     remaining = content
     while remaining:
@@ -414,6 +500,7 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
     elements.append({
         "tag": "markdown",
         "content": "---\n" + " · ".join(footer_parts),
+        "text_size": "notation",
     })
 
     summary_text = re.sub(r"[*`#>\[\]()~_]", "", content)
@@ -692,6 +779,7 @@ class ResponseHandle:
     def _perform_flush(self, text: str):
         if self._use_cardkit and self._cardkit_card_id:
             self._update_summary_to_typing()
+            text = optimize_markdown_style(text)
             seq = self._next_seq()
             try:
                 body = ContentCardElementRequestBody.builder() \
