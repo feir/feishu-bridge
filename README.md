@@ -73,7 +73,7 @@
 pipx install feishu-bridge
 
 # 或从源码安装
-git clone <repo-url>
+git clone https://github.com/feir/feishu-bridge.git
 cd feishu-bridge
 pip install -e '.[dev]'
 ```
