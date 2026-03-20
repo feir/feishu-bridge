@@ -14,7 +14,7 @@ import datetime
 import logging
 import time
 
-from feishu_bridge.api.client import FeishuAPI
+from feishu_bridge.api.client import FeishuAPI, FeishuAPIError
 
 log = logging.getLogger("feishu-tasks")
 
@@ -175,15 +175,22 @@ class FeishuTasks(FeishuAPI):
 
     def complete_task(self, chat_id: str, user_open_id: str,
                       task_guid: str) -> dict:
-        """Mark a task as completed by setting completed_at."""
+        """Mark a task as completed (idempotent — already-completed tasks succeed)."""
         token = self.get_token(chat_id, user_open_id)
         if not token:
             return {"error": "auth_failed"}
-        return self.request("PATCH", f"/tasks/{task_guid}", token,
-                            json_body={
-                                "task": {"completed_at": str(int(time.time() * 1000))},
-                                "update_fields": ["completed_at"],
-                            })
+        try:
+            return self.request("PATCH", f"/tasks/{task_guid}", token,
+                                json_body={
+                                    "task": {"completed_at": str(int(time.time() * 1000))},
+                                    "update_fields": ["completed_at"],
+                                })
+        except FeishuAPIError as e:
+            if e.code == 1470400:
+                log.info("Task %s already completed", task_guid)
+                return self.request("GET", f"/tasks/{task_guid}", token,
+                                    params={"user_id_type": "open_id"})
+            raise
 
     # -------------------------------------------------------------------
     # Subtask endpoints
@@ -208,13 +215,15 @@ class FeishuTasks(FeishuAPI):
 
     def create_subtask(self, chat_id: str, user_open_id: str,
                        parent_guid: str, summary: str,
+                       description: str = None,
                        due_timestamp: str = None) -> dict:
         """Create a subtask under the given parent task.
 
         Args:
             parent_guid: GUID of the parent task.
             summary: Title of the new subtask.
-            due_timestamp: Optional Unix timestamp (seconds) as string.
+            description: Optional description text.
+            due_timestamp: Optional Unix timestamp in **milliseconds** as string.
 
         Returns:
             API response data (contains the created subtask object).
@@ -224,6 +233,8 @@ class FeishuTasks(FeishuAPI):
             return {"error": "auth_failed"}
 
         body = {"summary": summary}
+        if description:
+            body["description"] = description
         if due_timestamp:
             body["due"] = {"timestamp": due_timestamp}
 
@@ -240,7 +251,7 @@ class FeishuTasks(FeishuAPI):
         Args:
             summary: task title (max 3000 chars)
             description: optional description
-            due_timestamp: optional Unix timestamp (seconds) as string
+            due_timestamp: optional Unix timestamp in **milliseconds** as string
             tasklist_guid: optional tasklist to add the task to
 
         Returns:
@@ -261,6 +272,80 @@ class FeishuTasks(FeishuAPI):
         return self.request("POST", "/tasks", token,
                             params={"user_id_type": "open_id"},
                             json_body=body)
+
+    def update_task(self, chat_id: str, user_open_id: str,
+                    task_guid: str, *,
+                    summary: str = None,
+                    description: str = None,
+                    due_timestamp: str = None,
+                    completed_at: str = None) -> dict:
+        """Update a task via PATCH.
+
+        Args:
+            task_guid: GUID of the task to update.
+            summary: New title (optional).
+            description: New description (optional).
+            due_timestamp: New due date as Unix ms timestamp string (optional).
+            completed_at: Completion timestamp in ms, or "0" to uncomplete (optional).
+
+        Returns:
+            API response (contains the updated task object).
+        """
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return {"error": "auth_failed"}
+
+        task_data = {}
+        if summary is not None:
+            task_data["summary"] = summary
+        if description is not None:
+            task_data["description"] = description
+        if due_timestamp is not None:
+            task_data["due"] = {"timestamp": due_timestamp}
+        if completed_at is not None:
+            task_data["completed_at"] = completed_at
+
+        if not task_data:
+            return {"error": "no fields to update"}
+
+        # Split completed_at from other fields to avoid silent-drop on 1470400:
+        # If completed_at is mixed with other fields and the task is already
+        # completed, the API rejects the whole PATCH — losing the other updates.
+        other_data = {k: v for k, v in task_data.items() if k != "completed_at"}
+
+        # Step 1: apply non-completion fields first (if any)
+        result = None
+        if other_data:
+            result = self.request("PATCH", f"/tasks/{task_guid}", token,
+                                  params={"user_id_type": "open_id"},
+                                  json_body={
+                                      "task": other_data,
+                                      "update_fields": list(other_data.keys()),
+                                  })
+
+        # Step 2: apply completed_at separately (idempotent)
+        if completed_at is not None:
+            try:
+                result = self.request(
+                    "PATCH", f"/tasks/{task_guid}", token,
+                    params={"user_id_type": "open_id"},
+                    json_body={
+                        "task": {"completed_at": completed_at},
+                        "update_fields": ["completed_at"],
+                    })
+            except FeishuAPIError as e:
+                # 1470400: task already completed — treat as success
+                if e.code == 1470400 and completed_at != "0":
+                    log.info("Task %s already completed, treating as success",
+                             task_guid)
+                    if not result:
+                        result = self.request(
+                            "GET", f"/tasks/{task_guid}", token,
+                            params={"user_id_type": "open_id"})
+                else:
+                    raise
+
+        return result
 
 
     # -------------------------------------------------------------------
@@ -356,7 +441,9 @@ class FeishuTasks(FeishuAPI):
                 due = t.get("due")
                 due_str = ""
                 if due and due.get("timestamp"):
-                    ts = int(str(due["timestamp"])[:10])
+                    ts_raw = int(due["timestamp"])
+                    # Feishu Task API stores timestamps in milliseconds
+                    ts = ts_raw // 1000 if ts_raw > 9_999_999_999 else ts_raw
                     due_str = f" — 截止 {datetime.datetime.fromtimestamp(ts).strftime('%m/%d')}"
                 lines.append(f"  • {summary_text}{due_str}")
             if len(tasks) > 20:

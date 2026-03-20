@@ -308,7 +308,8 @@ class BridgeCommandHandler:
             due = t.get("due")
             due_str = ""
             if due and due.get("timestamp"):
-                ts = int(str(due["timestamp"])[:10])
+                ts_raw = int(due["timestamp"])
+                ts = ts_raw // 1000 if ts_raw > 9_999_999_999 else ts_raw
                 due_str = f" — 截止 {datetime.datetime.fromtimestamp(ts).strftime('%m/%d')}"
             members = t.get("members", [])
             assignee_str = ""
@@ -361,7 +362,8 @@ class BridgeCommandHandler:
             due = t.get("due")
             due_str = ""
             if due and due.get("timestamp"):
-                ts = int(str(due["timestamp"])[:10])
+                ts_raw = int(due["timestamp"])
+                ts = ts_raw // 1000 if ts_raw > 9_999_999_999 else ts_raw
                 due_str = f" — 截止 {datetime.datetime.fromtimestamp(ts).strftime('%m/%d')}"
             members = t.get("members", [])
             assignee_str = ""
@@ -398,7 +400,8 @@ class BridgeCommandHandler:
 
         due = task.get("due")
         if due and due.get("timestamp"):
-            ts = int(str(due["timestamp"])[:10])
+            ts_raw = int(due["timestamp"])
+            ts = ts_raw // 1000 if ts_raw > 9_999_999_999 else ts_raw
             due_dt = datetime.datetime.fromtimestamp(ts)
             lines.append(f"截止: {due_dt.strftime('%Y-%m-%d %H:%M')}")
 

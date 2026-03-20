@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -28,6 +29,60 @@ from feishu_bridge.api.search import FeishuSearch
 from feishu_bridge.api.bitable import FeishuBitable
 from feishu_bridge.api.tasks import FeishuTasks
 from feishu_bridge.api.drive import FeishuDrive
+
+
+def _parse_due(value: str) -> str:
+    """Parse a due date string into Unix milliseconds for the Feishu Task API.
+
+    Accepts:
+      - Human-readable: "2026-03-31", "2026-03-31 23:59", "2026-03-31 23:59:00"
+        (interpreted as **UTC**; date-only defaults to 23:59:59 UTC)
+      - Unix seconds (10 digits): "1775001599" → auto-converted to ms
+      - Unix milliseconds (13 digits): "1775001599000" → passed through
+
+    Returns: string of Unix timestamp in milliseconds.
+    Raises ValueError on unparseable input.
+    """
+    from datetime import datetime, timezone
+
+    value = value.strip()
+
+    # Pure numeric → detect seconds (10 digits) vs milliseconds (13 digits)
+    if value.isdigit():
+        n = len(value)
+        if n <= 10:
+            return str(int(value) * 1000)  # seconds → ms
+        if n == 13:
+            return value  # already ms
+        raise ValueError(
+            f"Ambiguous numeric timestamp ({n} digits): {value!r}. "
+            "Use 10-digit (seconds) or 13-digit (milliseconds).")
+
+    # Try human-readable date formats
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            # If no time specified, default to end of day
+            if fmt == "%Y-%m-%d":
+                dt = dt.replace(hour=23, minute=59, second=59)
+            dt = dt.replace(tzinfo=timezone.utc)
+            return str(int(dt.timestamp() * 1000))
+        except ValueError:
+            continue
+
+    raise ValueError(f"Cannot parse due date: {value!r}. "
+                     "Use YYYY-MM-DD, 'YYYY-MM-DD HH:MM', or Unix timestamp.")
+
+
+def _safe_parse_due(value: str | None) -> str | None:
+    """Parse --due value, returning None if absent or exiting with JSON error."""
+    if not value:
+        return None
+    try:
+        return _parse_due(value)
+    except ValueError as e:
+        _output({"error": str(e)})
+        sys.exit(1)
 
 
 def _load_auth():
@@ -403,13 +458,21 @@ def main():
     p = sub.add_parser("create-task", help="Create a new task")
     p.add_argument("--summary", required=True, help="Task title")
     p.add_argument("--description", help="Task description")
-    p.add_argument("--due", type=int, help="Due date as Unix timestamp (seconds)")
+    p.add_argument("--due", help="Due date (UTC): YYYY-MM-DD, 'YYYY-MM-DD HH:MM', or Unix timestamp")
     p.add_argument("--tasklist-guid", help="Add to a specific task list")
 
     p = sub.add_parser("create-subtask", help="Create a subtask")
     p.add_argument("--parent-guid", required=True, help="Parent task GUID")
     p.add_argument("--summary", required=True, help="Subtask title")
-    p.add_argument("--due", type=int, help="Due date as Unix timestamp (seconds)")
+    p.add_argument("--description", help="Subtask description")
+    p.add_argument("--due", help="Due date (UTC): YYYY-MM-DD, 'YYYY-MM-DD HH:MM', or Unix timestamp")
+
+    p = sub.add_parser("update-task", help="Update a task's fields")
+    p.add_argument("--guid", required=True, help="Task GUID")
+    p.add_argument("--summary", help="New title")
+    p.add_argument("--description", help="New description")
+    p.add_argument("--due", help="New due date (UTC): YYYY-MM-DD, 'YYYY-MM-DD HH:MM', or Unix timestamp")
+    p.add_argument("--completed-at", help="Completion timestamp (ms), 'now', or '0' to uncomplete")
 
     p = sub.add_parser("create-tasklist", help="Create a new task list")
     p.add_argument("--name", required=True, help="Task list name (max 100 chars)")
@@ -837,18 +900,40 @@ def main():
 
     elif cmd == "create-task":
         mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
+        due_ms = _safe_parse_due(args.due)
         _output(mod.create_task(chat_id, sender_id,
                                 summary=args.summary,
                                 description=args.description,
-                                due_timestamp=str(args.due) if args.due else None,
+                                due_timestamp=due_ms,
                                 tasklist_guid=args.tasklist_guid))
 
     elif cmd == "create-subtask":
         mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
+        due_ms = _safe_parse_due(args.due)
         _output(mod.create_subtask(chat_id, sender_id,
                                    parent_guid=args.parent_guid,
                                    summary=args.summary,
-                                   due_timestamp=str(args.due) if args.due else None))
+                                   description=args.description,
+                                   due_timestamp=due_ms))
+
+    elif cmd == "update-task":
+        mod = _init_module(FeishuTasks, config, _user_token, _lark_client)
+        due_ms = _safe_parse_due(args.due)
+        # Handle --completed-at: 'now' → current ms, '0' → uncomplete, else parse
+        completed_at = None
+        if args.completed_at:
+            if args.completed_at == "now":
+                completed_at = str(int(time.time() * 1000))
+            elif args.completed_at == "0":
+                completed_at = "0"
+            else:
+                completed_at = _safe_parse_due(args.completed_at)
+        _output(mod.update_task(chat_id, sender_id,
+                                task_guid=args.guid,
+                                summary=args.summary,
+                                description=args.description,
+                                due_timestamp=due_ms,
+                                completed_at=completed_at))
 
 
 
