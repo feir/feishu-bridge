@@ -38,9 +38,8 @@ class FeishuBitable(FeishuAPI):
         "base:field:update",
         "base:field:delete",
         "base:view:read",
-        "base:view:create",
-        "base:view:update",
-        "base:view:delete",
+        # Note: base:view:create/update/delete don't exist as Feishu scopes;
+        # view CUD is covered by base:table:update.
     ]
     BASE_PATH = "/open-apis/bitable/v1"
 

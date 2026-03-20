@@ -424,7 +424,7 @@ def build_app_scope_missing_card(app_id: str, scopes: list[str]) -> dict:
                 "tag": "markdown",
                 "content": (
                     f"应用尚未开通以下权限：\n{scope_list}\n\n"
-                    f"请前往飞书开放平台开通后重试。"
+                    f"请前往飞书开放平台开通，**开通后重新发送命令**即可。"
                 ),
             },
             {
@@ -577,18 +577,42 @@ class FeishuAuth:
             log.info("Using cached token for %s", user_open_id[:8])
             return token
 
-        # 2. Start Device Flow
+        # 2. Start Device Flow — merge existing scopes with required scopes
+        #    so the new token doesn't lose previously granted authorizations.
+        stored = load_token(self.app_id, user_open_id)
+        if stored:
+            existing_scopes = stored.get("scope", "").split()
+            merged = list(dict.fromkeys(existing_scopes + scopes))
+        else:
+            merged = scopes
+
         try:
             device = request_device_authorization(
-                self.app_id, self.app_secret, scopes)
+                self.app_id, self.app_secret, merged)
         except RuntimeError as e:
             error_msg = str(e)
-            if "99991672" in error_msg or "scope" in error_msg.lower():
-                # App scope not enabled
+            if "99991672" in error_msg:
                 self._send_card(chat_id, build_app_scope_missing_card(
                     self.app_id, scopes))
                 return None
-            raise
+            # Invalid scope in merged set — stale scope from stored token?
+            # Fall back to requesting only the required scopes.
+            if ("invalid" in error_msg.lower() and "scope" in error_msg.lower()
+                    and merged != scopes):
+                log.warning("Merged scopes failed (%s), retrying with "
+                            "required scopes only", error_msg)
+                try:
+                    device = request_device_authorization(
+                        self.app_id, self.app_secret, scopes)
+                except RuntimeError as e2:
+                    err2 = str(e2)
+                    if "99991672" in err2:
+                        self._send_card(chat_id, build_app_scope_missing_card(
+                            self.app_id, scopes))
+                        return None
+                    raise
+            else:
+                raise
 
         # 3. Send auth card
         expires_min = max(1, device["expires_in"] // 60)
@@ -610,10 +634,14 @@ class FeishuAuth:
         if result["ok"]:
             token_data = result["token"]
             save_token(self.app_id, user_open_id, token_data)
-            self._update_card(msg_id, build_auth_success_card())
+            success_card = build_auth_success_card()
+            if not self._update_card(msg_id, success_card):
+                self._send_card(chat_id, success_card)
             return token_data["access_token"]
         else:
-            self._update_card(msg_id, build_auth_failed_card(result["message"]))
+            failed_card = build_auth_failed_card(result["message"])
+            if not self._update_card(msg_id, failed_card):
+                self._send_card(chat_id, failed_card)
             return None
 
     def _scopes_covered(self, stored: dict, required: list[str]) -> bool:
@@ -646,10 +674,10 @@ class FeishuAuth:
             log.exception("Send card error")
         return None
 
-    def _update_card(self, msg_id: Optional[str], card: dict):
-        """Update existing card content."""
+    def _update_card(self, msg_id: Optional[str], card: dict) -> bool:
+        """Update existing card content. Returns True on success."""
         if not msg_id or not self.lark_client:
-            return
+            return False
         try:
             from lark_oapi.api.im.v1 import (
                 PatchMessageRequest, PatchMessageRequestBody,
@@ -661,6 +689,11 @@ class FeishuAuth:
                     .content(json.dumps(card))
                     .build()
                 ).build()
-            self.lark_client.im.v1.message.patch(req)
+            resp = self.lark_client.im.v1.message.patch(req)
+            if resp.success():
+                return True
+            log.error("Update card failed: code=%s msg=%s msg_id=%s",
+                      resp.code, resp.msg, msg_id)
         except Exception:
-            log.exception("Update card error")
+            log.exception("Update card error for msg_id=%s", msg_id)
+        return False
