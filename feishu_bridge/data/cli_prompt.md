@@ -8,7 +8,20 @@ Call it with `feishu-cli <command> [args]`.
 ### Documents
 - `read-doc --token <doc_token>` — Read document as Markdown
 - `create-doc --title <title> [--markdown <content>] [--folder-token <folder>]`
-- `update-doc --token <doc_token> --markdown <content> [--mode overwrite|append]`
+- `update-doc --token <doc_token> --markdown <content> --mode <mode> [--selection <sel>] [--new-title <title>]`
+  Update modes (prefer incremental over overwrite):
+  - `overwrite` — 全量覆写（慎用：会丢失图片、评论等嵌入内容）
+  - `append` — 尾部追加
+  - `replace_range` — 替换 selection 匹配的内容
+  - `replace_all` — 全文替换所有匹配（`--selection` 可选，用于限定替换范围）
+  - `insert_before` — 在 selection 匹配位置前插入
+  - `insert_after` — 在 selection 匹配位置后插入
+  - `delete_range` — 删除 selection 匹配的内容（`--markdown` 需占位传入）
+  Selection (`replace_range`/`insert_before`/`insert_after`/`delete_range` 必填):
+  - 范围: `"开头内容...结尾内容"` — 匹配从开头到结尾（含中间），10-20 字符确保唯一
+  - 精确: `"完整内容"` — 不含 `...` 时精确匹配
+  - 转义: 内容含字面 `...` 时用 `\.\.\.`
+  Mode selection guide: append new content → `append`; insert near a heading or anchor text → `insert_after`/`insert_before` with `--selection`; replace a section → `replace_range`; global find-replace → `replace_all`; rewrite entire doc → `overwrite` (only when no images/tables/comments at risk).
 - `delete-doc --token <doc_token> --confirm <token_prefix>` ⚠️
 
 ### Spreadsheets
