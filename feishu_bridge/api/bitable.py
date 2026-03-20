@@ -23,6 +23,8 @@ class FeishuBitable(FeishuAPI):
     """Feishu Bitable (多维表格) CRUD via OAPI v1."""
 
     SCOPES = [
+        "bitable:app:readonly",
+        "bitable:app",
         "base:app:read",
         "base:app:create",
         "base:table:read",
