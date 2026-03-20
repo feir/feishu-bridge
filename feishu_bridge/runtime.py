@@ -7,12 +7,15 @@ import os
 import queue
 import signal
 import subprocess
+import tempfile
 import threading
 import time
+from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
+from dataclasses import dataclass, field
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar, Optional
 
 log = logging.getLogger("feishu-bridge")
 
@@ -53,6 +56,52 @@ EMPTY_RESULT_MESSAGE = "Claude 本次未返回任何内容，请稍后重试。"
 SILENT_OK_MESSAGE = "✓ 操作已完成（无文本输出）"
 
 
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunResult:
+    """Runner 统一返回结构。"""
+    result: str = ""
+    session_id: Optional[str] = None
+    is_error: bool = False
+    cancelled: bool = False
+    usage: Optional[dict] = None
+    last_call_usage: Optional[dict] = None
+    model_usage: Optional[dict] = None
+    total_cost_usd: Optional[float] = None
+    peak_context_tokens: int = 0
+    compact_detected: bool = False
+    default_context_window: int = 200_000
+
+    def to_dict(self) -> dict:
+        """向后兼容：转为 dict，保持 camelCase key。"""
+        from dataclasses import asdict
+        d = {k: v for k, v in asdict(self).items() if v is not None}
+        if "model_usage" in d:
+            d["modelUsage"] = d.pop("model_usage")
+        return d
+
+
+@dataclass
+class StreamState:
+    """流式解析过程中的可变状态。"""
+    accumulated_text: str = ""
+    session_id: Optional[str] = None
+    final_result: Optional[dict] = None
+    last_call_usage: Optional[dict] = None
+    peak_context_tokens: int = 0
+    compact_detected: bool = False
+    is_error: bool = False
+    done: bool = False
+    pending_output: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Dedup / Session / Queue (unchanged)
+# ---------------------------------------------------------------------------
+
 class MessageDedup:
     """LRU message dedup with TTL."""
 
@@ -86,18 +135,49 @@ class MessageDedup:
 class SessionMap:
     """Thread-safe session mapping with atomic JSON persistence."""
 
-    def __init__(self, path: Path):
+    _AGENT_TYPE_KEY = "_agent_type"
+
+    def __init__(self, path: Path, agent_type: str | None = None):
         self._lock = threading.RLock()
         self._path = path
         self._data: dict[str, str] = {}
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._load()
+        if agent_type:
+            self._reconcile_agent_type(agent_type)
+
+    def _reconcile_agent_type(self, agent_type: str):
+        """Clear stale sessions when agent type changes."""
+        stored = self._data.get(self._AGENT_TYPE_KEY)
+        if stored == agent_type:
+            return  # match — nothing to do
+
+        session_count = sum(1 for k in self._data if k != self._AGENT_TYPE_KEY)
+        if stored is None and agent_type == "claude" and session_count > 0:
+            # Legacy file without metadata + still using claude → preserve sessions
+            log.info("Adding agent_type=claude to existing sessions file")
+        elif stored is not None and stored != agent_type and session_count > 0:
+            log.warning(
+                "Agent type changed %s → %s; clearing %d stale sessions",
+                stored, agent_type, session_count,
+            )
+            self._data = {}
+        elif stored is None and agent_type != "claude" and session_count > 0:
+            log.warning(
+                "Agent type set to %s but existing sessions have no type marker; "
+                "clearing %d sessions", agent_type, session_count,
+            )
+            self._data = {}
+
+        self._data[self._AGENT_TYPE_KEY] = agent_type
+        self._save()
 
     def _load(self):
         if self._path.exists():
             try:
                 self._data = json.loads(self._path.read_text())
-                log.info("Loaded %d sessions from %s", len(self._data), self._path)
+                count = sum(1 for k in self._data if k != self._AGENT_TYPE_KEY)
+                log.info("Loaded %d sessions from %s", count, self._path)
             except (json.JSONDecodeError, IOError) as e:
                 log.warning("Failed to load sessions: %s", e)
                 self._data = {}
@@ -209,12 +289,31 @@ class ChatTaskQueue:
             return len(self._pending.get(key, []))
 
 
-class ClaudeRunner:
-    """Spawn claude -p one-shot and parse JSON result."""
+# ---------------------------------------------------------------------------
+# BaseRunner ABC
+# ---------------------------------------------------------------------------
+
+class BaseRunner(ABC):
+    """Abstract base for AI Agent CLI runners."""
+
+    DEFAULT_MODEL: ClassVar[str]
+    ALWAYS_STREAMING: ClassVar[bool] = False
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Enforce DEFAULT_MODEL on concrete subclasses
+        if not getattr(cls, '__abstractmethods__', None) and not hasattr(cls, 'DEFAULT_MODEL'):
+            raise TypeError(f"{cls.__name__} must define DEFAULT_MODEL")
+
+    _SAFETY_PROMPT = (
+        "CRITICAL: You are running as a subprocess of feishu-bridge. "
+        "NEVER execute systemctl restart/stop/reload on feishu-bridge - "
+        "doing so kills your own parent process, causing an infinite restart loop."
+    )
 
     def __init__(self, command: str, model: str, workspace: str, timeout: int,
                  max_budget_usd: Optional[float] = None,
-                 extra_system_prompts: list[str] = None):
+                 extra_system_prompts: Optional[list[str]] = None):
         self.command = command
         self.model = model
         self.workspace = workspace
@@ -225,18 +324,64 @@ class ClaudeRunner:
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
 
+    # ── Abstract methods (subclass must implement) ──
 
-    _SAFETY_PROMPT = (
-        "CRITICAL: You are running as a subprocess of feishu-bridge. "
-        "NEVER execute systemctl restart/stop/reload on feishu-bridge - "
-        "doing so kills your own parent process, causing an infinite restart loop."
-    )
+    @abstractmethod
+    def build_args(self, prompt: str, session_id: Optional[str],
+                   resume: bool, streaming: bool) -> list:
+        """构建 CLI 命令行参数列表。"""
+
+    @abstractmethod
+    def parse_streaming_line(self, event: dict, state: StreamState) -> None:
+        """解析单行流式 JSONL 事件，更新 StreamState。"""
+
+    @abstractmethod
+    def parse_blocking_output(self, stdout: str, session_id: Optional[str]) -> dict:
+        """解析阻塞模式的完整 stdout，返回 result dict。"""
+
+    @abstractmethod
+    def get_model_aliases(self) -> dict[str, str]:
+        """返回 {alias: full_model_name} 映射。"""
+
+    @abstractmethod
+    def get_default_context_window(self) -> int:
+        """默认 context window 大小。"""
+
+    # ── Optional overrides ──
+
+    def get_session_not_found_signatures(self) -> list[str]:
+        """返回表示 session 不存在的错误签名列表。默认空。"""
+        return []
+
+    def get_extra_env(self) -> dict:
+        """额外环境变量。默认空。"""
+        return {}
+
+    def get_display_name(self) -> str:
+        """用户可见的 Agent 名称。"""
+        return "AI Agent"
+
+    def supports_compact(self) -> bool:
+        """是否支持 /compact 命令。"""
+        return True
 
     def _build_system_prompt(self) -> str:
         """Merge safety guard + extra system prompts into one string."""
         parts = [self._SAFETY_PROMPT]
         parts.extend(self._extra_system_prompts)
         return "\n\n".join(parts)
+
+    def _build_streaming_result(self, state: StreamState,
+                                session_id: Optional[str]) -> Optional[dict]:
+        """Build content-level result from streaming state.
+
+        Return dict if a definitive result is available, None to fall through
+        to generic BaseRunner fallbacks (timeout, exit code, empty text).
+        Subclasses override this for protocol-specific result handling.
+        """
+        return None
+
+    # ── Shared subprocess management ──
 
     @staticmethod
     def _force_kill(proc: subprocess.Popen):
@@ -267,15 +412,11 @@ class ClaudeRunner:
         except (ProcessLookupError, PermissionError):
             return
         # Phase 2: schedule SIGKILL after grace period (non-blocking).
-        # The Timer is a non-daemon thread, so it keeps the process alive
-        # until it fires. If the child exits before the timer, poll()
-        # returns non-None and we skip the SIGKILL — the Timer then
-        # exits cleanly with no side effects.
         def _deferred_sigkill():
             if proc.poll() is None:  # Still alive
                 log.warning("Process %d did not exit after SIGTERM (%ds), sending SIGKILL",
                             proc.pid, graceful_timeout)
-                ClaudeRunner._force_kill(proc)
+                BaseRunner._force_kill(proc)
         threading.Timer(graceful_timeout, _deferred_sigkill).start()
 
     def cancel(self, tag: str) -> bool:
@@ -284,7 +425,8 @@ class ClaudeRunner:
             if proc:
                 self._cancelled.add(tag)
         if proc:
-            log.info("Cancelling claude process: tag=%s pid=%d", tag, proc.pid)
+            log.info("Cancelling %s process: tag=%s pid=%d",
+                     self.get_display_name(), tag, proc.pid)
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
@@ -306,45 +448,27 @@ class ClaudeRunner:
 
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
-            on_output=None, env_extra: dict = None) -> dict:
-        args = [
-            self.command, "-p",
-            "--dangerously-skip-permissions",
-            "--settings", get_bridge_settings_path(),
-            "--model", self.model,
-            "--append-system-prompt",
-            self._build_system_prompt(),
-        ]
-
-        if self.max_budget_usd is not None:
-            args.extend(["--max-budget-usd", str(self.max_budget_usd)])
-
-        if on_output:
-            args.extend(["--output-format", "stream-json",
-                         "--verbose", "--include-partial-messages"])
-        else:
-            args.extend(["--output-format", "json"])
-
-        if resume and session_id:
-            args.extend(["--resume", session_id])
-        elif session_id:
-            args.extend(["--session-id", session_id])
+            on_output=None, env_extra: Optional[dict] = None) -> dict:
 
         if len(prompt) > MAX_PROMPT_CHARS:
             log.warning("Prompt truncated: %d -> %d chars", len(prompt), MAX_PROMPT_CHARS)
             prompt = prompt[:MAX_PROMPT_CHARS] + "\n\n...(message truncated)"
 
-        args.append("--")
-        args.append(prompt)
+        streaming = bool(on_output) or self.ALWAYS_STREAMING
+        args = self.build_args(prompt, session_id, resume, streaming)
 
-        log.info("claude: resume=%s sid=%s stream=%s prompt=%d chars",
-                 resume, session_id[:8] if session_id else "-",
-                 bool(on_output), len(prompt))
+        log.info("%s: resume=%s sid=%s stream=%s prompt=%d chars",
+                 self.get_display_name(), resume,
+                 session_id[:8] if session_id else "-",
+                 streaming, len(prompt))
 
         env = None
+        extra_env = self.get_extra_env()
         if env_extra:
+            extra_env.update(env_extra)
+        if extra_env:
             env = os.environ.copy()
-            env.update(env_extra)
+            env.update(extra_env)
 
         proc = subprocess.Popen(
             args,
@@ -360,9 +484,13 @@ class ClaudeRunner:
             with self._lock:
                 self._active[tag] = proc
 
-        if on_output:
-            return self._run_streaming(proc, session_id, tag, on_output)
-        return self._run_blocking(proc, session_id, tag)
+        if streaming:
+            result = self._run_streaming(proc, session_id, tag, on_output)
+        else:
+            result = self._run_blocking(proc, session_id, tag)
+
+        result["default_context_window"] = self.get_default_context_window()
+        return result
 
     def _run_blocking(self, proc, session_id, tag) -> dict:
         t0 = time.monotonic()
@@ -371,7 +499,8 @@ class ClaudeRunner:
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - t0
             log.error(
-                "Claude blocking timeout: sid=%s elapsed=%.0fs limit=%ds",
+                "%s blocking timeout: sid=%s elapsed=%.0fs limit=%ds",
+                self.get_display_name(),
                 (session_id or "-")[:8], elapsed, self.timeout,
             )
             # Graceful kill: SIGTERM + deferred SIGKILL. proc.communicate()
@@ -379,7 +508,7 @@ class ClaudeRunner:
             self._kill_proc_tree(proc)
             proc.communicate()
             return {
-                "result": f"Claude 超时（已运行 {int(elapsed)}s，限制 {self.timeout}s）",
+                "result": f"{self.get_display_name()} 超时（已运行 {int(elapsed)}s，限制 {self.timeout}s）",
                 "session_id": session_id,
                 "is_error": True,
             }
@@ -396,55 +525,18 @@ class ClaudeRunner:
 
         if proc.returncode != 0 and not stdout.strip():
             return {
-                "result": f"Claude 退出码 {proc.returncode}: {stderr[:500]}",
+                "result": f"{self.get_display_name()} 退出码 {proc.returncode}: {stderr[:500]}",
                 "session_id": session_id,
                 "is_error": True,
             }
 
-        try:
-            data = json.loads(stdout)
-        except json.JSONDecodeError:
-            return {
-                "result": f"Claude 输出解析失败: {stdout[:500]}",
-                "session_id": session_id,
-                "is_error": True,
-            }
-
-        result_text = data.get("result", "")
-        if not data.get("is_error", False) and not result_text:
-            log.info(
-                "Claude returned empty blocking result (silent OK): sid=%s stdout_len=%d stderr_len=%d",
-                (data.get("session_id") or session_id or "-")[:8],
-                len(stdout),
-                len(stderr),
-            )
-            return {
-                "result": SILENT_OK_MESSAGE,
-                "session_id": data.get("session_id", session_id),
-                "is_error": False,
-                "usage": data.get("usage"),
-                "modelUsage": data.get("modelUsage"),
-                "total_cost_usd": data.get("total_cost_usd"),
-            }
-
-        return {
-            "result": result_text,
-            "session_id": data.get("session_id", session_id),
-            "is_error": data.get("is_error", False),
-            "usage": data.get("usage"),
-            "modelUsage": data.get("modelUsage"),
-            "total_cost_usd": data.get("total_cost_usd"),
-        }
+        return self.parse_blocking_output(stdout, session_id)
 
     def _run_streaming(self, proc, session_id, tag, on_output) -> dict:
-        accumulated = ""
-        final_result = None
-        last_call_usage = None  # per-call usage from last assistant event
+        state = StreamState(session_id=session_id)
         timed_out = False
         result_received = threading.Event()
         stderr_lines = []
-        peak_context_tokens = 0
-        compact_detected = False
         t0 = time.monotonic()
 
         def _drain_stderr():
@@ -460,13 +552,9 @@ class ClaudeRunner:
                 return  # Result already received; don't flag as timeout.
             timed_out = True
             # Graceful kill spawns its own deferred SIGKILL Timer (15s).
-            # If the process exits from SIGTERM, stdout EOF unblocks the
-            # main loop; the deferred timer no-ops via poll() check.
-            ClaudeRunner._kill_proc_tree(proc)
+            BaseRunner._kill_proc_tree(proc)
 
         # Idle timeout: resets on every stdout line from the CLI.
-        # This keeps long-running but active sessions alive (e.g. multi-hour
-        # tool-use chains) while still killing truly stuck processes.
         timer = threading.Timer(self.timeout, _timeout_kill)
         timer.start()
 
@@ -487,34 +575,17 @@ class ClaudeRunner:
                 except json.JSONDecodeError:
                     continue
 
-                etype = event.get("type", "")
-                if etype == "result":
-                    final_result = event
+                self.parse_streaming_line(event, state)
+
+                # Drain pending_output → on_output callback
+                if on_output and state.pending_output:
+                    for text in state.pending_output:
+                        on_output(text)
+                    state.pending_output.clear()
+
+                if state.done:
                     result_received.set()
                     break
-                if etype == "assistant":
-                    msg_usage = event.get("message", {}).get("usage")
-                    if msg_usage:
-                        last_call_usage = msg_usage
-                        # Track peak context tokens (pre-compact high-water mark).
-                        ctx_tokens = (msg_usage.get("input_tokens", 0)
-                                      + msg_usage.get("cache_read_input_tokens", 0)
-                                      + msg_usage.get("cache_creation_input_tokens", 0))
-                        if ctx_tokens > peak_context_tokens:
-                            peak_context_tokens = ctx_tokens
-                elif etype == "stream_event":
-                    inner = event.get("event", {})
-                    if (inner.get("type") == "content_block_delta"
-                            and inner.get("delta", {}).get("type") == "text_delta"):
-                        accumulated += inner["delta"].get("text", "")
-                        on_output(accumulated)
-                    elif inner.get("type") == "message_delta":
-                        edits = (inner.get("delta", {})
-                                 .get("context_management", {})
-                                 .get("applied_edits"))
-                        if edits:
-                            compact_detected = True
-                            log.info("Auto-compact detected: %d edit(s) applied", len(edits))
 
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -524,35 +595,38 @@ class ClaudeRunner:
                 # The idle timer fired, killed the process, stdout EOF'd,
                 # and now proc.wait(30) also timed out — unusual but possible.
                 log.error(
-                    "Claude idle timeout + proc.wait hang: sid=%s elapsed=%.0fs idle_limit=%ds",
-                    (session_id or "-")[:8], elapsed, self.timeout,
+                    "%s idle timeout + proc.wait hang: sid=%s elapsed=%.0fs idle_limit=%ds",
+                    self.get_display_name(),
+                    (state.session_id or session_id or "-")[:8], elapsed, self.timeout,
                 )
                 self._force_kill(proc)
                 proc.wait()
-            elif final_result:
-                # Claude sent a result event (task completed!) but the process
+            elif state.done:
+                # Agent sent a result event (task completed!) but the process
                 # didn't exit within 30s. Treat as success, not timeout.
                 log.warning(
-                    "Claude process hung after result event: sid=%s elapsed=%.0fs, force-killing",
-                    (session_id or "-")[:8], elapsed,
+                    "%s process hung after result event: sid=%s elapsed=%.0fs, force-killing",
+                    self.get_display_name(),
+                    (state.session_id or session_id or "-")[:8], elapsed,
                 )
                 self._force_kill(proc)
                 proc.wait()
-                # Fall through to the final_result handler below.
+                # Fall through to the content result handler below.
             else:
                 # stdout closed without a result event and process won't exit.
                 # Likely a crash or abnormal termination.
                 log.error(
-                    "Claude process hung (no result): sid=%s elapsed=%.0fs accumulated=%d chars, force-killing",
-                    (session_id or "-")[:8], elapsed, len(accumulated),
+                    "%s process hung (no result): sid=%s elapsed=%.0fs accumulated=%d chars, force-killing",
+                    self.get_display_name(),
+                    (state.session_id or session_id or "-")[:8], elapsed, len(state.accumulated_text),
                 )
                 self._force_kill(proc)
                 proc.wait()
                 return {
-                    "result": (accumulated + "\n\n⚠️ Claude 进程未正常退出（已运行 %ds）" % int(elapsed))
-                             if accumulated else
-                             "Claude 进程未正常退出（已运行 %ds，无输出）" % int(elapsed),
-                    "session_id": session_id,
+                    "result": (state.accumulated_text + "\n\n⚠️ %s 进程未正常退出（已运行 %ds）" % (self.get_display_name(), int(elapsed)))
+                             if state.accumulated_text else
+                             "%s 进程未正常退出（已运行 %ds，无输出）" % (self.get_display_name(), int(elapsed)),
+                    "session_id": state.session_id or session_id,
                     "is_error": True,
                 }
         except Exception:
@@ -567,87 +641,411 @@ class ClaudeRunner:
         if tag and was_cancelled:
             return {
                 "result": "任务已取消。",
-                "session_id": session_id,
+                "session_id": state.session_id or session_id,
                 "is_error": False,
                 "cancelled": True,
             }
 
-        # Check final_result BEFORE timed_out to handle the race where the
-        # idle timer fires during proc.wait(30) after result was received.
-        if final_result:
-            result_text = final_result.get("result") or accumulated
-            if not final_result.get("is_error", False) and not result_text:
-                log.info(
-                    "Claude returned empty streaming result (silent OK): sid=%s accumulated=%d stderr_len=%d",
-                    (final_result.get("session_id") or session_id or "-")[:8],
-                    len(accumulated),
-                    len(stderr_lines),
-                )
-                return {
-                    "result": SILENT_OK_MESSAGE,
-                    "session_id": final_result.get("session_id", session_id),
-                    "is_error": False,
-                    "usage": final_result.get("usage"),
-                    "last_call_usage": last_call_usage,
-                    "modelUsage": final_result.get("modelUsage"),
-                    "total_cost_usd": final_result.get("total_cost_usd"),
-                    "peak_context_tokens": peak_context_tokens,
-                    "compact_detected": compact_detected,
-                }
-            if accumulated and not final_result.get("result"):
-                log.info(
-                    "Claude streaming fallback used accumulated text: sid=%s chars=%d",
-                    (final_result.get("session_id") or session_id or "-")[:8],
-                    len(accumulated),
-                )
-            return {
-                "result": result_text,
-                "session_id": final_result.get("session_id", session_id),
-                "is_error": final_result.get("is_error", False),
-                "usage": final_result.get("usage"),
-                "last_call_usage": last_call_usage,
-                "modelUsage": final_result.get("modelUsage"),
-                "total_cost_usd": final_result.get("total_cost_usd"),
-                "peak_context_tokens": peak_context_tokens,
-                "compact_detected": compact_detected,
-            }
+        # Content-level result from subclass (checked BEFORE timed_out
+        # to handle race where idle timer fires during proc.wait after
+        # result was already received).
+        content_result = self._build_streaming_result(state, session_id)
+        if content_result is not None:
+            return content_result
 
         if timed_out:
             elapsed = time.monotonic() - t0
             log.error(
-                "Claude idle timeout: sid=%s elapsed=%.0fs idle_limit=%ds",
-                (session_id or "-")[:8], elapsed, self.timeout,
+                "%s idle timeout: sid=%s elapsed=%.0fs idle_limit=%ds",
+                self.get_display_name(),
+                (state.session_id or session_id or "-")[:8], elapsed, self.timeout,
             )
             return {
-                "result": f"Claude 空闲超时（连续无输出超过 {self.timeout}s，已运行 {int(elapsed)}s）",
-                "session_id": session_id,
+                "result": f"{self.get_display_name()} 空闲超时（连续无输出超过 {self.timeout}s，已运行 {int(elapsed)}s）",
+                "session_id": state.session_id or session_id,
                 "is_error": True,
             }
 
         stderr = "".join(stderr_lines)
         if proc.returncode != 0:
             return {
-                "result": f"Claude 退出码 {proc.returncode}: {stderr[:500]}",
-                "session_id": session_id,
+                "result": f"{self.get_display_name()} 退出码 {proc.returncode}: {stderr[:500]}",
+                "session_id": state.session_id or session_id,
                 "is_error": True,
             }
 
-        if not accumulated:
+        if not state.accumulated_text:
             log.warning(
-                "Claude streaming completed without text or result event: sid=%s stderr_len=%d",
-                (session_id or "-")[:8],
+                "%s streaming completed without text or result event: sid=%s stderr_len=%d",
+                self.get_display_name(),
+                (state.session_id or session_id or "-")[:8],
                 len(stderr),
             )
             return {
-                "result": EMPTY_RESULT_MESSAGE,
-                "session_id": session_id,
+                "result": f"{self.get_display_name()} 本次未返回任何内容，请稍后重试。",
+                "session_id": state.session_id or session_id,
                 "is_error": True,
             }
 
         return {
-            "result": accumulated,
-            "session_id": session_id,
-            "is_error": False,
-            "peak_context_tokens": peak_context_tokens,
-            "compact_detected": compact_detected,
+            "result": state.accumulated_text,
+            "session_id": state.session_id or session_id,
+            "is_error": state.is_error,
+            "peak_context_tokens": state.peak_context_tokens,
+            "compact_detected": state.compact_detected,
         }
+
+
+# ---------------------------------------------------------------------------
+# ClaudeRunner
+# ---------------------------------------------------------------------------
+
+class ClaudeRunner(BaseRunner):
+    """Claude Code CLI runner."""
+
+    DEFAULT_MODEL = "claude-opus-4-6"
+
+    SESSION_NOT_FOUND_SIGNATURES = [
+        "session not found",
+        "Session not found",
+        "no such session",
+        "session does not exist",
+        "sessionId that does not exist",
+        "Could not find session",
+        "ENOENT",
+        "no such file or directory",
+    ]
+
+    def build_args(self, prompt, session_id, resume, streaming):
+        args = [
+            self.command, "-p",
+            "--dangerously-skip-permissions",
+            "--settings", get_bridge_settings_path(),
+            "--model", self.model,
+            "--append-system-prompt",
+            self._build_system_prompt(),
+        ]
+
+        if self.max_budget_usd is not None:
+            args.extend(["--max-budget-usd", str(self.max_budget_usd)])
+
+        if streaming:
+            args.extend(["--output-format", "stream-json",
+                         "--verbose", "--include-partial-messages"])
+        else:
+            args.extend(["--output-format", "json"])
+
+        if resume and session_id:
+            args.extend(["--resume", session_id])
+        elif session_id:
+            args.extend(["--session-id", session_id])
+
+        args.append("--")
+        args.append(prompt)
+        return args
+
+    def parse_streaming_line(self, event, state):
+        etype = event.get("type", "")
+        if etype == "result":
+            state.final_result = event
+            state.done = True
+        elif etype == "assistant":
+            msg_usage = event.get("message", {}).get("usage")
+            if msg_usage:
+                state.last_call_usage = msg_usage
+                # Track peak context tokens (pre-compact high-water mark).
+                ctx_tokens = (msg_usage.get("input_tokens", 0)
+                              + msg_usage.get("cache_read_input_tokens", 0)
+                              + msg_usage.get("cache_creation_input_tokens", 0))
+                if ctx_tokens > state.peak_context_tokens:
+                    state.peak_context_tokens = ctx_tokens
+        elif etype == "stream_event":
+            inner = event.get("event", {})
+            if (inner.get("type") == "content_block_delta"
+                    and inner.get("delta", {}).get("type") == "text_delta"):
+                state.accumulated_text += inner["delta"].get("text", "")
+                state.pending_output.append(state.accumulated_text)
+            elif inner.get("type") == "message_delta":
+                edits = (inner.get("delta", {})
+                         .get("context_management", {})
+                         .get("applied_edits"))
+                if edits:
+                    state.compact_detected = True
+                    log.info("Auto-compact detected: %d edit(s) applied", len(edits))
+
+    def parse_blocking_output(self, stdout, session_id):
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return {
+                "result": f"{self.get_display_name()} 输出解析失败: {stdout[:500]}",
+                "session_id": session_id,
+                "is_error": True,
+            }
+
+        result_text = data.get("result", "")
+        if not data.get("is_error", False) and not result_text:
+            log.info(
+                "Claude returned empty blocking result (silent OK): sid=%s stdout_len=%d",
+                (data.get("session_id") or session_id or "-")[:8],
+                len(stdout),
+            )
+            return {
+                "result": SILENT_OK_MESSAGE,
+                "session_id": data.get("session_id", session_id),
+                "is_error": False,
+                "usage": data.get("usage"),
+                "modelUsage": data.get("modelUsage"),
+                "total_cost_usd": data.get("total_cost_usd"),
+            }
+
+        return {
+            "result": result_text,
+            "session_id": data.get("session_id", session_id),
+            "is_error": data.get("is_error", False),
+            "usage": data.get("usage"),
+            "modelUsage": data.get("modelUsage"),
+            "total_cost_usd": data.get("total_cost_usd"),
+        }
+
+    def _build_streaming_result(self, state, session_id):
+        if not state.final_result:
+            return None
+
+        fr = state.final_result
+        result_text = fr.get("result") or state.accumulated_text
+        sid = fr.get("session_id", session_id)
+
+        if not fr.get("is_error", False) and not result_text:
+            log.info(
+                "Claude returned empty streaming result (silent OK): sid=%s accumulated=%d",
+                (sid or "-")[:8],
+                len(state.accumulated_text),
+            )
+            return {
+                "result": SILENT_OK_MESSAGE,
+                "session_id": sid,
+                "is_error": False,
+                "usage": fr.get("usage"),
+                "last_call_usage": state.last_call_usage,
+                "modelUsage": fr.get("modelUsage"),
+                "total_cost_usd": fr.get("total_cost_usd"),
+                "peak_context_tokens": state.peak_context_tokens,
+                "compact_detected": state.compact_detected,
+            }
+
+        if state.accumulated_text and not fr.get("result"):
+            log.info(
+                "Claude streaming fallback used accumulated text: sid=%s chars=%d",
+                (sid or "-")[:8],
+                len(state.accumulated_text),
+            )
+
+        return {
+            "result": result_text,
+            "session_id": sid,
+            "is_error": fr.get("is_error", False),
+            "usage": fr.get("usage"),
+            "last_call_usage": state.last_call_usage,
+            "modelUsage": fr.get("modelUsage"),
+            "total_cost_usd": fr.get("total_cost_usd"),
+            "peak_context_tokens": state.peak_context_tokens,
+            "compact_detected": state.compact_detected,
+        }
+
+    def get_model_aliases(self):
+        return {
+            "opus": "claude-opus-4-6",
+            "sonnet": "claude-sonnet-4-6",
+            "haiku": "claude-haiku-4-5",
+        }
+
+    def get_default_context_window(self):
+        return 200_000
+
+    def get_session_not_found_signatures(self):
+        return self.SESSION_NOT_FOUND_SIGNATURES
+
+    def get_display_name(self):
+        return "Claude"
+
+
+# ---------------------------------------------------------------------------
+# CodexRunner
+# ---------------------------------------------------------------------------
+
+class CodexRunner(BaseRunner):
+    """OpenAI Codex CLI runner."""
+
+    DEFAULT_MODEL = "gpt-5.2-codex"
+    ALWAYS_STREAMING = True  # session_id comes from first event (thread.started)
+
+    def __init__(self, command: str, model: str, workspace: str, timeout: int,
+                 max_budget_usd: Optional[float] = None,
+                 extra_system_prompts: Optional[list[str]] = None):
+        if max_budget_usd is not None:
+            log.warning("Codex does not support budget tracking, max_budget_usd ignored")
+        super().__init__(
+            command=command, model=model, workspace=workspace,
+            timeout=timeout, max_budget_usd=None,
+            extra_system_prompts=extra_system_prompts,
+        )
+        # Thread-local storage for per-invocation temp file path.
+        # run() writes the path; build_args() reads it (same thread).
+        self._tls = threading.local()
+
+    def build_args(self, prompt, session_id, resume, streaming):
+        args = [
+            self.command, "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--json",
+            "-C", self.workspace,
+            "-m", self.model,
+        ]
+
+        # Inject system prompt via -c model_instructions_file (set by run())
+        instructions_path = getattr(self._tls, "instructions_path", None)
+        if instructions_path:
+            args.extend(["-c", f"model_instructions_file={instructions_path}"])
+
+        if resume and session_id:
+            args.extend(["resume", session_id, "--", prompt])
+        else:
+            # Codex assigns its own thread_id; ignore caller-provided session_id
+            args.extend(["--", prompt])
+
+        return args
+
+    def run(self, prompt: str, session_id: Optional[str] = None,
+            resume: bool = False, tag: Optional[str] = None,
+            on_output=None, env_extra: Optional[dict] = None) -> dict:
+        """Override run() to manage per-invocation system prompt temp file."""
+        self._tls.instructions_path = None
+        try:
+            system_prompt = self._build_system_prompt()
+            if system_prompt:
+                fd, path = tempfile.mkstemp(
+                    prefix="codex-instructions-", suffix=".md", text=True,
+                )
+                # Set early so finally can always clean up, even if fdopen/write fails
+                self._tls.instructions_path = path
+                with os.fdopen(fd, "w") as f:
+                    f.write(system_prompt)
+
+            return super().run(
+                prompt, session_id=session_id, resume=resume,
+                tag=tag, on_output=on_output, env_extra=env_extra,
+            )
+        finally:
+            path = getattr(self._tls, "instructions_path", None)
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                self._tls.instructions_path = None
+
+    def parse_streaming_line(self, event, state):
+        etype = event.get("type", "")
+
+        if etype == "thread.started":
+            # Session ID comes from the first event; ignore if missing/null
+            # to avoid persisting a caller-generated placeholder as a real
+            # Codex thread id (which would break later resume attempts).
+            tid = event.get("thread_id")
+            if tid:
+                state.session_id = tid
+
+        elif etype == "item.completed":
+            item = event.get("item") or {}
+            item_type = item.get("type", "")
+            if item_type == "agent_message":
+                text = item.get("text", "")
+                if text:
+                    state.accumulated_text += text
+                    state.pending_output.append(state.accumulated_text)
+            elif item_type == "error":
+                err_msg = item.get("text", "") or item.get("message", "")
+                log.error("Codex item error: %s", err_msg)
+                # Propagate error — may be the only error signal before stream ends
+                state.accumulated_text += (
+                    f"\n\n⚠️ Codex error: {err_msg}" if state.accumulated_text
+                    else f"Codex error: {err_msg}"
+                )
+                state.is_error = True
+            # command_execution items are intermediate tool-use events — ignore
+
+        elif etype == "turn.completed":
+            usage = event.get("usage", {})
+            if usage:
+                # Normalize Codex usage keys to match Claude convention
+                state.last_call_usage = {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "cache_read_input_tokens": usage.get("cached_input_tokens", 0),
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": usage.get("output_tokens", 0),
+                }
+                ctx_tokens = (
+                    state.last_call_usage["input_tokens"]
+                    + state.last_call_usage["cache_read_input_tokens"]
+                )
+                if ctx_tokens > state.peak_context_tokens:
+                    state.peak_context_tokens = ctx_tokens
+            state.done = True
+
+        elif etype == "turn.failed":
+            err = event.get("error", {})
+            err_msg = err.get("message", "") if isinstance(err, dict) else str(err)
+            log.error("Codex turn failed: %s", err_msg)
+            state.accumulated_text += f"\n\n⚠️ Codex error: {err_msg}" if state.accumulated_text else f"Codex error: {err_msg}"
+            state.is_error = True
+            state.done = True
+
+        elif etype == "error":
+            err_msg = event.get("message") or "Unknown error"
+            log.error("Codex top-level error: %s", err_msg)
+            state.accumulated_text += f"\n\n⚠️ Codex error: {err_msg}" if state.accumulated_text else f"Codex error: {err_msg}"
+            state.is_error = True
+            state.done = True
+
+        # turn.started — ignored (no useful data)
+
+    def _build_streaming_result(self, state, session_id):
+        if not state.done:
+            return None
+
+        sid = state.session_id or session_id
+        result_text = state.accumulated_text
+
+        if not result_text:
+            return None  # Fall through to BaseRunner empty-text handler
+
+        return {
+            "result": result_text,
+            "session_id": sid,
+            "is_error": state.is_error,
+            "usage": state.last_call_usage or {},
+            "last_call_usage": state.last_call_usage or {},
+            "peak_context_tokens": state.peak_context_tokens,
+            "compact_detected": False,
+        }
+
+    def parse_blocking_output(self, stdout, session_id):
+        # CodexRunner always streams (ALWAYS_STREAMING=True).
+        # This method should never be called.
+        raise NotImplementedError("CodexRunner always uses streaming mode")
+
+    def get_model_aliases(self):
+        return {
+            "codex": "gpt-5.2-codex",
+            "codex-mini": "gpt-5.1-codex-mini",
+        }
+
+    def get_default_context_window(self):
+        return 200_000
+
+    def get_display_name(self):
+        return "Codex"
+
+    def supports_compact(self):
+        return False

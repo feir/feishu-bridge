@@ -45,33 +45,43 @@ class BridgeCommandHandler:
                 handle.deliver("当前没有正在执行的任务。")
 
         elif cmd == "help":
-            handle.deliver(
-                "**Bridge 命令**\n"
-                "`/new` `/clear` `/reset` — 重置会话（清除上下文）\n"
-                "`/stop` `/cancel` — 取消当前任务（排队消息继续处理）\n"
-                "`/stop all` — 取消当前任务并清空所有排队消息\n"
-                "`/compact [指示]` — 压缩当前会话上下文\n"
-                "`/model [模型名]` — 查看或切换模型\n"
-                "`/cost` — 查看当前会话 token 用量\n"
-                "`/context` — 查看当前 context 使用率\n"
-                "`/feishu-tasks [命令]` — 飞书任务管理（list/get/subtasks/add-subtask）\n"
-                "`/feishu-doc` — 云文档读写（Markdown）\n"
-                "`/feishu-sheet` — 电子表格读写\n"
-                "`/feishu-bitable` — 多维表格操作\n"
-                "`/restart` — 重启当前 Bot 实例\n"
-                "`/restart-all` — 重启所有 Bot 实例\n"
-                "`/help` — 显示本帮助\n\n"
-                "飞书命令首次使用需授权（自动弹出授权卡片）\n\n"
-                "**群聊模式**\n"
-                "`owner-only` — 仅 owner @机器人并附上消息时响应\n"
-                "`mention-all` — 任何人 @机器人并附上消息时响应\n"
-                "`auto-reply` — 群内所有消息自动响应（无需 @）\n"
-                "`disabled` — 不响应该群消息\n\n"
-                "**Skill 命令**（透传给 Claude）\n"
-                "`/plan` `/done` `/save` `/social-feed` 等已注册 skill 正常使用"
-            )
+            lines = [
+                "**Bridge 命令**",
+                "`/new` `/clear` `/reset` — 重置会话（清除上下文）",
+                "`/stop` `/cancel` — 取消当前任务（排队消息继续处理）",
+                "`/stop all` — 取消当前任务并清空所有排队消息",
+            ]
+            if self.bot.runner.supports_compact():
+                lines.append("`/compact [指示]` — 压缩当前会话上下文")
+            lines.extend([
+                "`/model [模型名]` — 查看或切换模型",
+                "`/cost` — 查看当前会话 token 用量",
+                "`/context` — 查看当前 context 使用率",
+                "`/feishu-tasks [命令]` — 飞书任务管理（list/get/subtasks/add-subtask）",
+                "`/feishu-doc` — 云文档读写（Markdown）",
+                "`/feishu-sheet` — 电子表格读写",
+                "`/feishu-bitable` — 多维表格操作",
+                "`/restart` — 重启当前 Bot 实例",
+                "`/restart-all` — 重启所有 Bot 实例",
+                "`/help` — 显示本帮助",
+                "",
+                "飞书命令首次使用需授权（自动弹出授权卡片）",
+                "",
+                "**群聊模式**",
+                "`owner-only` — 仅 owner @机器人并附上消息时响应",
+                "`mention-all` — 任何人 @机器人并附上消息时响应",
+                "`auto-reply` — 群内所有消息自动响应（无需 @）",
+                "`disabled` — 不响应该群消息",
+                "",
+                f"**Skill 命令**（透传给 {self.bot.runner.get_display_name()}）",
+                "`/plan` `/done` `/save` `/social-feed` 等已注册 skill 正常使用",
+            ])
+            handle.deliver("\n".join(lines))
 
         elif cmd == "compact":
+            if not self.bot.runner.supports_compact():
+                handle.deliver("此 Agent 不支持 /compact 命令。")
+                return
             key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
             tag = SessionMap._key_str(key)
             prompt = f"/compact {arg}" if arg else "/compact"
@@ -98,19 +108,22 @@ class BridgeCommandHandler:
                 handle.deliver("上下文已压缩。")
 
         elif cmd == "model":
+            aliases = self.bot.runner.get_model_aliases()
             if not arg:
-                handle.deliver(f"当前模型: `{self.bot.runner.model}`")
-            elif arg in ("opus", "claude-opus-4-6"):
-                self.bot.runner.model = "claude-opus-4-6"
-                handle.deliver("模型已切换为 `claude-opus-4-6`")
-            elif arg in ("sonnet", "claude-sonnet-4-6"):
-                self.bot.runner.model = "claude-sonnet-4-6"
-                handle.deliver("模型已切换为 `claude-sonnet-4-6`")
-            elif arg in ("haiku", "claude-haiku-4-5"):
-                self.bot.runner.model = "claude-haiku-4-5"
-                handle.deliver("模型已切换为 `claude-haiku-4-5`")
+                alias_list = " / ".join(f"`{a}`" for a in aliases)
+                handle.deliver(
+                    f"当前模型: `{self.bot.runner.model}`\n可选: {alias_list}"
+                )
+            elif arg in aliases:
+                self.bot.runner.model = aliases[arg]
+                handle.deliver(f"模型已切换为 `{aliases[arg]}`")
+            elif arg in aliases.values():
+                self.bot.runner.model = arg
+                handle.deliver(f"模型已切换为 `{arg}`")
             else:
-                handle.deliver(f"未知模型: `{arg}`\n\n可选: `opus` / `sonnet` / `haiku`")
+                # Passthrough unknown model name (allows new models)
+                self.bot.runner.model = arg
+                handle.deliver(f"模型已设置为 `{arg}`（未识别的名称，将直接传递给 CLI）")
 
         elif cmd == "cost":
             key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
@@ -133,9 +146,12 @@ class BridgeCommandHandler:
                     f"输入: {inp:,} tokens",
                     f"  cache read: {cache_read:,} / cache create: {cache_create:,}",
                     f"输出: {out:,} tokens",
-                    f"本次费用: ${turn_cost:.4f}",
-                    f"累计费用: **${accumulated:.4f}**",
                 ]
+                if turn_cost is not None:
+                    lines.append(f"本次费用: ${turn_cost:.4f}")
+                    lines.append(f"累计费用: **${accumulated:.4f}**")
+                else:
+                    lines.append("费用: —（此 Agent 不提供费用数据）")
                 if model_usage:
                     lines.append("")
                     for model, mu in model_usage.items():
@@ -164,8 +180,8 @@ class BridgeCommandHandler:
             cache_read = usage.get("cache_read_input_tokens", 0)
             cache_create = usage.get("cache_creation_input_tokens", 0)
             total_ctx = inp + cache_read + cache_create
-            # Use actual context window from modelUsage, fallback 200K
-            max_ctx = 200_000
+            # Use actual context window from modelUsage, fallback to runner default
+            max_ctx = self.bot.runner.get_default_context_window()
             model_name = ""
             for m, mu in model_usage.items():
                 cw = mu.get("contextWindow", 0)
@@ -186,12 +202,15 @@ class BridgeCommandHandler:
             if cache_read:
                 cache_pct = cache_read / total_ctx * 100 if total_ctx else 0
                 lines.append(f"cache hit: {cache_read:,} ({cache_pct:.0f}%)")
-            accumulated = cost_info.get("accumulated_cost_usd", cost_info.get("total_cost_usd", 0))
-            lines.append(f"累计费用: ${accumulated:.4f}")
+            accumulated = cost_info.get("accumulated_cost_usd", cost_info.get("total_cost_usd") or 0)
+            if accumulated is not None and accumulated > 0:
+                lines.append(f"累计费用: ${accumulated:.4f}")
+            compact_hint = " 或 `/compact` 压缩" if self.bot.runner.supports_compact() else ""
             if pct >= 85:
-                lines.append("\U0001f534 建议 `/new` 新会话或 `/compact` 压缩")
+                lines.append(f"\U0001f534 建议 `/new` 新会话{compact_hint}")
             elif pct >= 70:
-                lines.append("\U0001f7e1 接近上限，可考虑 `/compact`")
+                compact_short = "，可考虑 `/compact`" if self.bot.runner.supports_compact() else ""
+                lines.append(f"\U0001f7e1 接近上限{compact_short}")
             handle.deliver("\n".join(lines))
 
         elif cmd == "feishu-tasks":
@@ -548,7 +567,7 @@ class BridgeCommandHandler:
             return "```\n" + "\n".join(lines) + "\n```"
 
         if action == "write":
-            return "表格写入需要结构化数据，请通过 Claude 对话描述你要写入的内容，我会调用 Sheets API 执行。"
+            return "表格写入需要结构化数据，请通过对话描述你要写入的内容，我会调用 Sheets API 执行。"
 
         return self.feishu_service_help("sheet")
 

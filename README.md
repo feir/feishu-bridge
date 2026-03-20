@@ -51,10 +51,10 @@
 | `/new` `/reset` `/clear` | 重置会话（清除上下文） |
 | `/stop` `/cancel` | 取消当前任务 |
 | `/stop all` | 取消当前任务并清空待处理队列 |
-| `/compact [指令]` | 压缩上下文 |
+| `/compact [指令]` | 压缩上下文（仅 Claude） |
 | `/model` | 查看当前模型 |
-| `/model opus\|sonnet\|haiku` | 切换 Claude 模型 |
-| `/cost` | 查看 token 用量和费用 |
+| `/model <alias>` | 切换模型（别名因 Agent 类型而异） |
+| `/cost` | 查看 token 用量和费用（仅 Claude） |
 | `/context` | 查看上下文使用率（含可视化进度条） |
 | `/restart` | 重启 Bridge 进程（launchd/systemd 自动拉起） |
 | `/restart-all` | 重启所有 bot 实例 |
@@ -92,6 +92,7 @@ $ feishu-bridge --bot my-bot
 
   App ID: cli_xxxx
   App Secret: xxxx
+  Agent 类型 [claude/codex] (claude):
   工作目录 [~/.local/share/feishu-bridge/workspaces/my-bot]:
 
   凭证已写入 ~/.config/feishu-bridge/.env
@@ -102,6 +103,7 @@ $ feishu-bridge --bot my-bot
 
 也可以手动创建 `~/.config/feishu-bridge/config.json`：
 
+**Claude（默认）**：
 ```json
 {
   "bots": [
@@ -113,18 +115,51 @@ $ feishu-bridge --bot my-bot
       "allowed_users": ["*"]
     }
   ],
-  "claude": {
+  "agent": {
+    "type": "claude",
     "command": "claude",
     "timeout_seconds": 300
   }
 }
 ```
 
+**Codex**：
+```json
+{
+  "bots": [
+    {
+      "name": "my-codex-bot",
+      "app_id": "${FEISHU_APP_ID}",
+      "app_secret": "${FEISHU_APP_SECRET}",
+      "workspace": "/path/to/workspace",
+      "allowed_users": ["*"]
+    }
+  ],
+  "agent": {
+    "type": "codex",
+    "command": "codex",
+    "timeout_seconds": 600
+  }
+}
+```
+
+> **旧格式兼容**：如果配置中使用 `"claude": {...}`（无 `type` 字段），会自动迁移为 `"agent": {"type": "claude", ...}`。
+
 - `${VAR}` 语法会在加载时替换为环境变量（凭证存放在 `~/.config/feishu-bridge/.env`）
 - `allowed_users`：允许使用的用户 ID 列表，`["*"]` 表示所有人
 - `allowed_chats`（可选）：允许的群聊 ID 列表
-- `model`（可选）：默认 Claude 模型，默认 `claude-opus-4-6`
+- `model`（可选）：覆盖默认模型（Claude 默认 `claude-opus-4-6`，Codex 默认 `gpt-5.2-codex`）
 - `group_policy`（可选）：群聊响应策略，详见下方说明
+
+#### Agent 类型对比
+
+| 特性 | Claude | Codex |
+|------|--------|-------|
+| 流式输出 | 增量实时更新 | 等待完成后一次性显示 |
+| `/compact` | 支持 | 不支持 |
+| `/cost` 费用追踪 | 支持 | 不支持 |
+| 会话持久化 | session_id | thread_id |
+| 默认模型 | `claude-opus-4-6` | `gpt-5.2-codex` |
 
 ### 群聊响应策略
 

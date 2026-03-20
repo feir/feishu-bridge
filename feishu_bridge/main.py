@@ -42,8 +42,10 @@ from feishu_bridge.parsers import (
 )
 from feishu_bridge.commands import BridgeCommandHandler
 from feishu_bridge.runtime import (
+    BaseRunner,
     ChatTaskQueue,
     ClaudeRunner,
+    CodexRunner,
     DEDUP_MAX,
     DEDUP_TTL,
     DEFAULT_TIMEOUT,
@@ -79,13 +81,6 @@ _FEISHU_SERVICES_OK = True  # All deps are declared in pyproject.toml
 # ============================================================
 # Constants
 # ============================================================
-
-SESSION_NOT_FOUND_SIGNATURES = [
-    "session not found",
-    "no such session",
-    "could not find session",
-    "session does not exist",
-]
 
 WORKER_COUNT = 4
 
@@ -132,7 +127,10 @@ def _reject_not_owner(client, chat_id, thread_id, message_id):
 # Config
 # ============================================================
 
-
+_RUNNER_CLASSES: dict[str, type[BaseRunner]] = {
+    "claude": ClaudeRunner,
+    "codex": CodexRunner,
+}
 
 
 
@@ -194,18 +192,34 @@ def load_config(config_path: str, bot_name: str) -> dict:
         log.error("allowed_users entries must be non-empty strings")
         sys.exit(1)
 
-    # Validate claude command
-    claude_cfg = config.get("claude", {})
-    claude_cmd = claude_cfg.get("command", "claude")
-    resolved_cmd = shutil.which(claude_cmd)
+    # Migrate legacy "claude" key → "agent" (backward compat)
+    if "claude" in config and "agent" not in config:
+        claude_legacy = config.pop("claude")
+        config["agent"] = {"type": "claude", **claude_legacy}
+        log.info("Migrated config: 'claude' key → 'agent' with type=claude")
+
+    agent_cfg = config.get("agent", {"type": "claude", "command": "claude"})
+    agent_type = agent_cfg.get("type")
+    if not agent_type:
+        log.error("agent.type is required (claude or codex)")
+        sys.exit(1)
+    if agent_type not in _RUNNER_CLASSES:
+        log.error("Unknown agent type '%s'. Supported: %s",
+                  agent_type, list(_RUNNER_CLASSES.keys()))
+        sys.exit(1)
+
+    # Resolve agent CLI command
+    default_cmd = "claude" if agent_type == "claude" else agent_type
+    agent_cmd = agent_cfg.get("command", default_cmd)
+    resolved_cmd = shutil.which(agent_cmd)
     if not resolved_cmd:
         log.error(
-            "Claude command '%s' not found in PATH. "
-            "Set absolute path in config or update PATH.", claude_cmd
+            "Agent command '%s' not found in PATH. "
+            "Set absolute path in config or update PATH.", agent_cmd
         )
         sys.exit(1)
-    claude_cfg["_resolved_command"] = resolved_cmd
-    log.info("Claude CLI: %s", resolved_cmd)
+    agent_cfg["_resolved_command"] = resolved_cmd
+    log.info("Agent CLI (%s): %s", agent_type, resolved_cmd)
 
     # ------------------------------------------------------------------
     # group_policy validation
@@ -263,9 +277,25 @@ def load_config(config_path: str, bot_name: str) -> dict:
     log.info("Bot config: %s", json.dumps(masked, ensure_ascii=False))
 
     all_bot_names = [b["name"] for b in config.get("bots", []) if b.get("name")]
-    return {"bot": bot, "claude": claude_cfg, "dedup": config.get("dedup", {}),
+    return {"bot": bot, "agent": agent_cfg, "dedup": config.get("dedup", {}),
             "todo_auto_drive": config.get("todo_auto_drive", True),
             "all_bot_names": all_bot_names}
+
+def create_runner(agent_cfg: dict, bot_cfg: dict,
+                  extra_prompts: list[str]) -> BaseRunner:
+    """Factory: create the appropriate Runner based on agent.type."""
+    agent_type = agent_cfg["type"]
+    runner_cls = _RUNNER_CLASSES[agent_type]  # validated in load_config()
+    default_model = runner_cls.DEFAULT_MODEL
+    return runner_cls(
+        command=agent_cfg["_resolved_command"],
+        model=bot_cfg.get("model", default_model),
+        workspace=bot_cfg["workspace"],
+        timeout=agent_cfg.get("timeout_seconds", DEFAULT_TIMEOUT),
+        max_budget_usd=agent_cfg.get("max_budget_usd"),
+        extra_system_prompts=extra_prompts,
+    )
+
 
 # ============================================================
 # Message Processing (Worker)
@@ -276,7 +306,7 @@ def _format_task_detail_bridge(task: dict) -> str:
 
 
 def process_message(item: dict, bot_config: dict, lark_client,
-                    session_map: SessionMap, runner: ClaudeRunner,
+                    session_map: SessionMap, runner: BaseRunner,
                     feishu_tasks=None, feishu_docs=None, feishu_sheets=None):
     """Compatibility wrapper for the worker pipeline implementation."""
     return _bridge_worker_process_message(
@@ -295,7 +325,6 @@ def process_message(item: dict, bot_config: dict, lark_client,
         fetch_forward_messages_fn=fetch_forward_messages,
         fetch_quoted_message_fn=fetch_quoted_message,
         remove_typing_indicator_fn=remove_typing_indicator,
-        session_not_found_signatures=SESSION_NOT_FOUND_SIGNATURES,
     )
 
 
@@ -308,7 +337,7 @@ class FeishuBot:
 
     def __init__(self, config: dict):
         self.bot_config = config["bot"]
-        self.claude_config = config["claude"]
+        self.agent_config = config["agent"]
         self.dedup_config = config.get("dedup", {})
 
         self.bot_id = self.bot_config["name"]
@@ -339,7 +368,8 @@ class FeishuBot:
             max_entries=self.dedup_config.get("max_entries", DEDUP_MAX),
         )
         self.session_map = SessionMap(
-            Path(self.workspace) / "state" / "feishu-bridge" / f"sessions-{self.bot_id}.json"
+            Path(self.workspace) / "state" / "feishu-bridge" / f"sessions-{self.bot_id}.json",
+            agent_type=self.agent_config.get("type"),
         )
         # Load CLI prompt for Feishu operations (materialized via importlib.resources)
         _extra_prompts = []
@@ -352,14 +382,7 @@ class FeishuBot:
                 _cli_text = _cli_text.replace("feishu-cli", _cli_abs)
             _extra_prompts.append(_cli_text)
 
-        self.runner = ClaudeRunner(
-            command=self.claude_config["_resolved_command"],
-            model=self.bot_config.get("model", "claude-opus-4-6"),
-            workspace=self.workspace,
-            timeout=self.claude_config.get("timeout_seconds", DEFAULT_TIMEOUT),
-            max_budget_usd=self.claude_config.get("max_budget_usd"),
-            extra_system_prompts=_extra_prompts,
-        )
+        self.runner = create_runner(self.agent_config, self.bot_config, _extra_prompts)
         self.command_handler = BridgeCommandHandler(self)
 
         # Work queue: ChatTaskQueue manages per-session FIFO,
@@ -1018,12 +1041,11 @@ def validate_feishu_token(client) -> bool:
 
 
 
-def fetch_bot_info(client) -> tuple[str, str | None]:
+def fetch_bot_info(client, fallback_name: str = "Claude Code") -> tuple[str, str | None]:
     """Fetch bot display name and open_id from Feishu API.
 
-    Returns (app_name, open_id). Falls back to ('Claude Code', None) on failure.
+    Returns (app_name, open_id). Falls back to (fallback_name, None) on failure.
     """
-    fallback_name = 'Claude Code'
     try:
         req = lark.BaseRequest()
         req.http_method = lark.HttpMethod.GET
@@ -1128,7 +1150,10 @@ def main():
 
     # Fetch bot info (name + open_id) before parallel startup tasks
     try:
-        name, open_id = fetch_bot_info(bot.lark_client)
+        name, open_id = fetch_bot_info(
+            bot.lark_client,
+            fallback_name=bot.runner.get_display_name(),
+        )
         set_bot_display_name(name)
         bot.bot_open_id = open_id
         if not open_id:

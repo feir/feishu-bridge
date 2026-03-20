@@ -2,6 +2,7 @@
 """Unit tests for Feishu Bridge task/error handling."""
 
 import json
+import os
 
 import pytest
 
@@ -253,7 +254,7 @@ def test_streaming_runner_returns_explicit_error_when_no_text_or_result():
         on_output=lambda _text: None,
     )
 
-    assert result["result"] == bridge_runtime.EMPTY_RESULT_MESSAGE
+    assert "未返回任何内容" in result["result"]
     assert result["session_id"] == "sid-456"
     assert result["is_error"] is True
 
@@ -1584,3 +1585,687 @@ def test_autofetch_never_contains_auth_card_text():
 
     assert "已发送授权卡片" not in captured["text"]
     assert "未授权" in captured["text"]
+
+
+# ---------------------------------------------------------------------------
+# BaseRunner ABC, RunResult, StreamState
+# ---------------------------------------------------------------------------
+
+def test_run_result_to_dict_filters_none_and_renames():
+    """RunResult.to_dict() filters None values and renames model_usage → modelUsage."""
+    r = bridge_runtime.RunResult(
+        result="hello",
+        session_id="sid-1",
+        is_error=False,
+        model_usage={"claude-opus-4-6": {"contextWindow": 200_000}},
+        total_cost_usd=0.05,
+    )
+    d = r.to_dict()
+    # model_usage renamed to modelUsage
+    assert "modelUsage" in d
+    assert "model_usage" not in d
+    assert d["modelUsage"] == {"claude-opus-4-6": {"contextWindow": 200_000}}
+    # None fields filtered out
+    assert "usage" not in d
+    assert "last_call_usage" not in d
+    # Non-None fields preserved
+    assert d["result"] == "hello"
+    assert d["session_id"] == "sid-1"
+    assert d["total_cost_usd"] == 0.05
+    # Default non-None values kept
+    assert d["default_context_window"] == 200_000
+    assert d["is_error"] is False
+
+
+def test_run_result_to_dict_omits_none_session_id():
+    """RunResult.to_dict() omits session_id when it is None."""
+    r = bridge_runtime.RunResult(result="ok")
+    d = r.to_dict()
+    assert "session_id" not in d
+
+
+def test_base_runner_abc_cannot_instantiate():
+    """BaseRunner cannot be instantiated directly (abstract methods)."""
+    import pytest
+    with pytest.raises(TypeError):
+        bridge_runtime.BaseRunner(
+            command="test", model="m", workspace="/tmp", timeout=30,
+        )
+
+
+def test_base_runner_subclass_missing_default_model():
+    """Concrete BaseRunner subclass without DEFAULT_MODEL raises TypeError."""
+    import pytest
+    with pytest.raises(TypeError, match="must define DEFAULT_MODEL"):
+        class BadRunner(bridge_runtime.BaseRunner):
+            def build_args(self, *a, **k): pass
+            def parse_streaming_line(self, *a, **k): pass
+            def parse_blocking_output(self, *a, **k): pass
+            def get_model_aliases(self): return {}
+            def get_default_context_window(self): return 100_000
+
+
+def test_claude_runner_session_not_found_signatures():
+    """ClaudeRunner.get_session_not_found_signatures() returns expected list."""
+    runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-opus-4-6",
+        workspace="/tmp", timeout=30,
+    )
+    sigs = runner.get_session_not_found_signatures()
+    # Must include both original main.py entries and new entries
+    assert "session not found" in sigs
+    assert "no such session" in sigs
+    assert "session does not exist" in sigs
+    assert "ENOENT" in sigs
+
+
+def test_claude_runner_get_display_name():
+    """ClaudeRunner.get_display_name() returns 'Claude'."""
+    runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-opus-4-6",
+        workspace="/tmp", timeout=30,
+    )
+    assert runner.get_display_name() == "Claude"
+
+
+def test_claude_runner_get_model_aliases():
+    """ClaudeRunner provides opus/sonnet/haiku aliases."""
+    runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-opus-4-6",
+        workspace="/tmp", timeout=30,
+    )
+    aliases = runner.get_model_aliases()
+    assert aliases["opus"] == "claude-opus-4-6"
+    assert aliases["sonnet"] == "claude-sonnet-4-6"
+    assert aliases["haiku"] == "claude-haiku-4-5"
+
+
+def test_stream_state_pending_output_default_empty():
+    """StreamState.pending_output defaults to empty list (not shared)."""
+    s1 = bridge_runtime.StreamState()
+    s2 = bridge_runtime.StreamState()
+    s1.pending_output.append("test")
+    assert s2.pending_output == []  # not shared
+
+
+# ---------------------------------------------------------------------------
+# CodexRunner
+# ---------------------------------------------------------------------------
+
+def _make_codex_runner(**kwargs):
+    defaults = dict(command="codex", model="gpt-5.2-codex",
+                    workspace="/tmp", timeout=30)
+    defaults.update(kwargs)
+    return bridge_runtime.CodexRunner(**defaults)
+
+
+def test_codex_runner_build_args_new_session():
+    """CodexRunner build_args for new session ignores caller session_id."""
+    runner = _make_codex_runner()
+    args = runner.build_args("hello", session_id="sid-ignored", resume=False, streaming=True)
+    assert args[0] == "codex"
+    assert args[1] == "exec"
+    assert "--dangerously-bypass-approvals-and-sandbox" in args
+    assert "--json" in args
+    assert args[-1] == "hello"
+    # session_id must NOT appear in args for new sessions
+    assert "sid-ignored" not in args
+
+
+def test_codex_runner_build_args_resume():
+    """CodexRunner build_args for resume includes thread_id."""
+    runner = _make_codex_runner()
+    args = runner.build_args("follow up", session_id="thread-abc", resume=True, streaming=True)
+    # resume sub-command with thread_id before prompt
+    resume_idx = args.index("resume")
+    assert args[resume_idx + 1] == "thread-abc"
+    assert args[-1] == "follow up"
+
+
+def test_codex_runner_build_args_includes_instructions_from_tls():
+    """build_args includes -c model_instructions_file when TLS path is set."""
+    runner = _make_codex_runner()
+    runner._tls.instructions_path = "/tmp/test-instructions.md"
+    args = runner.build_args("hello", session_id=None, resume=False, streaming=True)
+    assert "-c" in args
+    ci = args.index("-c")
+    assert args[ci + 1] == "model_instructions_file=/tmp/test-instructions.md"
+    runner._tls.instructions_path = None  # cleanup
+
+
+def test_codex_runner_parse_thread_started():
+    """thread.started event sets session_id on state."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line(
+        {"type": "thread.started", "thread_id": "thread-xyz"},
+        state,
+    )
+    assert state.session_id == "thread-xyz"
+    assert not state.done
+
+
+def test_codex_runner_parse_agent_message():
+    """item.completed with agent_message appends text."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line(
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "Hello world"}},
+        state,
+    )
+    assert state.accumulated_text == "Hello world"
+    assert state.pending_output == ["Hello world"]
+    assert not state.done
+
+
+def test_codex_runner_parse_command_execution_ignored():
+    """item.completed with command_execution is silently ignored."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line(
+        {"type": "item.completed", "item": {
+            "type": "command_execution", "command": "ls",
+            "aggregated_output": "file1\nfile2", "exit_code": 0,
+        }},
+        state,
+    )
+    assert state.accumulated_text == ""
+    assert state.pending_output == []
+    assert not state.done
+
+
+def test_codex_runner_parse_turn_completed():
+    """turn.completed extracts usage and marks done."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line(
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 200,
+        }},
+        state,
+    )
+    assert state.done
+    # Verify usage normalization: cached_input_tokens → cache_read_input_tokens
+    assert state.last_call_usage["cache_read_input_tokens"] == 500
+    assert state.last_call_usage["input_tokens"] == 1000
+    assert state.last_call_usage["cache_creation_input_tokens"] == 0
+    assert state.peak_context_tokens == 1500  # 1000 + 500
+
+
+def test_codex_runner_parse_turn_failed():
+    """turn.failed sets error text, is_error, and marks done."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line(
+        {"type": "turn.failed", "error": {"message": "rate limit exceeded"}},
+        state,
+    )
+    assert state.done
+    assert state.is_error
+    assert "rate limit exceeded" in state.accumulated_text
+
+
+def test_codex_runner_parse_top_level_error():
+    """Top-level error event sets error text, is_error, and marks done."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line(
+        {"type": "error", "message": "invalid API key"},
+        state,
+    )
+    assert state.done
+    assert state.is_error
+    assert "invalid API key" in state.accumulated_text
+
+
+def test_codex_runner_full_streaming_flow():
+    """End-to-end streaming: thread.started → agent_message → turn.completed."""
+    runner = _make_codex_runner()
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = iter([
+                '{"type":"thread.started","thread_id":"t-001"}\n',
+                '{"type":"turn.started"}\n',
+                '{"type":"item.completed","item":{"type":"command_execution","command":"ls","aggregated_output":"a.py","exit_code":0}}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Here is the file listing."}}\n',
+                '{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":100,"output_tokens":50}}\n',
+            ])
+            self.stderr = iter([])
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    streamed = []
+    result = runner._run_streaming(
+        FakeProc(),
+        session_id="ignored-sid",
+        tag=None,
+        on_output=streamed.append,
+    )
+
+    assert result["session_id"] == "t-001"
+    assert result["result"] == "Here is the file listing."
+    assert result["is_error"] is False
+    assert streamed == ["Here is the file listing."]
+    # Usage normalized
+    assert result["last_call_usage"]["cache_read_input_tokens"] == 100
+    assert result["peak_context_tokens"] == 600  # 500 + 100
+
+
+def test_codex_runner_streaming_no_on_output():
+    """CodexRunner works when on_output is None (ALWAYS_STREAMING path)."""
+    runner = _make_codex_runner()
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = iter([
+                '{"type":"thread.started","thread_id":"t-002"}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Done."}}\n',
+                '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10}}\n',
+            ])
+            self.stderr = iter([])
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    result = runner._run_streaming(
+        FakeProc(),
+        session_id="sid-fallback",
+        tag=None,
+        on_output=None,  # ALWAYS_STREAMING but no callback
+    )
+
+    assert result["session_id"] == "t-002"
+    assert result["result"] == "Done."
+    assert result["is_error"] is False
+
+
+def test_codex_runner_streaming_error_flow():
+    """turn.failed produces error result."""
+    runner = _make_codex_runner()
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = iter([
+                '{"type":"thread.started","thread_id":"t-err"}\n',
+                '{"type":"turn.failed","error":{"message":"quota exceeded"}}\n',
+            ])
+            self.stderr = iter([])
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    result = runner._run_streaming(
+        FakeProc(), session_id=None, tag=None, on_output=lambda _: None,
+    )
+
+    assert result["session_id"] == "t-err"
+    assert "quota exceeded" in result["result"]
+    assert result["is_error"] is True
+
+
+def test_codex_runner_ignores_max_budget():
+    """CodexRunner logs warning and ignores max_budget_usd."""
+    runner = bridge_runtime.CodexRunner(
+        command="codex", model="gpt-5.2-codex",
+        workspace="/tmp", timeout=30,
+        max_budget_usd=5.0,
+    )
+    assert runner.max_budget_usd is None
+
+
+def test_codex_runner_display_name_and_compact():
+    """CodexRunner display name and compact support."""
+    runner = _make_codex_runner()
+    assert runner.get_display_name() == "Codex"
+    assert runner.supports_compact() is False
+    assert runner.get_session_not_found_signatures() == []
+
+
+def test_codex_runner_model_aliases():
+    """CodexRunner provides codex/codex-mini aliases."""
+    runner = _make_codex_runner()
+    aliases = runner.get_model_aliases()
+    assert aliases["codex"] == "gpt-5.2-codex"
+    assert aliases["codex-mini"] == "gpt-5.1-codex-mini"
+
+
+def test_codex_runner_multiple_agent_messages():
+    """Multiple agent_message items accumulate text."""
+    runner = _make_codex_runner()
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = iter([
+                '{"type":"thread.started","thread_id":"t-multi"}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Part 1. "}}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Part 2."}}\n',
+                '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":20}}\n',
+            ])
+            self.stderr = iter([])
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    streamed = []
+    result = runner._run_streaming(
+        FakeProc(), session_id=None, tag=None, on_output=streamed.append,
+    )
+
+    assert result["result"] == "Part 1. Part 2."
+    # Each agent_message appends accumulated text to pending_output
+    assert streamed == ["Part 1. ", "Part 1. Part 2."]
+
+
+def test_codex_runner_temp_file_lifecycle(monkeypatch):
+    """run() creates and cleans up temp file for system prompt injection."""
+    runner = bridge_runtime.CodexRunner(
+        command="codex", model="gpt-5.2-codex",
+        workspace="/tmp", timeout=30,
+        extra_system_prompts=["Test prompt injection"],
+    )
+
+    created_files = []
+    deleted_files = []
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = iter([
+                '{"type":"thread.started","thread_id":"t-tmp"}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n',
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}\n',
+            ])
+            self.stderr = iter([])
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    original_popen = bridge_runtime.subprocess.Popen
+
+    def fake_popen(args, **kwargs):
+        # Check that -c model_instructions_file=<path> is in args
+        for i, arg in enumerate(args):
+            if arg == "-c" and i + 1 < len(args) and "model_instructions_file=" in args[i + 1]:
+                path = args[i + 1].split("=", 1)[1]
+                created_files.append(path)
+                # Verify file exists and contains our prompt
+                assert os.path.exists(path)
+                content = open(path).read()
+                assert "Test prompt injection" in content
+        return FakeProc()
+
+    original_unlink = os.unlink
+
+    def tracking_unlink(path):
+        if "codex-instructions-" in path:
+            deleted_files.append(path)
+        return original_unlink(path)
+
+    monkeypatch.setattr(bridge_runtime.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(os, "unlink", tracking_unlink)
+
+    result = runner.run("test prompt")
+
+    assert result["result"] == "ok"
+    # Temp file was created
+    assert len(created_files) == 1
+    # Temp file was cleaned up
+    assert len(deleted_files) == 1
+    assert created_files[0] == deleted_files[0]
+
+
+def test_codex_runner_item_completed_null_item():
+    """item.completed with item=null should not crash."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    # JSON: {"type": "item.completed", "item": null}
+    runner.parse_streaming_line(
+        {"type": "item.completed", "item": None},
+        state,
+    )
+    # Should not crash, and no text should be accumulated
+    assert state.accumulated_text == ""
+    assert not state.done
+
+
+def test_codex_runner_item_error_propagates():
+    """item.completed with type=error propagates error text and sets is_error."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line(
+        {"type": "item.completed", "item": {"type": "error", "text": "sandbox failure"}},
+        state,
+    )
+    assert state.is_error
+    assert "sandbox failure" in state.accumulated_text
+
+
+def test_codex_runner_streaming_result_is_error_propagated():
+    """_build_streaming_result propagates is_error from state."""
+    runner = _make_codex_runner()
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = iter([
+                '{"type":"thread.started","thread_id":"t-ie"}\n',
+                '{"type":"turn.failed","error":{"message":"auth expired"}}\n',
+            ])
+            self.stderr = iter([])
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    result = runner._run_streaming(
+        FakeProc(), session_id=None, tag=None, on_output=lambda _: None,
+    )
+
+    assert result["is_error"] is True
+    assert "auth expired" in result["result"]
+    # usage should be empty dict, not None
+    assert result["usage"] == {}
+
+
+def test_stream_state_is_error_default():
+    """StreamState.is_error defaults to False."""
+    state = bridge_runtime.StreamState()
+    assert state.is_error is False
+
+
+def test_codex_runner_item_error_without_turn_completed():
+    """BUG-1 regression: item.completed(type=error) as last event before exit
+    must preserve is_error=True in the final result, even without turn.completed."""
+    runner = _make_codex_runner()
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = iter([
+                '{"type":"thread.started","thread_id":"t-err"}\n',
+                '{"type":"item.completed","item":{"type":"error","text":"rate limit"}}\n',
+                # No turn.completed/turn.failed — process exits cleanly
+            ])
+            self.stderr = iter([])
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    result = runner._run_streaming(
+        FakeProc(), session_id=None, tag=None, on_output=lambda _: None,
+    )
+
+    # Must be flagged as error even though state.done was never set
+    assert result["is_error"] is True
+    assert "rate limit" in result["result"]
+
+
+def test_codex_runner_thread_started_missing_thread_id():
+    """BUG-2 regression: thread.started with null/missing thread_id must NOT
+    overwrite state.session_id, preventing caller placeholder from being
+    persisted as a real Codex thread id."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+
+    # Missing thread_id entirely
+    runner.parse_streaming_line({"type": "thread.started"}, state)
+    assert state.session_id is None
+
+    # Explicit null
+    runner.parse_streaming_line({"type": "thread.started", "thread_id": None}, state)
+    assert state.session_id is None
+
+    # Empty string
+    runner.parse_streaming_line({"type": "thread.started", "thread_id": ""}, state)
+    assert state.session_id is None
+
+    # Valid thread_id works
+    runner.parse_streaming_line({"type": "thread.started", "thread_id": "t-real"}, state)
+    assert state.session_id == "t-real"
+
+
+def test_codex_runner_parse_top_level_error_null_message():
+    """Top-level error event with message=None uses fallback, not 'None' string."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line({"type": "error", "message": None}, state)
+    assert state.done
+    assert state.is_error
+    # Must NOT render "None" as text — should use fallback
+    assert "None" not in state.accumulated_text
+    assert "Unknown error" in state.accumulated_text
+
+
+def test_codex_runner_parse_turn_completed_no_usage():
+    """turn.completed without usage field still marks done; last_call_usage stays None."""
+    runner = _make_codex_runner()
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line({"type": "turn.completed"}, state)
+    assert state.done
+    assert state.last_call_usage is None
+    assert state.peak_context_tokens == 0
+
+
+# ============================================================
+# Phase 3: Config migration, runner factory, session namespace
+# ============================================================
+
+def test_load_config_migrates_claude_to_agent(tmp_path):
+    """Old 'claude' config key is migrated to 'agent' with type=claude."""
+    config = {
+        "bots": [_base_bot_config()],
+        "claude": {"command": "python3", "timeout_seconds": 600},
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    result = bridge.load_config(str(cfg_file), "test")
+    assert "agent" in result
+    assert result["agent"]["type"] == "claude"
+    assert result["agent"]["timeout_seconds"] == 600
+    assert "_resolved_command" in result["agent"]
+
+
+def test_load_config_new_agent_format(tmp_path):
+    """New 'agent' format is loaded directly without migration."""
+    config = {
+        "bots": [_base_bot_config()],
+        "agent": {"type": "claude", "command": "python3", "timeout_seconds": 300},
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    result = bridge.load_config(str(cfg_file), "test")
+    assert result["agent"]["type"] == "claude"
+    assert result["agent"]["timeout_seconds"] == 300
+
+
+def test_load_config_missing_agent_type_exits(tmp_path):
+    """agent config without 'type' causes sys.exit."""
+    config = {
+        "bots": [_base_bot_config()],
+        "agent": {"command": "python3"},
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    with pytest.raises(SystemExit):
+        bridge.load_config(str(cfg_file), "test")
+
+
+def test_create_runner_claude():
+    """Factory creates ClaudeRunner for type=claude."""
+    import shutil
+    cmd = shutil.which("python3")
+    agent_cfg = {"type": "claude", "_resolved_command": cmd, "timeout_seconds": 30}
+    bot_cfg = {"workspace": "/tmp", "model": "claude-sonnet-4-6"}
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+    assert isinstance(runner, bridge_runtime.ClaudeRunner)
+    assert runner.model == "claude-sonnet-4-6"
+
+
+def test_create_runner_codex():
+    """Factory creates CodexRunner for type=codex."""
+    import shutil
+    cmd = shutil.which("python3")
+    agent_cfg = {"type": "codex", "_resolved_command": cmd, "timeout_seconds": 30}
+    bot_cfg = {"workspace": "/tmp"}
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+    assert isinstance(runner, bridge_runtime.CodexRunner)
+    assert runner.model == "gpt-5.2-codex"  # DEFAULT_MODEL fallback
+
+
+def test_create_runner_unknown_type_raises():
+    """Factory raises KeyError for unknown agent type (validated in load_config)."""
+    agent_cfg = {"type": "unknown", "_resolved_command": "python3"}
+    bot_cfg = {"workspace": "/tmp"}
+    with pytest.raises(KeyError):
+        bridge.create_runner(agent_cfg, bot_cfg, [])
+
+
+def test_session_map_agent_type_reconcile_same(tmp_path):
+    """SessionMap preserves sessions when agent_type matches."""
+    path = tmp_path / "sessions.json"
+    path.write_text(json.dumps({"_agent_type": "claude", "k1": "s1"}))
+
+    sm = bridge_runtime.SessionMap(path, agent_type="claude")
+    assert sm.get(("k1",)) == "s1"
+
+
+def test_session_map_agent_type_reconcile_changed(tmp_path):
+    """SessionMap clears sessions when agent_type changes."""
+    path = tmp_path / "sessions.json"
+    path.write_text(json.dumps({"_agent_type": "claude", "k1": "s1"}))
+
+    sm = bridge_runtime.SessionMap(path, agent_type="codex")
+    assert sm.get(("k1",)) is None  # cleared
+    # Verify new type is stored
+    data = json.loads(path.read_text())
+    assert data["_agent_type"] == "codex"
+
+
+def test_session_map_legacy_claude_preserved(tmp_path):
+    """Legacy sessions (no _agent_type) preserved when type=claude."""
+    path = tmp_path / "sessions.json"
+    path.write_text(json.dumps({"k1": "s1"}))
+
+    sm = bridge_runtime.SessionMap(path, agent_type="claude")
+    assert sm.get(("k1",)) == "s1"  # preserved
+    data = json.loads(path.read_text())
+    assert data["_agent_type"] == "claude"
+
+
+def test_session_map_legacy_non_claude_cleared(tmp_path):
+    """Legacy sessions (no _agent_type) cleared when type!=claude."""
+    path = tmp_path / "sessions.json"
+    path.write_text(json.dumps({"k1": "s1"}))
+
+    sm = bridge_runtime.SessionMap(path, agent_type="codex")
+    assert sm.get(("k1",)) is None  # cleared
+    data = json.loads(path.read_text())
+    assert data["_agent_type"] == "codex"

@@ -11,6 +11,7 @@ If no config exists and stdin is a TTY, an interactive setup wizard runs.
 import json
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -55,6 +56,18 @@ def _interactive_setup(bot_name: str) -> str:
     ws_input = _prompt(f"  工作目录 [{default_ws}]: ").strip()
     workspace = ws_input or default_ws
 
+    # Agent type selection
+    agent_type_input = _prompt("  Agent 类型 [claude/codex] (claude): ").strip().lower()
+    agent_type = agent_type_input if agent_type_input in ("claude", "codex") else "claude"
+    agent_cmd = agent_type  # "claude" or "codex"
+
+    if not shutil.which(agent_cmd):
+        print(f"\n  ⚠️  命令 '{agent_cmd}' 未在 PATH 中找到。"
+              f"请安装后重试或在配置中设置绝对路径。", file=sys.stderr)
+        raise SystemExit(1)
+
+    agent_cfg = {"type": agent_type, "command": agent_cmd, "timeout_seconds": 300}
+
     config = {
         "bots": [
             {
@@ -65,7 +78,7 @@ def _interactive_setup(bot_name: str) -> str:
                 "allowed_users": ["*"],
             }
         ],
-        "claude": {"command": "claude", "timeout_seconds": 300},
+        "agent": agent_cfg,
     }
 
     config_dir = _XDG_CONFIG_PATH.parent

@@ -11,7 +11,7 @@ from feishu_bridge.parsers import (
     fetch_forward_messages,
     fetch_quoted_message,
 )
-from feishu_bridge.runtime import ClaudeRunner, SessionMap
+from feishu_bridge.runtime import BaseRunner, SessionMap
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
 
 log = logging.getLogger("feishu-bridge")
@@ -25,8 +25,8 @@ def _context_health_alert(result: dict) -> str | None:
     Also reports when auto-compact was detected so the user knows
     earlier conversation turns may have been summarised.
     """
-    # Determine context window size
-    max_ctx = 200_000  # conservative default
+    # Determine context window size (prefer modelUsage, fallback to runner default)
+    max_ctx = result.get("default_context_window", 200_000)
     model_usage = result.get("modelUsage", {})
     for _model, mu in model_usage.items():
         cw = mu.get("contextWindow", 0)
@@ -115,7 +115,7 @@ def process_message(
     bot_config: dict,
     lark_client,
     session_map: SessionMap,
-    runner: ClaudeRunner,
+    runner: BaseRunner,
     feishu_tasks=None,
     feishu_docs=None,
     feishu_sheets=None,
@@ -142,7 +142,12 @@ def process_message(
     handle = response_handle_cls(lark_client, chat_id, thread_id, message_id)
     image_path = None
     auth_file_path = None
-    session_not_found_signatures = session_not_found_signatures or []
+    # Prefer runner's own signatures; fall back to caller-provided list for compat
+    session_not_found_signatures = (
+        runner.get_session_not_found_signatures()
+        if hasattr(runner, 'get_session_not_found_signatures')
+        else session_not_found_signatures or []
+    )
 
     try:
         handle._runner = runner
@@ -547,7 +552,7 @@ def process_message(
                     "usage": result.get("usage", {}),
                     "last_call_usage": result.get("last_call_usage"),
                     "model_usage": result.get("modelUsage", {}),
-                    "total_cost_usd": result.get("total_cost_usd", 0),
+                    "total_cost_usd": result.get("total_cost_usd"),
                     "accumulated_cost_usd": prev_accumulated + (result.get("total_cost_usd") or 0),
                 }
 
