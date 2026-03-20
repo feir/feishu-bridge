@@ -897,7 +897,7 @@ def main():
 
     # Load config
     from feishu_bridge.config import resolve_config_path
-    config_path = resolve_config_path(args.config)
+    config_path = resolve_config_path(args.config, bot_name=args.bot)
     config = load_config(config_path, args.bot)
 
     # Create bot and run startup tasks in parallel

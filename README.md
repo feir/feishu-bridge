@@ -5,12 +5,13 @@
 
 ## 使用示例
 
-简单示例：
+**简单示例**：
 - "我飞书任务里的待办都有哪些" → 查询任务列表
 - "帮我在知识库里新建一篇文档" → 创建文档
 - "查一下上周的日历安排" → 查询日历事件
 - "把这个文件传到飞书云盘 https://example.com/report.pdf" → 下载并上传
-复杂组合示例：
+
+**复杂组合示例**：
 - "查看下昨天我们讨论的 bridge 增强计划的执行进度情况" → 搜索文档 + 读取内容 + 查询任务，综合分析后汇报
 - "把上周会议纪要里的待办项创建为飞书任务" → 读取文档 + 提取待办 + 批量创建任务
 - "对比这两个表格的数据差异，结果写入新文档" → 读取两个表格 + 分析 + 创建文档写入结果
@@ -77,9 +78,29 @@ cd feishu-bridge
 pip install -e '.[dev]'
 ```
 
-### 3. 配置
+### 3. 配置并运行
 
-创建 `~/.config/feishu-bridge/config.json`：
+首次运行时，如果没有配置文件，会自动启动交互式向导：
+
+```bash
+$ feishu-bridge --bot my-bot
+
+✦ Feishu Bridge 首次配置向导
+
+  请先在飞书开放平台创建机器人：
+  https://open.feishu.cn/page/openclaw?form=multiAgent
+
+  App ID: cli_xxxx
+  App Secret: xxxx
+  工作目录 [~/.local/share/feishu-bridge/workspaces/my-bot]:
+
+  凭证已写入 ~/.config/feishu-bridge/.env
+  配置已写入 ~/.config/feishu-bridge/config.json
+```
+
+向导会自动生成配置文件和凭证文件，然后直接启动。
+
+也可以手动创建 `~/.config/feishu-bridge/config.json`：
 
 ```json
 {
@@ -99,16 +120,10 @@ pip install -e '.[dev]'
 }
 ```
 
-- `${VAR}` 语法会在加载时替换为环境变量
+- `${VAR}` 语法会在加载时替换为环境变量（凭证存放在 `~/.config/feishu-bridge/.env`）
 - `allowed_users`：允许使用的用户 ID 列表，`["*"]` 表示所有人
 - `allowed_chats`（可选）：允许的群聊 ID 列表
 - `model`（可选）：默认 Claude 模型，默认 `claude-opus-4-6`
-
-### 4. 运行
-
-```bash
-feishu-bridge --bot my-bot
-```
 
 ### CLI 工具
 
@@ -146,7 +161,7 @@ systemctl --user enable --now feishu-bridge@my-bot
 ## 安全
 
 - **Token 加密存储** — AES-256-GCM，密钥绑定 app_id + user_id + machine_id
-- **沙盒限制** — 内置 settings.json 拦截危险命令（`systemctl *feishu-bridge*`、`shutdown`、`rm -rf` 等）
+- **沙盒限制** — Bridge 自带权限规则拦截高危命令（如 `systemctl *feishu-bridge*`、`shutdown`、`curl`、`kill` 等），同时遵守用户本地的 Claude Code 权限配置
 - **删除操作安全确认** — 所有 `feishu-cli` 删除命令需 `--confirm <prefix>` 二次确认
 
 ## 开发
