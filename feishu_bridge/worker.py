@@ -139,6 +139,17 @@ def _write_auth_file(chat_id: str, sender_id: str, user_token: str | None) -> st
     return auth_path
 
 
+def _cleanup_auth_card(feishu_mod, sender_id: str):
+    """Best-effort cleanup of the OAuth auth card after result delivery."""
+    if not feishu_mod or not sender_id:
+        return
+    try:
+        feishu_mod.cleanup_auth_card(sender_id)
+    except Exception:
+        log.warning("Failed to cleanup auth card for %s", sender_id[:8],
+                    exc_info=True)
+
+
 def process_message(
     item: dict,
     bot_config: dict,
@@ -162,6 +173,7 @@ def process_message(
     chat_id = item["chat_id"]
     thread_id = item.get("thread_id")
     parent_id = item.get("parent_id")
+    sender_id = item.get("sender_id", "")
     text = item.get("text", "")
     image_key = item.get("image_key")
     message_id = item.get("message_id")
@@ -245,7 +257,6 @@ def process_message(
         feishu_urls = item.get("_feishu_urls") or []
         if feishu_urls and (feishu_docs or feishu_sheets) and feishu_api_error_cls:
             import requests as _requests
-            sender_id = item.get("sender_id", "")
             # Silent per-service token check: auto-fetch must NOT trigger OAuth.
             # get_cached_token() returns None without sending auth cards.
             _doc_token = feishu_docs.get_cached_token(sender_id) if feishu_docs else None
@@ -401,8 +412,6 @@ def process_message(
             )
         if todo_task_id and feishu_tasks and feishu_api_error_cls:
             import requests as _requests
-
-            sender_id = item.get("sender_id", "")
             try:
                 data = feishu_tasks.get_task(chat_id, sender_id, todo_task_id)
             except feishu_api_error_cls as e:
@@ -508,7 +517,6 @@ def process_message(
         # may be None for first-time users — feishu-cli will trigger OAuth
         # on-demand when it actually needs the token (not pre-emptively).
         env_extra = None
-        sender_id = item.get("sender_id", "")
         try:
             if feishu_docs:
                 cli_token = feishu_docs.get_cached_token(sender_id)
@@ -603,6 +611,11 @@ def process_message(
 
         if not handle._terminated:
             handle.deliver(result["result"], is_error=result["is_error"])
+
+        # Delete the auth card so it doesn't remain as the last message.
+        # The auth card msg_id is persisted to disk by auth.py (or a CLI
+        # subprocess), so this works cross-process.
+        _cleanup_auth_card(feishu_docs, sender_id)
 
         return handle
 

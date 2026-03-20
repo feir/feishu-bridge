@@ -88,6 +88,30 @@ def _token_path(app_id: str, user_open_id: str) -> Path:
     return TOKEN_DIR / f"{app_id}_{user_open_id}.enc"
 
 
+def _auth_card_path(app_id: str, user_open_id: str) -> Path:
+    """Path for persisting auth card msg_id (cross-process tracking)."""
+    return TOKEN_DIR / f"{app_id}_{user_open_id}_authcard"
+
+
+def save_auth_card_id(app_id: str, user_open_id: str, msg_id: str):
+    """Persist auth card msg_id so the caller can delete it after delivery."""
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _auth_card_path(app_id, user_open_id).write_text(msg_id)
+
+
+def pop_auth_card_id(app_id: str, user_open_id: str) -> Optional[str]:
+    """Read and remove persisted auth card msg_id. Returns None if absent."""
+    path = _auth_card_path(app_id, user_open_id)
+    if not path.exists():
+        return None
+    try:
+        msg_id = path.read_text().strip()
+        path.unlink(missing_ok=True)
+        return msg_id or None
+    except OSError:
+        return None
+
+
 def save_token(app_id: str, user_open_id: str, token_data: dict):
     """Encrypt and save token to disk (atomic write, 0600)."""
     TOKEN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -614,7 +638,7 @@ class FeishuAuth:
             else:
                 raise
 
-        # 3. Send auth card
+        # 3. Send auth card and persist msg_id for post-delivery cleanup
         expires_min = max(1, device["expires_in"] // 60)
         msg_id = self._send_card(chat_id, build_auth_card(
             device["verification_uri_complete"], scopes, expires_min))
@@ -624,6 +648,8 @@ class FeishuAuth:
                       user_open_id[:8])
             return None
 
+        save_auth_card_id(self.app_id, user_open_id, msg_id)
+
         # 4. Poll for token
         result = poll_device_token(
             self.app_id, self.app_secret,
@@ -631,6 +657,8 @@ class FeishuAuth:
             device["interval"], stop_flag)
 
         # 5. Update card and store token
+        #    Card will be deleted by the caller after result delivery;
+        #    update it now so the user sees immediate feedback.
         if result["ok"]:
             token_data = result["token"]
             save_token(self.app_id, user_open_id, token_data)
@@ -697,3 +725,32 @@ class FeishuAuth:
         except Exception:
             log.exception("Update card error for msg_id=%s", msg_id)
         return False
+
+    def _delete_message(self, msg_id: str) -> bool:
+        """Delete a bot message by ID. Returns True on success."""
+        if not msg_id or not self.lark_client:
+            return False
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageRequest
+            req = DeleteMessageRequest.builder() \
+                .message_id(msg_id).build()
+            resp = self.lark_client.im.v1.message.delete(req)
+            if resp.success():
+                return True
+            log.error("Delete message failed: code=%s msg=%s msg_id=%s",
+                      resp.code, resp.msg, msg_id)
+        except Exception:
+            log.exception("Delete message error for msg_id=%s", msg_id)
+        return False
+
+    def cleanup_auth_card(self, user_open_id: str) -> bool:
+        """Delete the auth card from chat after result delivery.
+
+        Reads the persisted auth card msg_id (written by this or a CLI
+        subprocess), deletes the Feishu message, and removes the file.
+        Cross-process safe — uses filesystem for IPC.
+        """
+        msg_id = pop_auth_card_id(self.app_id, user_open_id)
+        if not msg_id:
+            return False
+        return self._delete_message(msg_id)

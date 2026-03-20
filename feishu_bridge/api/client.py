@@ -76,6 +76,14 @@ class FeishuAPI:
             return self._token_override
         return self.auth.get_valid_token(user_open_id)
 
+    def cleanup_auth_card(self, user_open_id: str) -> bool:
+        """Delete the auth card sent during OAuth flow (if any).
+
+        Call after delivering the main result so the auth card doesn't
+        remain as the last visible message in chat.
+        """
+        return self.auth.cleanup_auth_card(user_open_id)
+
     # HTTP status codes that warrant automatic retry
     _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
     _MAX_RETRIES = 3
