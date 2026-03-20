@@ -364,12 +364,6 @@ def build_cardkit_streaming_card() -> dict:
                     "element_id": CARDKIT_ELEMENT_ID,
                     "content": "",
                 },
-                {
-                    "tag": "note",
-                    "elements": [
-                        {"tag": "plain_text", "content": "⏳ 生成中..."},
-                    ],
-                },
             ],
         },
     }
@@ -417,12 +411,9 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
     footer_parts = [status]
     if elapsed_s > 0:
         footer_parts.append(f"耗时 {_format_elapsed(elapsed_s)}")
-    elements.append({"tag": "hr"})
     elements.append({
-        "tag": "note",
-        "elements": [
-            {"tag": "plain_text", "content": " · ".join(footer_parts)},
-        ],
+        "tag": "markdown",
+        "content": "---\n" + " · ".join(footer_parts),
     })
 
     summary_text = re.sub(r"[*`#>\[\]()~_]", "", content)
