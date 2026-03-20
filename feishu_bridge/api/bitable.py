@@ -25,7 +25,9 @@ class FeishuBitable(FeishuAPI):
     SCOPES = [
         "base:app:read",
         "base:app:create",
+        "base:table:read",
         "base:table:create",
+        "base:table:update",
         "base:table:delete",
         "base:record:retrieve",
         "base:record:create",
@@ -34,6 +36,11 @@ class FeishuBitable(FeishuAPI):
         "base:field:read",
         "base:field:create",
         "base:field:update",
+        "base:field:delete",
+        "base:view:read",
+        "base:view:create",
+        "base:view:update",
+        "base:view:delete",
     ]
     BASE_PATH = "/open-apis/bitable/v1"
 
@@ -64,6 +71,41 @@ class FeishuBitable(FeishuAPI):
 
         return self.request("GET", f"/apps/{app_token}/tables", token,
                             params=params)
+
+    def copy_app(self, chat_id: str, user_open_id: str,
+                 app_token: str, name: str = None,
+                 folder_token: str = None) -> Optional[dict]:
+        """Copy a bitable app.
+
+        Args:
+            app_token: source app to copy
+            name: name for the copy (default: original name + " copy")
+            folder_token: target folder
+        """
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        body = {}
+        if name:
+            body["name"] = name
+        if folder_token:
+            body["folder_token"] = folder_token
+
+        return self.request("POST", f"/apps/{app_token}/copy", token,
+                            json_body=body or None)
+
+    def patch_table(self, chat_id: str, user_open_id: str,
+                    app_token: str, table_id: str,
+                    name: str) -> Optional[dict]:
+        """Rename a table in a bitable app."""
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        return self.request("PATCH",
+                            f"/apps/{app_token}/tables/{table_id}", token,
+                            json_body={"table": {"name": name}})
 
     # -------------------------------------------------------------------
     # Record operations
@@ -228,14 +270,175 @@ class FeishuBitable(FeishuAPI):
     # -------------------------------------------------------------------
 
     def list_fields(self, chat_id: str, user_open_id: str,
-                    app_token: str, table_id: str) -> Optional[dict]:
+                    app_token: str, table_id: str,
+                    page_size: int = 100,
+                    page_token: str = None) -> Optional[dict]:
         """List all fields (columns) in a table."""
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+        params = {"page_size": page_size}
+        if page_token:
+            params["page_token"] = page_token
+        return self.request(
+            "GET",
+            f"/apps/{app_token}/tables/{table_id}/fields",
+            token,
+            params=params,
+        )
+
+    def create_field(self, chat_id: str, user_open_id: str,
+                     app_token: str, table_id: str,
+                     field_name: str, field_type: int,
+                     property_: dict = None) -> Optional[dict]:
+        """Create a field (column) in a table.
+
+        Args:
+            field_name: display name
+            field_type: type code (1=Text, 2=Number, 3=SingleSelect,
+                4=MultiSelect, 5=DateTime, 7=Checkbox, 11=User, 13=Phone,
+                15=URL, 17=Attachment, 18=Link, 20=Formula, 21=DuplexLink,
+                22=Location, 23=GroupChat, 1001=CreatedTime,
+                1002=LastModifiedTime, 1003=CreatedBy, 1004=LastModifiedBy,
+                1005=AutoNumber)
+            property_: type-specific config (e.g. options for select fields)
+        """
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        body = {"field_name": field_name, "type": field_type}
+        if property_:
+            body["property"] = property_
+
+        return self.request(
+            "POST",
+            f"/apps/{app_token}/tables/{table_id}/fields",
+            token, json_body=body)
+
+    def update_field(self, chat_id: str, user_open_id: str,
+                     app_token: str, table_id: str,
+                     field_id: str,
+                     field_name: str = None,
+                     field_type: int = None,
+                     property_: dict = None) -> Optional[dict]:
+        """Update a field (rename, change type, or modify property).
+
+        Args:
+            field_id: field ID to update
+            field_name: new display name
+            field_type: new type code (see create_field for codes)
+            property_: new type-specific config
+        """
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        body = {}
+        if field_name is not None:
+            body["field_name"] = field_name
+        if field_type is not None:
+            body["type"] = field_type
+        if property_ is not None:
+            body["property"] = property_
+
+        if not body:
+            raise ValueError("update_field requires at least one of: "
+                             "field_name, field_type, property_")
+
+        return self.request(
+            "PUT",
+            f"/apps/{app_token}/tables/{table_id}/fields/{field_id}",
+            token, json_body=body)
+
+    def delete_field(self, chat_id: str, user_open_id: str,
+                     app_token: str, table_id: str,
+                     field_id: str) -> Optional[dict]:
+        """Delete a field (column) from a table."""
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+        return self.request(
+            "DELETE",
+            f"/apps/{app_token}/tables/{table_id}/fields/{field_id}",
+            token)
+
+    # -------------------------------------------------------------------
+    # View operations
+    # -------------------------------------------------------------------
+
+    def list_views(self, chat_id: str, user_open_id: str,
+                   app_token: str, table_id: str,
+                   page_size: int = 50,
+                   page_token: str = None) -> Optional[dict]:
+        """List views in a table."""
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        params = {"page_size": page_size}
+        if page_token:
+            params["page_token"] = page_token
+
+        return self.request(
+            "GET",
+            f"/apps/{app_token}/tables/{table_id}/views",
+            token, params=params)
+
+    def get_view(self, chat_id: str, user_open_id: str,
+                 app_token: str, table_id: str,
+                 view_id: str) -> Optional[dict]:
+        """Get a view's details."""
         token = self.get_token(chat_id, user_open_id)
         if not token:
             return None
         return self.request(
             "GET",
-            f"/apps/{app_token}/tables/{table_id}/fields",
+            f"/apps/{app_token}/tables/{table_id}/views/{view_id}",
+            token)
+
+    def create_view(self, chat_id: str, user_open_id: str,
+                    app_token: str, table_id: str,
+                    view_name: str,
+                    view_type: str = "grid") -> Optional[dict]:
+        """Create a view in a table.
+
+        Args:
+            view_name: display name
+            view_type: "grid", "kanban", "gallery", "gantt", or "form"
+        """
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        return self.request(
+            "POST",
+            f"/apps/{app_token}/tables/{table_id}/views",
             token,
-            params={"page_size": 100},
-        )
+            json_body={"view_name": view_name, "view_type": view_type})
+
+    def patch_view(self, chat_id: str, user_open_id: str,
+                   app_token: str, table_id: str,
+                   view_id: str, view_name: str) -> Optional[dict]:
+        """Rename a view."""
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        return self.request(
+            "PATCH",
+            f"/apps/{app_token}/tables/{table_id}/views/{view_id}",
+            token,
+            json_body={"view_name": view_name})
+
+    def delete_view(self, chat_id: str, user_open_id: str,
+                    app_token: str, table_id: str,
+                    view_id: str) -> Optional[dict]:
+        """Delete a view from a table."""
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+        return self.request(
+            "DELETE",
+            f"/apps/{app_token}/tables/{table_id}/views/{view_id}",
+            token)

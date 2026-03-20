@@ -70,15 +70,37 @@ Call it with `feishu-cli <command> [args]`.
 - `list-files [--folder-token <token>]`
 
 ### Bitable (多维表格)
+
+**App**
+- `get-bitable-app --app-token <token>` — Get app metadata
+- `create-bitable-app --name <name> [--folder-token <folder>]`
+- `copy-bitable-app --app-token <token> [--name <name>] [--folder-token <folder>]` — Copy a bitable
+
+**Table**
+- `list-bitable-tables --app-token <token>` — List tables in a bitable
+- `create-bitable-table --app-token <token> --name <name>`
+- `patch-bitable-table --app-token <token> --table-id <id> --name <new_name>` — Rename table
+- `delete-bitable-table --app-token <token> --table-id <id> --confirm <id_prefix>` ⚠️
+
+**Record**
 - `list-bitable-records --app-token <token> --table-id <id> [--filter <expr>]`
 - `get-bitable-record --app-token <token> --table-id <id> --record-id <id>`
 - `create-bitable-records --app-token <token> --table-id <id> --records '<json_array>'`
 - `update-bitable-records --app-token <token> --table-id <id> --records '<json_array>'`
 - `delete-bitable-records --app-token <token> --table-id <id> --record-ids '<json_array>' --confirm <id_prefix>` ⚠️
-- `create-bitable-app --name <name> [--folder-token <folder>]`
-- `create-bitable-table --app-token <token> --name <name>`
-- `delete-bitable-table --app-token <token> --table-id <id> --confirm <id_prefix>` ⚠️
+
+**Field**
 - `list-bitable-fields --app-token <token> --table-id <id>`
+- `create-bitable-field --app-token <token> --table-id <id> --field-name <name> --field-type <int> [--property '<json>']` — Type codes: 1=Text 2=Number 3=SingleSelect 4=MultiSelect 5=DateTime 7=Checkbox 11=User 15=URL 17=Attachment 20=Formula 21=DuplexLink
+- `update-bitable-field --app-token <token> --table-id <id> --field-id <id> [--field-name <name>] [--field-type <int>] [--property '<json>']`
+- `delete-bitable-field --app-token <token> --table-id <id> --field-id <id> --confirm <id_prefix>` ⚠️
+
+**View**
+- `list-bitable-views --app-token <token> --table-id <id>`
+- `get-bitable-view --app-token <token> --table-id <id> --view-id <id>`
+- `create-bitable-view --app-token <token> --table-id <id> --view-name <name> [--view-type grid|kanban|gallery|gantt|form]`
+- `patch-bitable-view --app-token <token> --table-id <id> --view-id <id> --view-name <new_name>` — Rename view
+- `delete-bitable-view --app-token <token> --table-id <id> --view-id <id> --confirm <id_prefix>` ⚠️
 
 
 ### Drive (云盘)

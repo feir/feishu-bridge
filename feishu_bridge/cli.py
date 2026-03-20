@@ -407,6 +407,40 @@ def main():
     p.add_argument("--page-token")
 
     # --- Bitable ---
+    # App-level
+    p = sub.add_parser("get-bitable-app", help="Get bitable app metadata")
+    p.add_argument("--app-token", required=True)
+
+    p = sub.add_parser("create-bitable-app", help="Create a new bitable")
+    p.add_argument("--name", required=True)
+    p.add_argument("--folder-token")
+
+    p = sub.add_parser("copy-bitable-app", help="Copy a bitable app")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--name", help="Name for the copy")
+    p.add_argument("--folder-token")
+
+    # Table-level
+    p = sub.add_parser("list-bitable-tables", help="List tables in a bitable")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--page-size", type=int, default=50)
+    p.add_argument("--page-token")
+
+    p = sub.add_parser("create-bitable-table", help="Create a table in bitable")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--name", required=True)
+
+    p = sub.add_parser("patch-bitable-table", help="Rename a bitable table")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--name", required=True)
+
+    p = sub.add_parser("delete-bitable-table", help="Delete a bitable table")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--confirm", required=True)
+
+    # Record-level
     p = sub.add_parser("list-bitable-records", help="List bitable records")
     p.add_argument("--app-token", required=True)
     p.add_argument("--table-id", required=True)
@@ -435,22 +469,67 @@ def main():
     p.add_argument("--record-ids", required=True, help="JSON array of record IDs")
     p.add_argument("--confirm", required=True)
 
-    p = sub.add_parser("create-bitable-app", help="Create a new bitable")
-    p.add_argument("--name", required=True)
-    p.add_argument("--folder-token")
-
-    p = sub.add_parser("create-bitable-table", help="Create a table in bitable")
-    p.add_argument("--app-token", required=True)
-    p.add_argument("--name", required=True)
-
-    p = sub.add_parser("delete-bitable-table", help="Delete a bitable table")
-    p.add_argument("--app-token", required=True)
-    p.add_argument("--table-id", required=True)
-    p.add_argument("--confirm", required=True)
-
+    # Field-level
     p = sub.add_parser("list-bitable-fields", help="List bitable fields")
     p.add_argument("--app-token", required=True)
     p.add_argument("--table-id", required=True)
+    p.add_argument("--page-size", type=int, default=100)
+    p.add_argument("--page-token")
+
+    p = sub.add_parser("create-bitable-field", help="Create a bitable field")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--field-name", required=True)
+    p.add_argument("--field-type", required=True, type=int,
+                   help="Type code: 1=Text 2=Number 3=SingleSelect 4=MultiSelect 5=DateTime 7=Checkbox 11=User 15=URL 17=Attachment 20=Formula 21=DuplexLink")
+    p.add_argument("--property", dest="field_property",
+                   help="JSON object for type-specific config")
+
+    p = sub.add_parser("update-bitable-field", help="Update a bitable field")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--field-id", required=True)
+    p.add_argument("--field-name", help="New field name")
+    p.add_argument("--field-type", type=int, help="New type code")
+    p.add_argument("--property", dest="field_property",
+                   help="JSON object for type-specific config")
+
+    p = sub.add_parser("delete-bitable-field", help="Delete a bitable field")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--field-id", required=True)
+    p.add_argument("--confirm", required=True)
+
+    # View-level
+    p = sub.add_parser("list-bitable-views", help="List views in a table")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--page-size", type=int, default=50)
+    p.add_argument("--page-token")
+
+    p = sub.add_parser("get-bitable-view", help="Get a view's details")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--view-id", required=True)
+
+    p = sub.add_parser("create-bitable-view", help="Create a view")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--view-name", required=True)
+    p.add_argument("--view-type", default="grid",
+                   choices=["grid", "kanban", "gallery", "gantt", "form"])
+
+    p = sub.add_parser("patch-bitable-view", help="Rename a view")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--view-id", required=True)
+    p.add_argument("--view-name", required=True)
+
+    p = sub.add_parser("delete-bitable-view", help="Delete a view")
+    p.add_argument("--app-token", required=True)
+    p.add_argument("--table-id", required=True)
+    p.add_argument("--view-id", required=True)
+    p.add_argument("--confirm", required=True)
 
 
     # --- Drive Upload ---
@@ -867,7 +946,54 @@ def main():
                                page_size=args.page_size,
                                page_token=args.page_token))
 
-    # Bitable commands
+    # Bitable commands — App
+    elif cmd == "get-bitable-app":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.get_app(chat_id, sender_id,
+                            app_token=args.app_token))
+
+    elif cmd == "create-bitable-app":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.create_app(chat_id, sender_id,
+                               name=args.name,
+                               folder_token=args.folder_token))
+
+    elif cmd == "copy-bitable-app":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.copy_app(chat_id, sender_id,
+                             app_token=args.app_token,
+                             name=args.name,
+                             folder_token=args.folder_token))
+
+    # Bitable commands — Table
+    elif cmd == "list-bitable-tables":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.list_tables(chat_id, sender_id,
+                                app_token=args.app_token,
+                                page_size=args.page_size,
+                                page_token=args.page_token))
+
+    elif cmd == "create-bitable-table":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.create_table(chat_id, sender_id,
+                                 app_token=args.app_token,
+                                 name=args.name))
+
+    elif cmd == "patch-bitable-table":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.patch_table(chat_id, sender_id,
+                                app_token=args.app_token,
+                                table_id=args.table_id,
+                                name=args.name))
+
+    elif cmd == "delete-bitable-table":
+        _confirm_guard(args, args.table_id, "table_id")
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.delete_table(chat_id, sender_id,
+                                 app_token=args.app_token,
+                                 table_id=args.table_id))
+
+    # Bitable commands — Record
     elif cmd == "list-bitable-records":
         mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         _output(mod.list_records(chat_id, sender_id,
@@ -912,30 +1038,87 @@ def main():
                                    table_id=args.table_id,
                                    record_ids=record_ids))
 
-    elif cmd == "create-bitable-app":
-        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
-        _output(mod.create_app(chat_id, sender_id,
-                               name=args.name,
-                               folder_token=args.folder_token))
-
-    elif cmd == "create-bitable-table":
-        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
-        _output(mod.create_table(chat_id, sender_id,
-                                 app_token=args.app_token,
-                                 name=args.name))
-
-    elif cmd == "delete-bitable-table":
-        _confirm_guard(args, args.table_id, "table_id")
-        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
-        _output(mod.delete_table(chat_id, sender_id,
-                                 app_token=args.app_token,
-                                 table_id=args.table_id))
-
+    # Bitable commands — Field
     elif cmd == "list-bitable-fields":
         mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
         _output(mod.list_fields(chat_id, sender_id,
                                 app_token=args.app_token,
-                                table_id=args.table_id))
+                                table_id=args.table_id,
+                                page_size=args.page_size,
+                                page_token=args.page_token))
+
+    elif cmd == "create-bitable-field":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        prop = None
+        if args.field_property:
+            prop = _safe_json_loads(args.field_property, "--property")
+        _output(mod.create_field(chat_id, sender_id,
+                                 app_token=args.app_token,
+                                 table_id=args.table_id,
+                                 field_name=args.field_name,
+                                 field_type=args.field_type,
+                                 property_=prop))
+
+    elif cmd == "update-bitable-field":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        prop = None
+        if args.field_property:
+            prop = _safe_json_loads(args.field_property, "--property")
+        _output(mod.update_field(chat_id, sender_id,
+                                 app_token=args.app_token,
+                                 table_id=args.table_id,
+                                 field_id=args.field_id,
+                                 field_name=args.field_name,
+                                 field_type=args.field_type,
+                                 property_=prop))
+
+    elif cmd == "delete-bitable-field":
+        _confirm_guard(args, args.field_id, "field_id")
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.delete_field(chat_id, sender_id,
+                                 app_token=args.app_token,
+                                 table_id=args.table_id,
+                                 field_id=args.field_id))
+
+    # Bitable commands — View
+    elif cmd == "list-bitable-views":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.list_views(chat_id, sender_id,
+                               app_token=args.app_token,
+                               table_id=args.table_id,
+                               page_size=args.page_size,
+                               page_token=args.page_token))
+
+    elif cmd == "get-bitable-view":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.get_view(chat_id, sender_id,
+                             app_token=args.app_token,
+                             table_id=args.table_id,
+                             view_id=args.view_id))
+
+    elif cmd == "create-bitable-view":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.create_view(chat_id, sender_id,
+                                app_token=args.app_token,
+                                table_id=args.table_id,
+                                view_name=args.view_name,
+                                view_type=args.view_type))
+
+    elif cmd == "patch-bitable-view":
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.patch_view(chat_id, sender_id,
+                               app_token=args.app_token,
+                               table_id=args.table_id,
+                               view_id=args.view_id,
+                               view_name=args.view_name))
+
+    elif cmd == "delete-bitable-view":
+        _confirm_guard(args, args.view_id, "view_id")
+        mod = _init_module(FeishuBitable, config, _user_token, _lark_client)
+        _output(mod.delete_view(chat_id, sender_id,
+                                app_token=args.app_token,
+                                table_id=args.table_id,
+                                view_id=args.view_id))
 
 
     # Task commands
