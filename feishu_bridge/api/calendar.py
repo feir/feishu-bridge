@@ -12,19 +12,23 @@ import logging
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from feishu_bridge.api.client import FeishuAPI
 
-_TZ_CST = timezone(timedelta(hours=8))
+DEFAULT_TIMEZONE = "Asia/Shanghai"
 
 
-def _to_unix_ts(value: str) -> str:
+def _to_unix_ts(value: str, tz_name: str = DEFAULT_TIMEZONE) -> str:
     """Convert time value to Unix timestamp string.
 
     Accepts:
       - Unix timestamp (digits only, 10 or 13 digits) — returned as-is (seconds)
       - RFC3339 / ISO8601 with tz — parsed and converted
-      - "YYYY-MM-DD HH:MM[:SS]" — assumed Asia/Shanghai (UTC+8)
+      - "YYYY-MM-DD HH:MM[:SS]" — interpreted in *tz_name* timezone
+
+    Args:
+        tz_name: IANA timezone name for naive datetime inputs (default: Asia/Shanghai)
     """
     value = value.strip()
     # Already a unix timestamp
@@ -42,7 +46,8 @@ def _to_unix_ts(value: str) -> str:
             return str(int(dt.timestamp()))
         except ValueError:
             continue
-    # Without timezone — assume UTC+8
+    # Without timezone — use caller-specified timezone
+    tz = ZoneInfo(tz_name)
     for fmt in (
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
@@ -50,7 +55,7 @@ def _to_unix_ts(value: str) -> str:
         "%Y-%m-%dT%H:%M",
     ):
         try:
-            dt = datetime.strptime(value, fmt).replace(tzinfo=_TZ_CST)
+            dt = datetime.strptime(value, fmt).replace(tzinfo=tz)
             return str(int(dt.timestamp()))
         except ValueError:
             continue
@@ -87,21 +92,23 @@ class FeishuCalendar(FeishuAPI):
     def list_events(self, chat_id: str, user_open_id: str,
                     calendar_id: str, start_time: str, end_time: str,
                     page_size: int = 50,
-                    page_token: str = None) -> Optional[dict]:
+                    page_token: str = None,
+                    timezone: str = DEFAULT_TIMEZONE) -> Optional[dict]:
         """List events in a calendar within a time range.
 
         Args:
             calendar_id: calendar ID (use "primary" for user's main calendar)
             start_time: RFC3339 timestamp (e.g. "2026-03-19T00:00:00+08:00")
             end_time: RFC3339 timestamp
+            timezone: IANA timezone for naive time parsing
         """
         token = self.get_token(chat_id, user_open_id)
         if not token:
             return None
 
         params = {
-            "start_time": _to_unix_ts(start_time),
-            "end_time": _to_unix_ts(end_time),
+            "start_time": _to_unix_ts(start_time, timezone),
+            "end_time": _to_unix_ts(end_time, timezone),
             "page_size": page_size,
         }
         if page_token:
@@ -126,7 +133,8 @@ class FeishuCalendar(FeishuAPI):
                      calendar_id: str, summary: str,
                      start_time: str, end_time: str,
                      description: str = None,
-                     attendees: list[dict] = None) -> Optional[dict]:
+                     attendees: list[dict] = None,
+                     timezone: str = DEFAULT_TIMEZONE) -> Optional[dict]:
         """Create a calendar event.
 
         Args:
@@ -135,6 +143,7 @@ class FeishuCalendar(FeishuAPI):
             end_time: RFC3339 timestamp
             description: optional event description
             attendees: list of {"type": "user", "user_id": open_id} dicts
+            timezone: IANA timezone for display and naive time parsing
         """
         token = self.get_token(chat_id, user_open_id)
         if not token:
@@ -142,8 +151,14 @@ class FeishuCalendar(FeishuAPI):
 
         body = {
             "summary": summary,
-            "start_time": {"timestamp": _to_unix_ts(start_time)},
-            "end_time": {"timestamp": _to_unix_ts(end_time)},
+            "start_time": {
+                "timestamp": _to_unix_ts(start_time, timezone),
+                "timezone": timezone,
+            },
+            "end_time": {
+                "timestamp": _to_unix_ts(end_time, timezone),
+                "timezone": timezone,
+            },
         }
         if description:
             body["description"] = description
@@ -156,10 +171,13 @@ class FeishuCalendar(FeishuAPI):
 
     def update_event(self, chat_id: str, user_open_id: str,
                      calendar_id: str, event_id: str,
+                     timezone: str = DEFAULT_TIMEZONE,
                      **kwargs) -> Optional[dict]:
         """Update a calendar event.
 
         Accepts keyword args: summary, description, start_time, end_time, attendees.
+        Args:
+            timezone: IANA timezone for display and naive time parsing
         """
         token = self.get_token(chat_id, user_open_id)
         if not token:
@@ -171,9 +189,15 @@ class FeishuCalendar(FeishuAPI):
         if "description" in kwargs:
             body["description"] = kwargs["description"]
         if "start_time" in kwargs:
-            body["start_time"] = {"timestamp": _to_unix_ts(kwargs["start_time"])}
+            body["start_time"] = {
+                "timestamp": _to_unix_ts(kwargs["start_time"], timezone),
+                "timezone": timezone,
+            }
         if "end_time" in kwargs:
-            body["end_time"] = {"timestamp": _to_unix_ts(kwargs["end_time"])}
+            body["end_time"] = {
+                "timestamp": _to_unix_ts(kwargs["end_time"], timezone),
+                "timezone": timezone,
+            }
         if "attendees" in kwargs:
             body["attendees"] = kwargs["attendees"]
 
@@ -218,21 +242,23 @@ class FeishuCalendar(FeishuAPI):
                              calendar_id: str, event_id: str,
                              start_time: str, end_time: str,
                              page_size: int = 50,
-                             page_token: str = None) -> Optional[dict]:
+                             page_token: str = None,
+                             timezone: str = DEFAULT_TIMEZONE) -> Optional[dict]:
         """List instances of a recurring event within a time range.
 
         Args:
             event_id: recurring event ID
             start_time: RFC3339 timestamp
             end_time: RFC3339 timestamp (max 40-day window)
+            timezone: IANA timezone for naive time parsing
         """
         token = self.get_token(chat_id, user_open_id)
         if not token:
             return None
 
         params = {
-            "start_time": _to_unix_ts(start_time),
-            "end_time": _to_unix_ts(end_time),
+            "start_time": _to_unix_ts(start_time, timezone),
+            "end_time": _to_unix_ts(end_time, timezone),
             "page_size": page_size,
         }
         if page_token:
@@ -308,21 +334,23 @@ class FeishuCalendar(FeishuAPI):
 
     def list_freebusy(self, chat_id: str, user_open_id: str,
                       user_ids: list[str],
-                      start_time: str, end_time: str) -> Optional[dict]:
+                      start_time: str, end_time: str,
+                      timezone: str = DEFAULT_TIMEZONE) -> Optional[dict]:
         """Query free/busy status for 1-10 users.
 
         Args:
             user_ids: list of user open_ids (max 10)
             start_time: RFC3339 timestamp
             end_time: RFC3339 timestamp
+            timezone: IANA timezone for naive time parsing
         """
         token = self.get_token(chat_id, user_open_id)
         if not token:
             return None
 
         body = {
-            "time_min": _to_unix_ts(start_time),
-            "time_max": _to_unix_ts(end_time),
+            "time_min": _to_unix_ts(start_time, timezone),
+            "time_max": _to_unix_ts(end_time, timezone),
             "user_ids": user_ids,
         }
         return self.request(

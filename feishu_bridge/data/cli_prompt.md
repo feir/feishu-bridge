@@ -50,17 +50,18 @@ Call it with `feishu-cli <command> [args]`.
 
 ### Calendar
 - `list-calendars`
-- `list-events --calendar-id <id> --start-time <rfc3339> --end-time <rfc3339>`
+- `list-events --calendar-id <id> --start-time <rfc3339> --end-time <rfc3339> [--timezone <iana_tz>]`
 - `get-event --calendar-id <id> --event-id <id>`
-- `create-event --calendar-id <id> --summary <title> --start-time <rfc3339> --end-time <rfc3339> [--description <text>]`
-- `update-event --calendar-id <id> --event-id <id> [--summary <title>] [--start-time <t>] [--end-time <t>]`
+- `create-event --calendar-id <id> --summary <title> --start-time <rfc3339> --end-time <rfc3339> [--description <text>] [--timezone <iana_tz>]`
+- `update-event --calendar-id <id> --event-id <id> [--summary <title>] [--start-time <t>] [--end-time <t>] [--timezone <iana_tz>]`
 - `delete-event --calendar-id <id> --event-id <id> --confirm <id_prefix>` ⚠️
 - `reply-event --calendar-id <id> --event-id <id> --status accept|decline|tentative`
-- `list-event-instances --calendar-id <id> --event-id <id> --start-time <rfc3339> --end-time <rfc3339>` — Expand recurring event instances (max 40-day window)
+- `list-event-instances --calendar-id <id> --event-id <id> --start-time <rfc3339> --end-time <rfc3339> [--timezone <iana_tz>]` — Expand recurring event instances (max 40-day window)
 - `list-attendees --calendar-id <id> --event-id <id>` — List event attendees
 - `create-attendees --calendar-id <id> --event-id <id> --attendees '<json_array>'` — Add attendees (user/resource/third_party)
 - `delete-attendees --calendar-id <id> --event-id <id> --attendee-ids '<json_array>' --confirm <id_prefix>` ⚠️
-- `list-freebusy --user-ids '<json_array>' --start-time <rfc3339> --end-time <rfc3339>` — Query free/busy for 1-10 users
+- `list-freebusy --user-ids '<json_array>' --start-time <rfc3339> --end-time <rfc3339> [--timezone <iana_tz>]` — Query free/busy for 1-10 users
+- Note: `--timezone` defaults to `Asia/Shanghai`. Only needed when time inputs lack timezone info (e.g. "2026-03-21 10:30"). RFC3339 with offset (e.g. "+08:00") ignores this flag.
 
 ### Search
 - `search-docs --query <keyword> [--type doc|sheet|bitable]`

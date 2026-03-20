@@ -310,6 +310,7 @@ def main():
     p.add_argument("--calendar-id", required=True)
     p.add_argument("--start-time", required=True, help="RFC3339 timestamp")
     p.add_argument("--end-time", required=True, help="RFC3339 timestamp")
+    p.add_argument("--timezone", default="Asia/Shanghai", help="IANA timezone for naive times")
     p.add_argument("--page-size", type=int, default=50)
     p.add_argument("--page-token")
 
@@ -324,6 +325,7 @@ def main():
     p.add_argument("--end-time", required=True)
     p.add_argument("--description")
     p.add_argument("--attendees", help="JSON array of attendee objects")
+    p.add_argument("--timezone", default="Asia/Shanghai", help="IANA timezone for naive times and display")
 
     p = sub.add_parser("update-event", help="Update calendar event")
     p.add_argument("--calendar-id", required=True)
@@ -332,6 +334,7 @@ def main():
     p.add_argument("--description")
     p.add_argument("--start-time")
     p.add_argument("--end-time")
+    p.add_argument("--timezone", default="Asia/Shanghai", help="IANA timezone for naive times and display")
 
     p = sub.add_parser("delete-event", help="Delete calendar event")
     p.add_argument("--calendar-id", required=True)
@@ -348,6 +351,7 @@ def main():
     p.add_argument("--event-id", required=True)
     p.add_argument("--start-time", required=True, help="RFC3339 timestamp")
     p.add_argument("--end-time", required=True, help="RFC3339 timestamp (max 40-day window)")
+    p.add_argument("--timezone", default="Asia/Shanghai", help="IANA timezone for naive times")
     p.add_argument("--page-size", type=int, default=50)
     p.add_argument("--page-token")
 
@@ -375,6 +379,7 @@ def main():
                    help="JSON array of user open_ids (max 10)")
     p.add_argument("--start-time", required=True, help="RFC3339 timestamp")
     p.add_argument("--end-time", required=True, help="RFC3339 timestamp")
+    p.add_argument("--timezone", default="Asia/Shanghai", help="IANA timezone for naive times")
 
     # --- Search ---
     p = sub.add_parser("search-docs", help="Search documents")
@@ -734,7 +739,8 @@ def main():
                                 start_time=args.start_time,
                                 end_time=args.end_time,
                                 page_size=args.page_size,
-                                page_token=args.page_token))
+                                page_token=args.page_token,
+                                timezone=args.timezone))
 
     elif cmd == "get-event":
         mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
@@ -753,7 +759,8 @@ def main():
                                  start_time=args.start_time,
                                  end_time=args.end_time,
                                  description=args.description,
-                                 attendees=attendees))
+                                 attendees=attendees,
+                                 timezone=args.timezone))
 
     elif cmd == "update-event":
         mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
@@ -765,6 +772,7 @@ def main():
         _output(mod.update_event(chat_id, sender_id,
                                  calendar_id=args.calendar_id,
                                  event_id=args.event_id,
+                                 timezone=args.timezone,
                                  **kwargs))
 
     elif cmd == "delete-event":
@@ -789,7 +797,8 @@ def main():
                                          start_time=args.start_time,
                                          end_time=args.end_time,
                                          page_size=args.page_size,
-                                         page_token=args.page_token))
+                                         page_token=args.page_token,
+                                         timezone=args.timezone))
 
     elif cmd == "list-attendees":
         mod = _init_module(FeishuCalendar, config, _user_token, _lark_client)
@@ -822,7 +831,8 @@ def main():
         _output(mod.list_freebusy(chat_id, sender_id,
                                   user_ids=user_ids,
                                   start_time=args.start_time,
-                                  end_time=args.end_time))
+                                  end_time=args.end_time,
+                                  timezone=args.timezone))
 
     # Search commands
     elif cmd == "search-docs":
