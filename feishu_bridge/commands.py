@@ -79,7 +79,15 @@ class BridgeCommandHandler:
             if not sid:
                 handle.deliver("当前没有活跃会话，无需压缩。")
                 return
-            result = self.bot.runner.run(prompt, session_id=sid, resume=True, tag=tag)
+            handle.send_processing_indicator()
+
+            def on_stream(text_so_far):
+                handle.stream_update(text_so_far)
+
+            result = self.bot.runner.run(
+                prompt, session_id=sid, resume=True, tag=tag,
+                on_output=on_stream,
+            )
             if not result["is_error"]:
                 new_sid = result.get("session_id") or sid
                 if new_sid != sid:
