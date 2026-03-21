@@ -659,7 +659,72 @@ def main():
     p.add_argument("--rule-id", required=True, type=int, help="Rule ID (int)")
     p.add_argument("--confirm", required=True, help="Rule ID prefix for safety")
 
+    # --- IM (bot messages) ---
+    p = sub.add_parser("send-message",
+                       help="Send a bot message to a chat (no user auth needed)")
+    p.add_argument("--chat-id", required=True,
+                   help="Feishu chat_id (e.g. oc_xxx)")
+    p.add_argument("--text", help="Plain text message content")
+    p.add_argument("--msg-type", default="text",
+                   help="Message type: text, interactive, post (default: text)")
+    p.add_argument("--content",
+                   help="Raw JSON content string (for non-text msg types)")
+
     args = parser.parse_args()
+
+    # --- Bot-only commands (no user auth / FEISHU_AUTH_FILE needed) ---
+    if args.command == "send-message":
+        if args.text and args.content:
+            _output({"error": "--text and --content are mutually exclusive"})
+            sys.exit(1)
+        if args.text and args.msg_type != "text":
+            _output({"error": "--text can only be used with --msg-type text"})
+            sys.exit(1)
+
+        try:
+            import lark_oapi as lark
+            from lark_oapi.api.im.v1 import (
+                CreateMessageRequest, CreateMessageRequestBody,
+            )
+
+            config = _load_config()
+            client = lark.Client.builder() \
+                .app_id(config["app_id"]) \
+                .app_secret(config["app_secret"]) \
+                .domain(lark.FEISHU_DOMAIN) \
+                .log_level(lark.LogLevel.WARNING) \
+                .build()
+
+            if args.text:
+                content = json.dumps({"text": args.text})
+            elif args.content:
+                content = args.content
+            else:
+                _output({"error": "Either --text or --content is required"})
+                sys.exit(1)
+
+            body = CreateMessageRequestBody.builder() \
+                .receive_id(args.chat_id) \
+                .msg_type(args.msg_type) \
+                .content(content) \
+                .build()
+            req = CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(body) \
+                .build()
+            resp = client.im.v1.message.create(req)
+            if resp.success():
+                mid = resp.data.message_id if resp.data else None
+                _output({"message_id": mid})
+            else:
+                _output({"error": resp.msg, "code": resp.code})
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _output({"error": str(e)})
+            sys.exit(1)
+        return
 
     # Load auth and config
     auth = _load_auth()
