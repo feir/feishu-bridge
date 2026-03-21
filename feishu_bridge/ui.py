@@ -589,7 +589,7 @@ class ResponseHandle:
         self._card_fallback_timeout = 8
         self._summary_updated = False
         self._terminated = False
-        self._stream_start_time: Optional[float] = None
+        self._handle_start_time: float = time.time()
         self._runner: Optional[ClaudeRunner] = None
         self._runner_tag: Optional[str] = None
 
@@ -642,7 +642,6 @@ class ResponseHandle:
                 msg_id = self._send_cardkit_im(card_id)
                 if msg_id:
                     self.card_message_id = msg_id
-                    self._stream_start_time = time.time()
                     log.info("CardKit card created (deferred): card_id=%s msg_id=%s",
                              card_id, msg_id)
                     self._flush_ctrl = FlushController(self._perform_flush, use_cardkit=True)
@@ -714,9 +713,7 @@ class ResponseHandle:
             self._deliver_im_patch(content, is_error)
             return
 
-        elapsed_s = 0.0
-        if self._stream_start_time:
-            elapsed_s = time.time() - self._stream_start_time
+        elapsed_s = time.time() - self._handle_start_time
         seq = self._next_seq()
         final_card_json = build_cardkit_final_card(content, is_error, elapsed_s=elapsed_s)
         try:
