@@ -623,8 +623,8 @@ def main():
     p.add_argument("--body-plain", help="Plain text body")
     p.add_argument("--cc", action="append", help="CC recipient (repeatable)")
     p.add_argument("--bcc", action="append", help="BCC recipient (repeatable)")
-    p.add_argument("--from-address", help="Sender alias email address")
-    p.add_argument("--from-name", help="Sender display name")
+    p.add_argument("--from-address", help="Sender alias email (NOTE: Feishu API ignores this, always uses primary mailbox)")
+    p.add_argument("--from-name", help="Sender display name (works via head_from)")
     p.add_argument("--attachment", action="append", dest="attachments",
                    help="File path to attach (repeatable)")
 
@@ -1326,6 +1326,7 @@ def main():
         except ValueError as e:
             _output({"error": str(e)})
             sys.exit(1)
+
 
     elif cmd == "list-mail":
         mod = _init_module(FeishuMail, config, _user_token, _lark_client)

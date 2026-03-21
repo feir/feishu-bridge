@@ -43,18 +43,18 @@ class FeishuMail(FeishuAPI):
     # Send
     # ------------------------------------------------------------------
 
-    def send_message(self, chat_id: str, user_open_id: str, *,
-                     to: list[dict],
-                     subject: str,
-                     body_html: str = None,
-                     body_plain: str = None,
-                     cc: list[dict] = None,
-                     bcc: list[dict] = None,
-                     from_address: str = None,
-                     from_name: str = None,
-                     attachment_paths: list[str] = None,
-                     ) -> Optional[dict]:
-        """Send an email via Feishu mail API.
+    def _build_message_payload(self, *,
+                               to: list[dict],
+                               subject: str,
+                               body_html: str = None,
+                               body_plain: str = None,
+                               cc: list[dict] = None,
+                               bcc: list[dict] = None,
+                               from_address: str = None,
+                               from_name: str = None,
+                               attachment_paths: list[str] = None,
+                               ) -> dict:
+        """Build a mail message payload used by both send and draft.
 
         Args:
             to: [{"mail_address": "...", "name": "..."}]
@@ -62,16 +62,14 @@ class FeishuMail(FeishuAPI):
             body_html: HTML body (at least one of body_html/body_plain required)
             body_plain: plain text body
             cc/bcc: same format as to
-            from_address: alias email address for head_from
-            from_name: display name for head_from
+            from_address: alias email address for head_from (note: Feishu API
+                silently ignores this and always uses the primary mailbox address;
+                only from_name is honoured for display name override)
+            from_name: display name for head_from (this works)
             attachment_paths: list of local file paths to attach
         """
         if not body_html and not body_plain:
             raise ValueError("At least one of body_html or body_plain is required")
-
-        token = self.get_token(chat_id, user_open_id)
-        if not token:
-            return None
 
         payload = {
             "subject": subject,
@@ -122,7 +120,18 @@ class FeishuMail(FeishuAPI):
                 })
             payload["attachments"] = attachments
 
-        # Auto-generate dedupe_key to prevent duplicate sends on retry
+        return payload
+
+    def send_message(self, chat_id: str, user_open_id: str, **kwargs) -> Optional[dict]:
+        """Send an email via Feishu mail API.
+
+        Accepts the same keyword arguments as _build_message_payload().
+        """
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        payload = self._build_message_payload(**kwargs)
         payload["dedupe_key"] = str(_uuid.uuid4())
 
         return self.request(
