@@ -106,6 +106,16 @@ def _load_auth():
 
 def _load_config():
     """Load app credentials from bridge config."""
+    # Auto-load .env next to config.json so ${VAR} placeholders resolve
+    _env_file = Path.home() / ".config" / "feishu-bridge" / ".env"
+    if _env_file.is_file():
+        with open(_env_file) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _, _v = _line.partition("=")
+                    os.environ.setdefault(_k.strip(), _v.strip())
+
     bot_name = os.environ.get("FEISHU_BOT_NAME")
 
     # Use shared config discovery chain
@@ -401,6 +411,9 @@ def main():
     p.add_argument("--end-time")
     p.add_argument("--page-size", type=int, default=20)
     p.add_argument("--page-token")
+
+    p = sub.add_parser("read-message", help="Read a message by ID")
+    p.add_argument("--message-id", required=True, help="Message ID (om_xxx)")
 
     p = sub.add_parser("list-files", help="List Drive files")
     p.add_argument("--folder-token")
@@ -1050,6 +1063,31 @@ def main():
                                   end_time=args.end_time,
                                   page_size=args.page_size,
                                   page_token=args.page_token))
+
+    elif cmd == "read-message":
+        from feishu_bridge.parsers import fetch_quoted_message
+        if not _lark_client:
+            print(json.dumps({"error": "lark_client not available"}))
+            sys.exit(1)
+        # Fetch raw message for metadata + parsed content
+        from lark_oapi.api.im.v1 import GetMessageRequest
+        req = GetMessageRequest.builder().message_id(
+            args.message_id).build()
+        resp = _lark_client.im.v1.message.get(req)
+        if resp.success() and resp.data and resp.data.items:
+            msg = resp.data.items[0]
+            parsed = fetch_quoted_message(
+                _lark_client, args.message_id) or {}
+            _output({
+                "message_id": args.message_id,
+                "msg_type": msg.msg_type,
+                "content": parsed.get("content", ""),
+                "sender_id": parsed.get("sender_id"),
+                "create_time": msg.create_time,
+            })
+        else:
+            _output(fetch_quoted_message(
+                _lark_client, args.message_id))
 
     elif cmd == "list-files":
         mod = _init_module(FeishuSearch, config, _user_token, _lark_client)

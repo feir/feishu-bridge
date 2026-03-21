@@ -190,6 +190,15 @@ def fetch_quoted_message(lark_client, message_id: str) -> Optional[dict]:
             text = f"[分享群聊: {content.get('chat_name', '')}]"
         elif msg_type == "share_user":
             text = "[分享联系人]"
+        elif msg_type == "todo":
+            # Todo body: {"task_id": "...", "summary": {"content": [[{tag, text}]]}}
+            summary = content.get("summary", {})
+            parts = []
+            for line in summary.get("content", []):
+                for elem in line:
+                    if elem.get("tag") == "text":
+                        parts.append(elem.get("text", ""))
+            text = "".join(parts) or "[todo]"
         else:
             text = f"[{msg_type}]"
 
