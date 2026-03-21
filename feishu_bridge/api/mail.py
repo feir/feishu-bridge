@@ -29,10 +29,13 @@ class FeishuMail(FeishuAPI):
     SCOPES = [
         "mail:user_mailbox.message:readonly",
         "mail:user_mailbox.message:send",
+        "mail:user_mailbox.message.subject:read",
+        "mail:user_mailbox.message.address:read",
+        "mail:user_mailbox.message.body:read",
         "mail:user_mailbox.folder:read",
         "mail:user_mailbox.folder:write",
         "mail:user_mailbox.rule:write",
-        "mail:user_mailbox.rule:readonly",
+        "mail:user_mailbox.rule:read",
     ]
     BASE_PATH = "/open-apis/mail/v1"
 
@@ -164,13 +167,30 @@ class FeishuMail(FeishuAPI):
 
     def get_message(self, chat_id: str, user_open_id: str, *,
                     message_id: str) -> Optional[dict]:
-        """Get full email content by message_id."""
+        """Get full email content by message_id.
+
+        Decodes base64url-encoded body_html and body_plain_text fields
+        (Feishu returns them encoded in the get response).
+        """
         token = self.get_token(chat_id, user_open_id)
         if not token:
             return None
-        return self.request(
+        data = self.request(
             "GET", f"/user_mailboxes/me/messages/{message_id}", token,
         )
+        # Decode base64url body fields if present
+        msg = data.get("message", data)
+        for field in ("body_html", "body_plain_text"):
+            raw = msg.get(field)
+            if raw:
+                try:
+                    # Re-add padding for base64url decode
+                    pad = 4 - len(raw) % 4
+                    decoded = base64.urlsafe_b64decode(raw + "=" * (pad % 4))
+                    msg[field] = decoded.decode("utf-8", errors="replace")
+                except Exception:
+                    pass  # Leave as-is if decode fails
+        return data
 
     # ------------------------------------------------------------------
     # Folders

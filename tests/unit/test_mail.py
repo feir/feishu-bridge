@@ -21,7 +21,7 @@ class TestFeishuMailInit:
     """Test mail module instantiation and attributes."""
 
     def test_scopes_defined(self):
-        assert len(FeishuMail.SCOPES) == 6
+        assert len(FeishuMail.SCOPES) == 9
         assert all(s.startswith("mail:") for s in FeishuMail.SCOPES)
 
     def test_base_path(self):
