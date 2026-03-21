@@ -1375,6 +1375,21 @@ def main():
         _output({"error": f"Unknown command: {cmd}"})
         sys.exit(1)
 
+    # Clean up auth card if one was sent during this CLI invocation.
+    # The auth flow persists the card msg_id via save_auth_card_id();
+    # we delete the card here so it doesn't linger in the user's chat.
+    if sender_id and config:
+        try:
+            from feishu_bridge.api.auth import read_auth_card_id, remove_auth_card_id
+            from feishu_bridge.api.client import FeishuAPI
+            card_id = read_auth_card_id(config["app_id"], sender_id)
+            if card_id:
+                mod = _init_module(FeishuAPI, config, _user_token, _lark_client)
+                if mod.cleanup_auth_card(sender_id):
+                    log.debug("Auth card cleaned up: %s", card_id)
+        except Exception:
+            pass  # Best-effort — don't fail the CLI on cleanup errors
+
 
 if __name__ == "__main__":
     main()
