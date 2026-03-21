@@ -512,10 +512,6 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
     return {
         "schema": "2.0",
         "config": config,
-        "header": {
-            "title": {"content": ("❌ " if is_error else "✅ ") + ("错误" if is_error else _bot_display_name)},
-            "template": "red" if is_error else "green",
-        },
         "body": {"elements": elements},
     }
 
