@@ -94,22 +94,47 @@ def _auth_card_path(app_id: str, user_open_id: str) -> Path:
 
 
 def save_auth_card_id(app_id: str, user_open_id: str, msg_id: str):
-    """Persist auth card msg_id so the caller can delete it after delivery."""
+    """Persist auth card msg_id so the caller can delete it after delivery.
+
+    Uses atomic write with 0o600 permissions, matching save_token pattern.
+    """
+    import tempfile
     TOKEN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _auth_card_path(app_id, user_open_id).write_text(msg_id)
-
-
-def pop_auth_card_id(app_id: str, user_open_id: str) -> Optional[str]:
-    """Read and remove persisted auth card msg_id. Returns None if absent."""
+    TOKEN_DIR.chmod(0o700)
     path = _auth_card_path(app_id, user_open_id)
-    if not path.exists():
-        return None
+    fd, tmp_path = tempfile.mkstemp(dir=TOKEN_DIR)
+    fd_open = True
     try:
-        msg_id = path.read_text().strip()
-        path.unlink(missing_ok=True)
+        os.write(fd, msg_id.encode())
+        os.fchmod(fd, 0o600)
+        os.close(fd)
+        fd_open = False
+        os.replace(tmp_path, str(path))
+    except BaseException:
+        if fd_open:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def read_auth_card_id(app_id: str, user_open_id: str) -> Optional[str]:
+    """Read persisted auth card msg_id without removing it. Returns None if absent."""
+    try:
+        msg_id = _auth_card_path(app_id, user_open_id).read_text().strip()
         return msg_id or None
-    except OSError:
+    except (OSError, FileNotFoundError):
         return None
+
+
+def remove_auth_card_id(app_id: str, user_open_id: str):
+    """Remove persisted auth card msg_id file. No-op if absent."""
+    try:
+        _auth_card_path(app_id, user_open_id).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def save_token(app_id: str, user_open_id: str, token_data: dict):
@@ -747,10 +772,14 @@ class FeishuAuth:
         """Delete the auth card from chat after result delivery.
 
         Reads the persisted auth card msg_id (written by this or a CLI
-        subprocess), deletes the Feishu message, and removes the file.
+        subprocess), deletes the Feishu message, and removes the IPC file
+        only on success — so a transient API failure can be retried.
         Cross-process safe — uses filesystem for IPC.
         """
-        msg_id = pop_auth_card_id(self.app_id, user_open_id)
+        msg_id = read_auth_card_id(self.app_id, user_open_id)
         if not msg_id:
             return False
-        return self._delete_message(msg_id)
+        if self._delete_message(msg_id):
+            remove_auth_card_id(self.app_id, user_open_id)
+            return True
+        return False

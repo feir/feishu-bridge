@@ -612,11 +612,6 @@ def process_message(
         if not handle._terminated:
             handle.deliver(result["result"], is_error=result["is_error"])
 
-        # Delete the auth card so it doesn't remain as the last message.
-        # The auth card msg_id is persisted to disk by auth.py (or a CLI
-        # subprocess), so this works cross-process.
-        _cleanup_auth_card(feishu_docs, sender_id)
-
         return handle
 
     except Exception as e:
@@ -646,5 +641,11 @@ def process_message(
                 os.unlink(image_path)
             except OSError:
                 pass
+        # Delete the auth card so it doesn't linger in chat.
+        # In finally so it runs on exceptions/cancellations too.
+        # Falls back to any available FeishuAPI instance.
+        _cleanup_auth_card(
+            feishu_docs or feishu_tasks or feishu_sheets, sender_id
+        )
 
     return handle

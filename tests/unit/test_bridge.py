@@ -1553,6 +1553,8 @@ def test_autofetch_never_contains_auth_card_text():
     class FakeDocs:
         def get_cached_token(self, user_open_id):
             return None
+        def cleanup_auth_card(self, user_open_id):
+            return False
 
     captured = {}
 
@@ -2269,3 +2271,120 @@ def test_session_map_legacy_non_claude_cleared(tmp_path):
     assert sm.get(("k1",)) is None  # cleared
     data = json.loads(path.read_text())
     assert data["_agent_type"] == "codex"
+
+
+# ---------------------------------------------------------------------------
+# Auth card IPC — save / read / remove / cleanup
+# ---------------------------------------------------------------------------
+
+class TestAuthCardIPC:
+    """Tests for file-based auth card IPC (save/read/remove)."""
+
+    def test_save_read_roundtrip(self, tmp_path, monkeypatch):
+        """save → read returns the same msg_id."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        feishu_auth.save_auth_card_id("app1", "user1", "om_msg_abc123")
+        assert feishu_auth.read_auth_card_id("app1", "user1") == "om_msg_abc123"
+
+    def test_save_file_permissions(self, tmp_path, monkeypatch):
+        """IPC file must have 0600 permissions."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        feishu_auth.save_auth_card_id("app1", "user1", "msg123")
+        path = feishu_auth._auth_card_path("app1", "user1")
+        mode = oct(path.stat().st_mode & 0o777)
+        assert mode == "0o600"
+
+    def test_read_missing_returns_none(self, tmp_path, monkeypatch):
+        """Reading non-existent IPC file returns None."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        assert feishu_auth.read_auth_card_id("app1", "nobody") is None
+
+    def test_read_empty_returns_none(self, tmp_path, monkeypatch):
+        """Reading an empty IPC file returns None."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        path = feishu_auth._auth_card_path("app1", "user1")
+        path.write_text("")
+        assert feishu_auth.read_auth_card_id("app1", "user1") is None
+
+    def test_remove_deletes_file(self, tmp_path, monkeypatch):
+        """remove_auth_card_id deletes the IPC file."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        feishu_auth.save_auth_card_id("app1", "user1", "msg456")
+        feishu_auth.remove_auth_card_id("app1", "user1")
+        assert feishu_auth.read_auth_card_id("app1", "user1") is None
+
+    def test_remove_missing_is_noop(self, tmp_path, monkeypatch):
+        """remove on non-existent file does not raise."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        feishu_auth.remove_auth_card_id("app1", "nobody")  # should not raise
+
+    def test_save_overwrites_previous(self, tmp_path, monkeypatch):
+        """Second save overwrites first."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        feishu_auth.save_auth_card_id("app1", "user1", "old_msg")
+        feishu_auth.save_auth_card_id("app1", "user1", "new_msg")
+        assert feishu_auth.read_auth_card_id("app1", "user1") == "new_msg"
+
+
+class TestCleanupAuthCard:
+    """Tests for cleanup_auth_card — delete API before unlinking file."""
+
+    def test_cleanup_deletes_file_on_api_success(self, tmp_path, monkeypatch):
+        """File is removed only after successful API delete."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        feishu_auth.save_auth_card_id("app1", "user1", "msg_ok")
+
+        auth = feishu_auth.FeishuAuth.__new__(feishu_auth.FeishuAuth)
+        auth.app_id = "app1"
+        auth.lark_client = None
+        monkeypatch.setattr(auth, "_delete_message", lambda msg_id: True)
+
+        assert auth.cleanup_auth_card("user1") is True
+        assert feishu_auth.read_auth_card_id("app1", "user1") is None
+
+    def test_cleanup_keeps_file_on_api_failure(self, tmp_path, monkeypatch):
+        """File is NOT removed when API delete fails — allows retry."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        feishu_auth.save_auth_card_id("app1", "user1", "msg_fail")
+
+        auth = feishu_auth.FeishuAuth.__new__(feishu_auth.FeishuAuth)
+        auth.app_id = "app1"
+        auth.lark_client = None
+        monkeypatch.setattr(auth, "_delete_message", lambda msg_id: False)
+
+        assert auth.cleanup_auth_card("user1") is False
+        # File still exists for future retry
+        assert feishu_auth.read_auth_card_id("app1", "user1") == "msg_fail"
+
+    def test_cleanup_no_file_returns_false(self, tmp_path, monkeypatch):
+        """No IPC file → returns False, no API call."""
+        monkeypatch.setattr(feishu_auth, "TOKEN_DIR", tmp_path)
+        delete_called = []
+
+        auth = feishu_auth.FeishuAuth.__new__(feishu_auth.FeishuAuth)
+        auth.app_id = "app1"
+        auth.lark_client = None
+        monkeypatch.setattr(auth, "_delete_message",
+                            lambda msg_id: delete_called.append(msg_id) or True)
+
+        assert auth.cleanup_auth_card("user1") is False
+        assert delete_called == []  # never called
+
+
+class TestWorkerCleanupAuthCard:
+    """Tests for _cleanup_auth_card worker helper."""
+
+    def test_noop_when_no_module(self):
+        """No crash when feishu_mod is None."""
+        bridge_worker._cleanup_auth_card(None, "user1")
+
+    def test_noop_when_no_sender(self):
+        """No crash when sender_id is empty."""
+        bridge_worker._cleanup_auth_card(object(), "")
+
+    def test_swallows_exceptions(self):
+        """Exceptions are swallowed — best-effort cleanup."""
+        class BadMod:
+            def cleanup_auth_card(self, uid):
+                raise RuntimeError("boom")
+        bridge_worker._cleanup_auth_card(BadMod(), "user1")  # should not raise
