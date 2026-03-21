@@ -450,6 +450,12 @@ SCOPE_DESCRIPTIONS = {
     "task:task:read": "任务只读",
     "task:task:write": "任务读写",
     "task:tasklist:read": "任务清单只读",
+    "mail:user_mailbox.message:readonly": "邮件读取",
+    "mail:user_mailbox.message:send": "邮件发送",
+    "mail:user_mailbox.folder:read": "邮件文件夹只读",
+    "mail:user_mailbox.folder:write": "邮件文件夹管理",
+    "mail:user_mailbox.rule:write": "邮件规则管理",
+    "mail:user_mailbox.rule:readonly": "邮件规则只读",
 }
 
 def build_app_scope_missing_card(app_id: str, scopes: list[str]) -> dict:

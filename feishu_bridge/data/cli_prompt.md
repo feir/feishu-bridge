@@ -113,6 +113,27 @@ Call it with `feishu-cli <command> [args]`.
 - `upload-file --file <local_path> [--folder-token <token>] [--file-name <name>]` — Upload a local file to Drive (max 20MB, default: root folder)
 - `upload-url --url <source_url> [--folder-token <token>] [--file-name <name>]` — Download from URL and upload to Drive (max 20MB, default: root folder)
 
+### Mail (邮件)
+- `send-mail --to <email> --subject <title> --body-html <html> [--body-plain <text>] [--cc <email>] [--bcc <email>] [--from-address <alias>] [--from-name <name>] [--attachment <path>]` — Send an email
+  - `--to`, `--cc`, `--bcc`, `--attachment` are repeatable for multiple values
+  - At least one of `--body-html` or `--body-plain` is required
+  - `--from-address`: send from an alias email (e.g. jerry@xiao-llc.com)
+  - `--attachment`: local file path, max 25MB/file, 50MB total
+- `list-mail [--folder <name_or_id>] [--unread] [--page-size N] [--page-token <token>]` — List emails
+  - `--folder` accepts folder name (e.g. "INBOX", case-insensitive) or folder_id string
+- `read-mail --message-id <id>` — Read full email content
+- `list-mail-folders [--folder-type 1|2]` — List mail folders (1=system, 2=user)
+- `create-mail-folder --name <name> [--parent-folder-id <int>]` — Create a mail folder
+- `list-mail-rules` — List mail rules
+- `create-mail-rule --name <name> --condition '<json>' --action '<json>' [--disabled] [--stop-after-match]` — Create a mail rule
+  - Condition: `'{"match_type": 1, "items": [{"type": 6, "operator": 1, "input": "invoice"}]}'`
+    - match_type: 1=all, 2=any
+    - type: 1=from, 2=to, 6=subject, 7=body
+    - operator: 1=contains, 5=equals
+  - Action: `'{"items": [{"type": 11, "input": "folder_id"}]}'`
+    - type: 1=archive, 3=mark_read, 9=flag, 11=move_to_folder
+- `delete-mail-rule --rule-id <int> --confirm <id_prefix>` ⚠️
+
 ### Tasks (任务)
 - `list-tasks [--completed true|false] [--page-size N]` — List tasks visible to user
 - `get-task --guid <task_guid>` — Get task details by GUID

@@ -29,6 +29,7 @@ from feishu_bridge.api.search import FeishuSearch
 from feishu_bridge.api.bitable import FeishuBitable
 from feishu_bridge.api.tasks import FeishuTasks
 from feishu_bridge.api.drive import FeishuDrive
+from feishu_bridge.api.mail import FeishuMail
 
 
 def _parse_due(value: str) -> str:
@@ -613,6 +614,50 @@ def main():
     p = sub.add_parser("remove-task-from-tasklist", help="Remove a task from a task list")
     p.add_argument("--task-guid", required=True, help="Task GUID")
     p.add_argument("--tasklist-guid", required=True, help="Tasklist GUID")
+
+    # --- Mail ---
+    p = sub.add_parser("send-mail", help="Send an email")
+    p.add_argument("--to", required=True, action="append", help="Recipient email (repeatable)")
+    p.add_argument("--subject", required=True)
+    p.add_argument("--body-html", help="HTML body")
+    p.add_argument("--body-plain", help="Plain text body")
+    p.add_argument("--cc", action="append", help="CC recipient (repeatable)")
+    p.add_argument("--bcc", action="append", help="BCC recipient (repeatable)")
+    p.add_argument("--from-address", help="Sender alias email address")
+    p.add_argument("--from-name", help="Sender display name")
+    p.add_argument("--attachment", action="append", dest="attachments",
+                   help="File path to attach (repeatable)")
+
+    p = sub.add_parser("list-mail", help="List emails in a folder")
+    p.add_argument("--folder", help="Folder name (e.g. INBOX) or folder_id")
+    p.add_argument("--unread", action="store_true", help="Only unread messages")
+    p.add_argument("--page-size", type=int, default=20)
+    p.add_argument("--page-token")
+
+    p = sub.add_parser("read-mail", help="Read an email by message ID")
+    p.add_argument("--message-id", required=True, help="Message ID")
+
+    p = sub.add_parser("list-mail-folders", help="List mail folders")
+    p.add_argument("--folder-type", type=int, help="1=system, 2=user")
+
+    p = sub.add_parser("create-mail-folder", help="Create a mail folder")
+    p.add_argument("--name", required=True, help="Folder name")
+    p.add_argument("--parent-folder-id", type=int, help="Parent folder ID (int)")
+
+    p = sub.add_parser("list-mail-rules", help="List mail rules")
+
+    p = sub.add_parser("create-mail-rule", help="Create a mail rule")
+    p.add_argument("--name", required=True, help="Rule display name")
+    p.add_argument("--condition", required=True, help="Condition JSON")
+    p.add_argument("--action", required=True, help="Action JSON")
+    p.add_argument("--disabled", action="store_true",
+                   help="Create rule as disabled (default: enabled)")
+    p.add_argument("--stop-after-match", action="store_true",
+                   help="Stop processing subsequent rules on match")
+
+    p = sub.add_parser("delete-mail-rule", help="Delete a mail rule")
+    p.add_argument("--rule-id", required=True, type=int, help="Rule ID (int)")
+    p.add_argument("--confirm", required=True, help="Rule ID prefix for safety")
 
     args = parser.parse_args()
 
@@ -1259,6 +1304,72 @@ def main():
                                     url=args.url,
                                     folder_token=args.folder_token,
                                     file_name=args.file_name))
+
+    # Mail commands
+    elif cmd == "send-mail":
+        if not args.body_html and not args.body_plain:
+            _output({"error": "At least one of --body-html or --body-plain is required"})
+            sys.exit(1)
+        mod = _init_module(FeishuMail, config, _user_token, _lark_client)
+        to = [{"mail_address": addr} for addr in args.to]
+        cc = [{"mail_address": addr} for addr in args.cc] if args.cc else None
+        bcc = [{"mail_address": addr} for addr in args.bcc] if args.bcc else None
+        try:
+            _output(mod.send_message(chat_id, sender_id,
+                                     to=to, subject=args.subject,
+                                     body_html=args.body_html,
+                                     body_plain=args.body_plain,
+                                     cc=cc, bcc=bcc,
+                                     from_address=args.from_address,
+                                     from_name=args.from_name,
+                                     attachment_paths=args.attachments))
+        except ValueError as e:
+            _output({"error": str(e)})
+            sys.exit(1)
+
+    elif cmd == "list-mail":
+        mod = _init_module(FeishuMail, config, _user_token, _lark_client)
+        _output(mod.list_messages(chat_id, sender_id,
+                                  folder=args.folder,
+                                  only_unread=args.unread,
+                                  page_size=args.page_size,
+                                  page_token=args.page_token))
+
+    elif cmd == "read-mail":
+        mod = _init_module(FeishuMail, config, _user_token, _lark_client)
+        _output(mod.get_message(chat_id, sender_id,
+                                message_id=args.message_id))
+
+    elif cmd == "list-mail-folders":
+        mod = _init_module(FeishuMail, config, _user_token, _lark_client)
+        _output(mod.list_folders(chat_id, sender_id,
+                                 folder_type=args.folder_type))
+
+    elif cmd == "create-mail-folder":
+        mod = _init_module(FeishuMail, config, _user_token, _lark_client)
+        _output(mod.create_folder(chat_id, sender_id,
+                                  name=args.name,
+                                  parent_folder_id=args.parent_folder_id))
+
+    elif cmd == "list-mail-rules":
+        mod = _init_module(FeishuMail, config, _user_token, _lark_client)
+        _output(mod.list_rules(chat_id, sender_id))
+
+    elif cmd == "create-mail-rule":
+        mod = _init_module(FeishuMail, config, _user_token, _lark_client)
+        condition = _safe_json_loads(args.condition, "--condition")
+        action = _safe_json_loads(args.action, "--action")
+        _output(mod.create_rule(chat_id, sender_id,
+                                name=args.name,
+                                condition=condition,
+                                action=action,
+                                is_enable=not args.disabled,
+                                ignore_the_rest_of_rules=args.stop_after_match))
+
+    elif cmd == "delete-mail-rule":
+        _confirm_guard(args, str(args.rule_id), "rule_id")
+        mod = _init_module(FeishuMail, config, _user_token, _lark_client)
+        _output(mod.delete_rule(chat_id, sender_id, rule_id=args.rule_id))
 
     else:
         _output({"error": f"Unknown command: {cmd}"})
