@@ -125,15 +125,15 @@ def read_auth_card_id(app_id: str, user_open_id: str) -> Optional[str]:
     try:
         msg_id = _auth_card_path(app_id, user_open_id).read_text().strip()
         return msg_id or None
-    except (OSError, FileNotFoundError):
+    except OSError:
         return None
 
 
 def remove_auth_card_id(app_id: str, user_open_id: str):
-    """Remove persisted auth card msg_id file. No-op if absent."""
+    """Remove persisted auth card msg_id file. No-op if absent or inaccessible."""
     try:
-        _auth_card_path(app_id, user_open_id).unlink()
-    except FileNotFoundError:
+        _auth_card_path(app_id, user_open_id).unlink(missing_ok=True)
+    except OSError:
         pass
 
 
