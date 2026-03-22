@@ -466,8 +466,9 @@ def download_file(lark_client, message_id: str, file_key: str,
     file_dir = Path(workspace) / ".tmp" / "feishu_files"
     file_dir.mkdir(parents=True, exist_ok=True)
 
-    # Preserve original extension, use uuid prefix to avoid collisions
-    safe_name = f"{uuid.uuid4().hex[:8]}_{file_name}"
+    # Strip path components to prevent traversal, preserve extension
+    base = Path(file_name).name
+    safe_name = f"{uuid.uuid4().hex[:8]}_{base}"
     dest = file_dir / safe_name
 
     try:

@@ -187,6 +187,7 @@ def process_message(
     handle = response_handle_cls(lark_client, chat_id, thread_id, message_id,
                                  bot_id=bot_id)
     image_path = None
+    file_path = None
     auth_file_path = None
     # Prefer runner's own signatures; fall back to caller-provided list for compat
     session_not_found_signatures = (
@@ -212,17 +213,18 @@ def process_message(
                 text = f"{text}\n\n[用户发送了一张图片，但下载失败]"
 
         if file_key and message_id:
+            display_name = file_name or "attachment"
             file_path = download_file_fn(
-                lark_client, message_id, file_key, file_name or "attachment",
+                lark_client, message_id, file_key, display_name,
                 bot_config["workspace"],
             )
             if file_path:
                 text = (
-                    f"{text}\n\n[用户发送了文件: {file_name}，"
+                    f"{text}\n\n[用户发送了文件: {display_name}，"
                     f"已保存到 {file_path}，请查看并回复]"
                 )
             else:
-                text = f"{text}\n\n[用户发送了文件: {file_name}，但下载失败]"
+                text = f"{text}\n\n[用户发送了文件: {display_name}，但下载失败]"
 
         should_fetch_quote = (
             (parent_id and not thread_id)
@@ -666,6 +668,11 @@ def process_message(
         if image_path:
             try:
                 os.unlink(image_path)
+            except OSError:
+                pass
+        if file_path:
+            try:
+                os.unlink(file_path)
             except OSError:
                 pass
         # Delete the auth card so it doesn't linger in chat.
