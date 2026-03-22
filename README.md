@@ -52,10 +52,12 @@
 | `/stop` `/cancel` | 取消当前任务 |
 | `/stop all` | 取消当前任务并清空待处理队列 |
 | `/compact [指令]` | 压缩上下文（仅 Claude） |
-| `/model` | 查看当前模型 |
-| `/model <alias>` | 切换模型（别名因 Agent 类型而异） |
-| `/cost` | 查看 token 用量和费用（仅 Claude） |
-| `/context` | 查看上下文使用率（含可视化进度条） |
+| `/model [模型名]` | 查看或切换模型（别名因 Agent 类型而异） |
+| `/status` | 查看会话状态（context / 费用 / 配额） |
+| `/feishu-tasks [命令]` | 飞书任务管理（list/get/subtasks/add-subtask） |
+| `/feishu-doc` | 云文档读写（Markdown） |
+| `/feishu-sheet` | 电子表格读写 |
+| `/feishu-bitable` | 多维表格操作 |
 | `/restart` | 重启 Bridge 进程（launchd/systemd 自动拉起） |
 | `/restart-all` | 重启所有 bot 实例 |
 | `/help` | 显示帮助 |
@@ -157,7 +159,7 @@ $ feishu-bridge --bot my-bot
 |------|--------|-------|
 | 流式输出 | 增量实时更新 | 等待完成后一次性显示 |
 | `/compact` | 支持 | 不支持 |
-| `/cost` 费用追踪 | 支持 | 不支持 |
+| `/status` 费用/配额 | 支持 | 不支持 |
 | 会话持久化 | session_id | thread_id |
 | 默认模型 | `claude-opus-4-6` | `gpt-5.2-codex` |
 

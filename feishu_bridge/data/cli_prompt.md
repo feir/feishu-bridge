@@ -67,6 +67,7 @@ Call it with `feishu-cli <command> [args]`.
 - `search-docs --query <keyword> [--type doc|sheet|bitable]`
 - `search-messages --query <keyword> [--chat-id <id>]`
 - `list-messages --container-id <chat_id> [--start-time <unix_ts>] [--end-time <unix_ts>]`
+- `read-message --message-id <id>` — Read a single message by ID
 - `list-files [--folder-token <token>]`
 
 ### Bitable (多维表格)
@@ -142,6 +143,7 @@ Call it with `feishu-cli <command> [args]`.
 - `list-tasklist-tasks --guid <tasklist_guid> [--completed true|false]` — List tasks in a task list
 - `create-task --summary <text> [--description <text>] [--due <unix_ts>] [--tasklist-guid <guid>]` — Create a new task
 - `complete-task --guid <task_guid>` — Mark a task as completed
+- `update-task --guid <task_guid> [--summary <text>] [--description <text>] [--due <date>] [--completed-at <ts|now|0>]` — Update task fields (use `--completed-at 0` to uncomplete)
 - `list-subtasks --guid <task_guid> [--page-size N]` — List subtasks of a task
 - `create-subtask --parent-guid <guid> --summary <text> [--due <unix_ts>]` — Create a subtask
 - `create-tasklist --name <name>` — Create a new task list
@@ -149,6 +151,10 @@ Call it with `feishu-cli <command> [args]`.
 - `delete-tasklist --guid <tasklist_guid> --confirm <guid_prefix>` ⚠️
 - `add-task-to-tasklist --task-guid <guid> --tasklist-guid <guid>` — Add a task to a list
 - `remove-task-from-tasklist --task-guid <guid> --tasklist-guid <guid>` — Remove a task from a list
+
+### Messaging (Bot)
+- `send-message --chat-id <id> --text <text>` — Send a bot text message to a chat (no user auth needed)
+- `send-message --chat-id <id> --msg-type interactive --content '<json>'` — Send a card/post message (raw JSON content)
 
 ## Important Notes
 - All output is JSON
