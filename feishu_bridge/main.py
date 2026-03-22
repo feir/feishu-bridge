@@ -601,6 +601,8 @@ class FeishuBot:
             # Lightweight parse (no network I/O)
             text = ""
             image_key = None
+            file_key = None
+            file_name = None
 
             _todo_task_id = None  # set by todo branch when auto_drive=True
             _card_message_id = None  # set for interactive msgs needing API re-fetch
@@ -615,6 +617,12 @@ class FeishuBot:
             elif msg_type == "image":
                 image_key = content.get("image_key")
                 if not image_key:
+                    return
+
+            elif msg_type == "file":
+                file_key = content.get("file_key")
+                file_name = content.get("file_name", "attachment")
+                if not file_key:
                     return
 
             elif msg_type == "post":
@@ -888,6 +896,8 @@ class FeishuBot:
                 "sender_id": sender_id,
                 "text": text,
                 "image_key": image_key,
+                "file_key": file_key,
+                "file_name": file_name,
                 "_queued_reaction_id": None,
                 "_todo_task_id": _todo_task_id,
                 "_card_message_id": _card_message_id,

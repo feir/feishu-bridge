@@ -7,6 +7,7 @@ import re
 import uuid
 
 from feishu_bridge.parsers import (
+    download_file,
     download_image,
     fetch_card_content,
     fetch_forward_messages,
@@ -162,6 +163,7 @@ def process_message(
     feishu_api_error_cls=None,
     response_handle_cls=ResponseHandle,
     download_image_fn=download_image,
+    download_file_fn=download_file,
     fetch_card_content_fn=fetch_card_content,
     fetch_forward_messages_fn=fetch_forward_messages,
     fetch_quoted_message_fn=fetch_quoted_message,
@@ -176,6 +178,8 @@ def process_message(
     sender_id = item.get("sender_id", "")
     text = item.get("text", "")
     image_key = item.get("image_key")
+    file_key = item.get("file_key")
+    file_name = item.get("file_name")
     message_id = item.get("message_id")
 
     key = (bot_id, chat_id, thread_id)
@@ -206,6 +210,19 @@ def process_message(
                 )
             else:
                 text = f"{text}\n\n[用户发送了一张图片，但下载失败]"
+
+        if file_key and message_id:
+            file_path = download_file_fn(
+                lark_client, message_id, file_key, file_name or "attachment",
+                bot_config["workspace"],
+            )
+            if file_path:
+                text = (
+                    f"{text}\n\n[用户发送了文件: {file_name}，"
+                    f"已保存到 {file_path}，请查看并回复]"
+                )
+            else:
+                text = f"{text}\n\n[用户发送了文件: {file_name}，但下载失败]"
 
         should_fetch_quote = (
             (parent_id and not thread_id)

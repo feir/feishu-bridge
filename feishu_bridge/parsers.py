@@ -458,3 +458,32 @@ def download_image(lark_client, message_id: str, image_key: str,
     except Exception:
         log.exception("Image download error")
         return None
+
+
+def download_file(lark_client, message_id: str, file_key: str,
+                  file_name: str, workspace: str) -> Optional[str]:
+    """Download Feishu file attachment to workspace/.tmp/feishu_files/."""
+    file_dir = Path(workspace) / ".tmp" / "feishu_files"
+    file_dir.mkdir(parents=True, exist_ok=True)
+
+    # Preserve original extension, use uuid prefix to avoid collisions
+    safe_name = f"{uuid.uuid4().hex[:8]}_{file_name}"
+    dest = file_dir / safe_name
+
+    try:
+        req = GetMessageResourceRequest.builder() \
+            .message_id(message_id) \
+            .file_key(file_key) \
+            .type("file") \
+            .build()
+
+        resp = lark_client.im.v1.message_resource.get(req)
+        if resp.success():
+            dest.write_bytes(resp.file.read())
+            log.info("File: %s (%d bytes)", dest.name, dest.stat().st_size)
+            return str(dest)
+        log.error("File download failed: %s %s", resp.code, resp.msg)
+        return None
+    except Exception:
+        log.exception("File download error")
+        return None
