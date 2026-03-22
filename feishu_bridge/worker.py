@@ -4,7 +4,10 @@ import json
 import logging
 import os
 import re
+import time
+import threading
 import uuid
+from pathlib import Path
 
 from feishu_bridge.parsers import (
     download_file,
@@ -19,6 +22,47 @@ from feishu_bridge.runtime import BaseRunner, SessionMap
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
 
 log = logging.getLogger("feishu-bridge")
+
+_MEDIA_MAX_AGE_SECS = 3600  # 1 hour
+
+
+def cleanup_stale_media(workspace: str, max_age: int = _MEDIA_MAX_AGE_SECS):
+    """Delete media files older than *max_age* seconds from temp dirs."""
+    cutoff = time.time() - max_age
+    dirs = [
+        Path(workspace) / ".tmp" / "feishu_imgs",
+        Path(workspace) / ".tmp" / "feishu_files",
+    ]
+    removed = 0
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            if f.is_file():
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        removed += 1
+                except OSError:
+                    pass
+    if removed:
+        log.info("Cleaned up %d stale media file(s)", removed)
+
+
+def start_media_cleanup_timer(workspace: str, interval: int = 600):
+    """Run cleanup_stale_media every *interval* seconds in a daemon thread."""
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                cleanup_stale_media(workspace)
+            except Exception:
+                log.exception("Media cleanup error")
+
+    t = threading.Thread(target=_loop, daemon=True, name="media-cleanup")
+    t.start()
+    log.info("Media cleanup timer started (interval=%ds, max_age=%ds)",
+             interval, _MEDIA_MAX_AGE_SECS)
 
 
 def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
@@ -715,16 +759,9 @@ def process_message(
                 os.unlink(auth_file_path)
             except OSError:
                 pass
-        if image_path:
-            try:
-                os.unlink(image_path)
-            except OSError:
-                pass
-        if file_path:
-            try:
-                os.unlink(file_path)
-            except OSError:
-                pass
+        # image_path / file_path are NOT deleted here — they may be needed
+        # in subsequent turns of the same session.  Stale files are cleaned
+        # up periodically by cleanup_stale_media().
         # Delete the auth card so it doesn't linger in chat.
         # In finally so it runs on exceptions/cancellations too.
         # Falls back to any available FeishuAPI instance.

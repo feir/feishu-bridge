@@ -66,6 +66,7 @@ from feishu_bridge.ui import (
 from feishu_bridge.worker import (
     format_task_detail_bridge as _bridge_worker_format_task_detail,
     process_message as _bridge_worker_process_message,
+    start_media_cleanup_timer,
 )
 from feishu_bridge.api.client import FeishuAPIError
 from feishu_bridge.api.tasks import FeishuTasks
@@ -513,6 +514,9 @@ class FeishuBot:
             )
             t.start()
         log.info("Started %d worker threads", WORKER_COUNT)
+
+        # Start periodic cleanup of stale downloaded media
+        start_media_cleanup_timer(self.workspace)
 
         # Build event handler (empty encrypt_key/token for WS mode)
         # Register reaction events with no-op handler to suppress SDK ERROR logs
