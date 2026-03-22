@@ -1,5 +1,6 @@
 """Feishu UI delivery helpers for Feishu bridge."""
 
+import copy
 import json
 import logging
 import re
@@ -251,6 +252,70 @@ def _build_action_buttons(markers: list[dict],
     return buttons
 
 
+def _prune_card_cache() -> None:
+    """Remove expired entries; evict oldest when over capacity.
+
+    Caller must hold _card_cache_lock.
+    """
+    now = time.time()
+    expired = [k for k, (exp, _) in _card_cache.items() if now > exp]
+    for k in expired:
+        del _card_cache[k]
+    while len(_card_cache) > _CARD_CACHE_MAX_SIZE:
+        oldest = min(_card_cache, key=lambda k: _card_cache[k][0])
+        del _card_cache[oldest]
+
+
+def rebuild_card_with_selection(card_ref: str,
+                                selected_label: str) -> dict | None:
+    """Rebuild a cached card with selected button highlighted and others disabled.
+
+    Returns a v2 card dict ready for callback response, or None on cache miss.
+    """
+    with _card_cache_lock:
+        entry = _card_cache.pop(card_ref, None)
+    if not entry:
+        return None
+    expiry, card = entry
+    if time.time() > expiry:
+        return None
+
+    card = copy.deepcopy(card)
+
+    # Walk elements to find action-button column_sets and update their state
+    for element in card["body"]["elements"]:
+        if element.get("tag") != "column_set":
+            continue
+        for col in element.get("columns", []):
+            buttons = col.get("elements", [])
+            has_action = any(
+                b.get("tag") == "button" and "action" in b.get("value", {})
+                for b in buttons
+            )
+            if not has_action:
+                continue
+            for btn in buttons:
+                if btn.get("tag") != "button":
+                    continue
+                value = btn.get("value", {})
+                if "action" not in value:
+                    continue
+                if value.get("label") == selected_label:
+                    text = btn["text"]["content"]
+                    if not text.startswith("✅"):
+                        btn["text"]["content"] = f"✅ {text}"
+                    btn["type"] = "primary_filled"
+                else:
+                    btn["type"] = "default"
+                btn["disabled"] = True
+                # Remove callback value so disabled buttons don't trigger
+                btn.pop("value", None)
+
+    # Override config for callback response
+    card["config"] = {"update_multi": True}
+    return card
+
+
 def _action_button(text: str, action: str, label: str,
                    chat_id: str, bot_id: str,
                    btn_type: str = "primary",
@@ -272,6 +337,12 @@ def _action_button(text: str, action: str, label: str,
 _unavailable_messages: dict[str, dict] = {}
 _UNAVAILABLE_TTL = 30 * 60
 _UNAVAILABLE_MAX_SIZE = 512
+
+# Card cache for preserving original content on button callbacks
+_card_cache: dict[str, tuple[float, dict]] = {}  # card_ref → (expiry_ts, card_dict)
+_card_cache_lock = threading.Lock()
+_CARD_CACHE_TTL = 2 * 3600  # 2 hours
+_CARD_CACHE_MAX_SIZE = 256
 
 MAX_DIV_CHARS = 10_000
 MAX_CARD_PAYLOAD_BYTES = 28 * 1024
@@ -668,7 +739,13 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
 
     # P1: action buttons (confirm/ask/choices) — suppressed when no chat_id/bot_id
     action_buttons = _build_action_buttons(markers, chat_id, bot_id)
+    card_ref = None
     if action_buttons:
+        # Inject card_ref into each button for cache lookup on callback
+        card_ref = uuid.uuid4().hex[:12]
+        for btn in action_buttons:
+            if "value" in btn:
+                btn["value"]["card_ref"] = card_ref
         elements.append({
             "tag": "column_set",
             "flex_mode": "flow",
@@ -718,11 +795,20 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
     if summary_text:
         config["summary"] = {"content": summary_text[:120]}
 
-    return {
+    card = {
         "schema": "2.0",
         "config": config,
         "body": {"elements": elements},
     }
+
+    # Cache the card so callbacks can rebuild with original content preserved
+    if card_ref:
+        with _card_cache_lock:
+            _prune_card_cache()
+            _card_cache[card_ref] = (time.time() + _CARD_CACHE_TTL,
+                                     copy.deepcopy(card))
+
+    return card
 
 
 def add_typing_indicator(lark_client, message_id: str) -> Optional[str]:

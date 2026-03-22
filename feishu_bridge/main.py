@@ -59,6 +59,7 @@ from feishu_bridge.runtime import (
 )
 from feishu_bridge.ui import (
     ResponseHandle,
+    rebuild_card_with_selection,
     remove_queued_reaction,
     remove_typing_indicator,
 )
@@ -996,16 +997,21 @@ class FeishuBot:
             except SessionQueueFull:
                 return _toast("warning", "消息过多，请稍后再试")
 
-            # Replace card: remove buttons, show selection confirmation
-            selected_card = {
-                "schema": "2.0",
-                "config": {"update_multi": True},
-                "body": {"elements": [{
-                    "tag": "markdown",
-                    "content": f"已选择: **{label}**",
-                }]},
-            }
-            return _toast("info", f"已选择: {label}", card_json=selected_card)
+            # Rebuild card: preserve original content, highlight selection
+            card_ref = value.get("card_ref")
+            rebuilt = (rebuild_card_with_selection(card_ref, label)
+                       if card_ref else None)
+            if not rebuilt:
+                # Cache miss (process restarted / expired) — minimal fallback
+                rebuilt = {
+                    "schema": "2.0",
+                    "config": {"update_multi": True},
+                    "body": {"elements": [{
+                        "tag": "markdown",
+                        "content": f"已选择: **{label}**",
+                    }]},
+                }
+            return _toast("info", f"已选择: {label}", card_json=rebuilt)
 
         except Exception:
             log.exception("on_card_action error")
