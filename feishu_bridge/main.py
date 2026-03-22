@@ -511,6 +511,7 @@ class FeishuBot:
             .register_p2_im_message_receive_v1(self._on_message) \
             .register_p2_im_message_reaction_created_v1(_noop_reaction) \
             .register_p2_im_message_reaction_deleted_v1(_noop_reaction) \
+            .register_p2_card_action_trigger(self._on_card_action) \
             .build()
 
         # Start WebSocket (blocking, auto-reconnect)
@@ -914,6 +915,91 @@ class FeishuBot:
 
         except Exception:
             log.exception("on_message error")
+
+    def _on_card_action(self, data):
+        """Handle interactive card button clicks — must return within 3 seconds."""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse, CallBackToast, CallBackCard,
+        )
+
+        def _toast(type_: str, content: str, card_json: dict | None = None):
+            resp = P2CardActionTriggerResponse()
+            resp.toast = CallBackToast()
+            resp.toast.type = type_
+            resp.toast.content = content
+            if card_json:
+                resp.card = CallBackCard()
+                resp.card.type = "raw"
+                resp.card.data = card_json
+            return resp
+
+        try:
+            action = data.event.action
+            value = action.value or {}
+            label = str(value.get("label", ""))[:200]
+            chat_id = value.get("chat_id")
+            bot_id = value.get("bot_id")
+
+            # Extract operator identity for auth + sender_id
+            operator = getattr(data.event, "operator", None)
+            sender_id = getattr(operator, "open_id", None) if operator else None
+
+            if not chat_id or not bot_id:
+                log.warning("Card action missing chat_id/bot_id: %s", value)
+                return _toast("warning", "按钮已过期")
+
+            # Authorization: enforce same allowed_users / allowed_chats gates
+            if sender_id:
+                if ("*" not in self.allowed_users
+                        and sender_id not in self.allowed_users):
+                    log.info("Card action rejected: user %s not allowed", sender_id)
+                    return _toast("warning", "无权操作")
+            if ("*" not in self.allowed_chats
+                    and chat_id not in self.allowed_chats):
+                log.info("Card action rejected: chat %s not allowed", chat_id)
+                return _toast("warning", "无权操作")
+
+            log.info("Card action: bot=%s chat=%s sender=%s label=%s",
+                     bot_id, chat_id, sender_id, label)
+
+            # Enqueue as a new user message through the normal pipeline
+            msg_key = SessionMap._key_str((bot_id, chat_id, None))
+            item = {
+                "bot_id": bot_id,
+                "chat_id": chat_id,
+                "thread_id": None,
+                "parent_id": None,
+                "message_id": None,
+                "sender_id": sender_id,
+                "text": label,
+                "image_key": None,
+                "_queued_reaction_id": None,
+                "_todo_task_id": None,
+                "_card_message_id": None,
+                "_merge_forward_message_id": None,
+                "_feishu_urls": [],
+                "_cost_store": self._session_cost,
+                "_queue_key": msg_key,
+            }
+            try:
+                self._chat_queue.enqueue(msg_key, item)
+            except SessionQueueFull:
+                return _toast("warning", "消息过多，请稍后再试")
+
+            # Replace card: remove buttons, show selection confirmation
+            selected_card = {
+                "schema": "2.0",
+                "config": {"update_multi": True},
+                "body": {"elements": [{
+                    "tag": "markdown",
+                    "content": f"已选择: **{label}**",
+                }]},
+            }
+            return _toast("info", f"已选择: {label}", card_json=selected_card)
+
+        except Exception:
+            log.exception("on_card_action error")
+            return _toast("error", "处理失败，请重试")
 
     def _handle_bridge_command(self, item: dict):
         self._command_handler().handle_bridge_command(item)

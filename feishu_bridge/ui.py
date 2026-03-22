@@ -5,6 +5,7 @@ import logging
 import re
 import threading
 import time
+import urllib.parse
 import uuid
 from typing import Optional
 
@@ -116,6 +117,156 @@ def _strip_invalid_image_keys(text: str) -> str:
     return _IMAGE_RE.sub(
         lambda m: m.group(0) if m.group(2).startswith("img_") else "", text,
     )
+
+# ---------------------------------------------------------------------------
+# P0: URL extraction + sidebar applink
+# ---------------------------------------------------------------------------
+
+_URL_RE = re.compile(r'(?<!\()\bhttps://\S+')
+_IMAGE_URL_RE = re.compile(r'!\[[^\]]*\]\(([^)\s]+)\)')
+
+SIDEBAR_APPLINK = "https://applink.feishu.cn/client/web_url/open"
+_MAX_SIDEBAR_URLS = 3
+_MAX_URL_LABEL_LEN = 40
+
+
+def extract_urls(content: str) -> list[str]:
+    """Extract unique https:// URLs from content, excluding markdown image URLs."""
+    image_urls = set(_IMAGE_URL_RE.findall(content))
+    seen: set[str] = set()
+    result: list[str] = []
+    for m in _URL_RE.finditer(content):
+        url = m.group().rstrip('.,;:!?)>]')
+        if url in seen or url in image_urls:
+            continue
+        seen.add(url)
+        result.append(url)
+        if len(result) >= _MAX_SIDEBAR_URLS:
+            break
+    return result
+
+
+def _url_label(url: str) -> str:
+    """Generate a short label for a URL: hostname/path_tail, max 40 chars."""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    path = parsed.path.rstrip("/")
+    tail = path.rsplit("/", 1)[-1] if "/" in path else path
+    label = f"{host}/{tail}" if tail else host
+    if len(label) > _MAX_URL_LABEL_LEN:
+        label = label[:_MAX_URL_LABEL_LEN - 1] + "…"
+    return label
+
+
+def to_sidebar_url(url: str) -> str:
+    """Generate a Feishu sidebar applink URL."""
+    return f"{SIDEBAR_APPLINK}?mode=sidebar-semi&url={urllib.parse.quote(url, safe='')}"
+
+
+def _build_url_buttons(content: str) -> list[dict]:
+    """Build CardKit v2 button elements for sidebar links from content URLs."""
+    urls = extract_urls(content)
+    buttons = []
+    for url in urls:
+        sidebar = to_sidebar_url(url)
+        buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": f"🔗 {_url_label(url)}"},
+            "type": "default",
+            "size": "small",
+            "multi_url": {
+                "url": sidebar,
+                "pc_url": sidebar,
+                "android_url": url,
+                "ios_url": url,
+            },
+        })
+    return buttons
+
+
+# ---------------------------------------------------------------------------
+# P1: Action marker protocol (strip / parse / button generation)
+# ---------------------------------------------------------------------------
+
+_MARKER_RE = re.compile(r'<!--\s*feishu:\w+\s+.*?-->', re.DOTALL)
+_MARKER_PARSE_RE = re.compile(
+    r'<!--\s*feishu:(?P<type>confirm|ask|choices)\s+(?P<json>.*?)-->',
+    re.DOTALL,
+)
+
+
+def strip_action_markers(text: str) -> str:
+    """Lightweight strip of all feishu action markers (for streaming path)."""
+    return _MARKER_RE.sub('', text)
+
+
+def parse_action_markers(content: str) -> tuple[str, list[dict]]:
+    """Parse and extract action markers from content.
+
+    Returns (clean_content, markers) where each marker is:
+        {"type": "confirm|ask|choices", "payload": <parsed JSON>}
+    """
+    markers: list[dict] = []
+    for m in _MARKER_PARSE_RE.finditer(content):
+        try:
+            payload = json.loads(m.group("json").strip())
+            markers.append({"type": m.group("type"), "payload": payload})
+        except (json.JSONDecodeError, ValueError):
+            log.debug("Failed to parse action marker: %s", m.group(0)[:80])
+    clean = _MARKER_RE.sub('', content)
+    return clean, markers
+
+
+def _build_action_buttons(markers: list[dict],
+                          chat_id: str | None = None,
+                          bot_id: str | None = None) -> list[dict]:
+    """Convert parsed action markers into CardKit v2 button elements."""
+    if not markers or not chat_id or not bot_id:
+        return []
+    buttons: list[dict] = []
+    for marker in markers:
+        mtype = marker["type"]
+        payload = marker["payload"]
+        if mtype == "confirm":
+            buttons.append(_action_button(
+                "✅ 确认", mtype, "确认", chat_id, bot_id,
+                btn_type="primary_filled"))
+            buttons.append(_action_button(
+                "❌ 取消", mtype, "取消", chat_id, bot_id,
+                btn_type="danger"))
+        elif mtype == "choices":
+            # payload is a list of strings
+            if isinstance(payload, list):
+                for opt in payload:
+                    buttons.append(_action_button(
+                        str(opt), mtype, str(opt), chat_id, bot_id))
+        elif mtype == "ask":
+            # payload has "options" list with "label" keys
+            options = payload.get("options", [])
+            for opt in options:
+                label = opt.get("label", "") if isinstance(opt, dict) else str(opt)
+                buttons.append(_action_button(
+                    label, mtype, label, chat_id, bot_id))
+    return buttons
+
+
+def _action_button(text: str, action: str, label: str,
+                   chat_id: str, bot_id: str,
+                   btn_type: str = "primary",
+                   btn_size: str = "medium") -> dict:
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": text},
+        "type": btn_type,
+        "size": btn_size,
+        "value": {
+            "action": action,
+            "label": label,
+            "chat_id": chat_id,
+            "bot_id": bot_id,
+        },
+    }
+
 
 _unavailable_messages: dict[str, dict] = {}
 _UNAVAILABLE_TTL = 30 * 60
@@ -462,41 +613,67 @@ def _format_elapsed(seconds: float) -> str:
     return f"{minutes}m{secs:.0f}s"
 
 
+def _format_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
 def build_cardkit_final_card(content: str, is_error: bool = False,
-                             elapsed_s: float = 0) -> dict:
+                             elapsed_s: float = 0,
+                             total_tokens: int = 0,
+                             chat_id: str | None = None,
+                             bot_id: str | None = None) -> dict:
+    # P1: parse action markers BEFORE optimize (Finding 6 ordering fix)
+    content, markers = parse_action_markers(content)
     content = optimize_markdown_style(content)
-    chunks: list[str] = []
-    remaining = content
-    while remaining:
-        if len(remaining) <= MAX_DIV_CHARS:
-            chunks.append(remaining)
-            break
-        split_at = MAX_DIV_CHARS
-        for sep in ["\n", " "]:
-            idx = remaining.rfind(sep, 0, split_at)
-            if idx > split_at // 2:
-                split_at = idx + 1
-                break
-        chunks.append(remaining[:split_at])
-        remaining = remaining[split_at:]
 
-    if not chunks:
-        chunks = ["(空回复)"]
-
+    # Single element — no chunking.  openclaw-lark proves Feishu handles
+    # arbitrarily long markdown in one element; splitting into multiple
+    # elements causes rendering issues when transitioning from streaming.
     elements = [
         {
             "tag": "markdown",
-            "element_id": f"{CARDKIT_ELEMENT_ID}_{i}" if i > 0 else CARDKIT_ELEMENT_ID,
-            "content": chunk,
-        }
-        for i, chunk in enumerate(chunks)
+            "element_id": CARDKIT_ELEMENT_ID,
+            "content": content or "(空回复)",
+        },
     ]
+
+    # P1: action buttons (confirm/ask/choices) — suppressed when no chat_id/bot_id
+    action_buttons = _build_action_buttons(markers, chat_id, bot_id)
+    if action_buttons:
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "flow",
+            "columns": [{
+                "tag": "column",
+                "width": "auto",
+                "elements": action_buttons,
+            }],
+        })
+
+    # P0: URL sidebar link buttons
+    url_buttons = _build_url_buttons(content)
+    if url_buttons:
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "flow",
+            "columns": [{
+                "tag": "column",
+                "width": "auto",
+                "elements": url_buttons,
+            }],
+        })
 
     # Footer with status and elapsed time
     status = "❌ 出错" if is_error else "✅ 完成"
     footer_parts = [status]
     if elapsed_s > 0:
         footer_parts.append(f"耗时 {_format_elapsed(elapsed_s)}")
+    if total_tokens > 0:
+        footer_parts.append(f"{_format_tokens(total_tokens)} tokens")
     elements.append({
         "tag": "markdown",
         "content": "---\n" + " · ".join(footer_parts),
@@ -568,11 +745,13 @@ class ResponseHandle:
 
     def __init__(self, lark_client, chat_id: str,
                  thread_id: Optional[str] = None,
-                 source_message_id: Optional[str] = None):
+                 source_message_id: Optional[str] = None,
+                 bot_id: Optional[str] = None):
         self.client = lark_client
         self.chat_id = chat_id
         self.thread_id = thread_id
         self.source_message_id = source_message_id
+        self.bot_id = bot_id
         self.card_message_id: Optional[str] = None
         self._use_cardkit = False
         self._cardkit_card_id: Optional[str] = None
@@ -660,7 +839,8 @@ class ResponseHandle:
                 return True
             return False
 
-    def deliver(self, content: str, is_error: bool = False):
+    def deliver(self, content: str, is_error: bool = False,
+                total_tokens: int = 0):
         if self._card_fallback_timer:
             self._card_fallback_timer.cancel()
             self._card_fallback_timer = None
@@ -675,12 +855,16 @@ class ResponseHandle:
             self._ensure_card()
         if self._flush_ctrl:
             self._flush_ctrl.drain()
+        log.info("Deliver: content_len=%d is_error=%s cardkit=%s",
+                 len(content), is_error,
+                 bool(self._use_cardkit and self._cardkit_card_id))
         if self._use_cardkit and self._cardkit_card_id:
-            self._deliver_cardkit(content, is_error)
+            self._deliver_cardkit(content, is_error, total_tokens=total_tokens)
         else:
             self._deliver_im_patch(content, is_error)
 
-    def _deliver_cardkit(self, content: str, is_error: bool):
+    def _deliver_cardkit(self, content: str, is_error: bool,
+                         total_tokens: int = 0):
         card_id = self._cardkit_card_id
         seq = self._next_seq()
         settings_json = json.dumps({"config": {"streaming_mode": False}})
@@ -711,11 +895,16 @@ class ResponseHandle:
 
         elapsed_s = time.time() - self._handle_start_time
         seq = self._next_seq()
-        final_card_json = build_cardkit_final_card(content, is_error, elapsed_s=elapsed_s)
+        final_card_json = build_cardkit_final_card(
+            content, is_error, elapsed_s=elapsed_s, total_tokens=total_tokens,
+            chat_id=self.chat_id, bot_id=self.bot_id)
+        card_data = json.dumps(final_card_json, ensure_ascii=False)
+        log.info("CardKit card.update: card_id=%s content_len=%d payload_bytes=%d seq=%d",
+                 card_id, len(content), len(card_data.encode("utf-8")), seq)
         try:
             card_obj = Card.builder() \
                 .type("card_json") \
-                .data(json.dumps(final_card_json, ensure_ascii=False)) \
+                .data(card_data) \
                 .build()
             body = UpdateCardRequestBody.builder() \
                 .card(card_obj) \
@@ -772,6 +961,7 @@ class ResponseHandle:
     def _perform_flush(self, text: str):
         if self._use_cardkit and self._cardkit_card_id:
             self._update_summary_to_typing()
+            text = strip_action_markers(text)
             text = optimize_markdown_style(text)
             seq = self._next_seq()
             try:

@@ -180,7 +180,8 @@ def process_message(
 
     key = (bot_id, chat_id, thread_id)
     tag = SessionMap._key_str(key)
-    handle = response_handle_cls(lark_client, chat_id, thread_id, message_id)
+    handle = response_handle_cls(lark_client, chat_id, thread_id, message_id,
+                                 bot_id=bot_id)
     image_path = None
     auth_file_path = None
     # Prefer runner's own signatures; fall back to caller-provided list for compat
@@ -610,7 +611,11 @@ def process_message(
                 result["result"] = (result.get("result") or "") + ctx_alert
 
         if not handle._terminated:
-            handle.deliver(result["result"], is_error=result["is_error"])
+            usage = result.get("usage") or {}
+            total_tokens = (usage.get("input_tokens", 0)
+                            + usage.get("output_tokens", 0))
+            handle.deliver(result["result"], is_error=result["is_error"],
+                           total_tokens=total_tokens)
 
         return handle
 

@@ -19,11 +19,12 @@ from feishu_bridge.api.tasks import FeishuTasks
 class FakeHandle:
     """Minimal ResponseHandle stub for worker-unit tests."""
 
-    def __init__(self, client, chat_id, thread_id, message_id):
+    def __init__(self, client, chat_id, thread_id, message_id, bot_id=None):
         self.client = client
         self.chat_id = chat_id
         self.thread_id = thread_id
         self.source_message_id = message_id
+        self.bot_id = bot_id
         self.deliveries = []
         self._terminated = False
         self._card_fallback_timer = None
@@ -35,8 +36,8 @@ class FakeHandle:
     def stream_update(self, content):
         self.last_stream = content
 
-    def deliver(self, content, is_error=False):
-        self.deliveries.append((content, is_error))
+    def deliver(self, content, is_error=False, total_tokens=0):
+        self.deliveries.append((content, is_error, total_tokens))
 
 
 class DummySessionMap:
@@ -137,7 +138,7 @@ def test_process_message_todo_fallback_reports_truncation(monkeypatch):
 
     assert handle.deliveries == [(
         "未能在搜索上限内定位此任务，请稍后重试，或改用 `/feishu-tasks get <guid>` 直接查询。",
-        False,
+        False, 0,
     )]
 
 
@@ -191,7 +192,7 @@ def test_handle_feishu_service_sheet_uses_feishu_sheets_attr(monkeypatch):
         "sheet",
     )
 
-    assert handle.deliveries == [("sheet:chat:ou_xxx", False)]
+    assert handle.deliveries == [("sheet:chat:ou_xxx", False, 0)]
 
 
 def test_streaming_runner_falls_back_to_accumulated_text_when_final_result_empty():
@@ -340,7 +341,7 @@ def test_bridge_worker_returns_handle_on_exception():
     )
 
     assert isinstance(handle, FakeHandle)
-    assert handle.deliveries == [("内部错误，请稍后重试。如持续出现请联系管理员。", True)]
+    assert handle.deliveries == [("内部错误，请稍后重试。如持续出现请联系管理员。", True, 0)]
 
 
 def test_worker_refetches_card_content_when_flag_set():
