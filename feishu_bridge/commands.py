@@ -243,12 +243,11 @@ class BridgeCommandHandler:
 
         if snap and snap.available and not snap.stale:
             lines.append("")
-            claude_plan = "Max" if snap.extra_usage_enabled else "Pro"
             any_exhausted = any(
                 w.utilization >= 100 for w in snap.windows.values()
             )
             status_icon = "\U0001f6ab" if any_exhausted else "\U0001f7e2"
-            lines.append(f"**Claude ({claude_plan})** {status_icon}")
+            lines.append(f"**Claude** {status_icon}")
             for wkey, label in WINDOW_LABELS.items():
                 w = snap.windows.get(wkey)
                 if w is None:
