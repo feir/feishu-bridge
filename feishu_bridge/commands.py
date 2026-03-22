@@ -5,11 +5,19 @@ import logging
 import threading
 
 from feishu_bridge.api.client import FeishuAPIError
-
+from feishu_bridge.quota import WINDOW_LABELS, fetch_codex_quota
 from feishu_bridge.ui import ResponseHandle, add_queued_reaction
 from feishu_bridge.runtime import SessionMap
 
 log = logging.getLogger("feishu-bridge")
+
+
+def _context_window_for_model(model: str) -> int:
+    """Infer context window size from model name."""
+    m = model.lower()
+    if "opus" in m:
+        return 1_000_000
+    return 200_000
 
 
 class BridgeCommandHandler:
@@ -181,11 +189,14 @@ class BridgeCommandHandler:
         max_ctx = self.bot.runner.get_default_context_window()
         model_name = self.bot.runner.model or ""
         for m, mu in model_usage.items():
+            model_name = m
             cw = mu.get("contextWindow", 0)
             if cw > 0:
                 max_ctx = cw
-                model_name = m
-                break
+            else:
+                # Fallback: infer context window from model name
+                max_ctx = _context_window_for_model(m)
+            break
 
         pct = total_ctx / max_ctx * 100 if max_ctx else 0
         filled = int(pct / 5)
@@ -208,49 +219,95 @@ class BridgeCommandHandler:
         elif pct >= 70:
             lines.append(f"\U0001f7e1 接近上限{compact_hint}")
 
-        # --- Section 2: Cost ---
+        # --- Section 2: Cost (API mode only) ---
         turn_cost = cost_info.get("total_cost_usd")
         accumulated = cost_info.get("accumulated_cost_usd", turn_cost or 0)
         out_tokens = usage.get("output_tokens", 0)
 
-        if turn_cost is not None:
+        if turn_cost and turn_cost > 0:
             lines.append("")
-            cost_parts = []
-            if turn_cost > 0:
-                cost_parts.append(f"本次 ${turn_cost:.4f}")
+            cost_parts = [f"本次 ${turn_cost:.4f}"]
             if accumulated and accumulated > 0:
                 cost_parts.append(f"累计 **${accumulated:.4f}**")
-            if cost_parts:
-                lines.append("**费用** " + " · ".join(cost_parts))
+            lines.append("**费用** " + " · ".join(cost_parts))
             lines.append(f"in: {inp + cache_read + cache_create:,} · out: {out_tokens:,}")
 
-        # --- Section 3: Quota ---
-        rli = cost_info.get("rate_limit_info")
-        if rli:
-            utilization = rli.get("utilization", 0)
-            status = rli.get("status", "")
-            limit_type = rli.get("rateLimitType", "")
-            label = "7d" if "seven_day" in limit_type else "5h"
+        # --- Section 3: Quota (API poller preferred, stream event fallback) ---
+        lines.append("")
 
-            lines.append("")
-            if status == "rejected":
-                import time as _time
-                resets_at = rli.get("resetsAt", 0)
-                remaining = max(0, resets_at - _time.time()) if resets_at else 0
+        quota_poller = getattr(self.bot, "_quota_poller", None)
+        snap = quota_poller.snapshot if quota_poller else None
+
+        if snap and snap.available and not snap.stale:
+            import time as _time
+            quota_parts = []
+            for wkey, label in WINDOW_LABELS.items():
+                w = snap.windows.get(wkey)
+                if w is None:
+                    continue
+                util = w.utilization
+                icon = ("\U0001f6ab" if util >= 100
+                        else "\U0001f534" if util >= 80
+                        else "\U0001f7e1" if util >= 50
+                        else "\U0001f7e2")
+                remaining = max(0, w.resets_at_epoch - _time.time())
                 hours, mins = divmod(int(remaining) // 60, 60)
-                reset_str = f" · 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
-                lines.append(f"**配额** \U0001f6ab {label} 已用尽（{utilization:.0%}）{reset_str}")
-            elif utilization > 0:
-                icon = "\U0001f534" if utilization >= 0.8 else "\U0001f7e1" if utilization >= 0.5 else "\U0001f7e2"
-                line = f"**配额** {icon} {label}: {utilization:.0%}"
-                resets_at = rli.get("resetsAt", 0)
-                if resets_at:
+                reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
+                quota_parts.append(f"{icon} {label}: {util:.0f}%{reset_str}")
+            if quota_parts:
+                lines.append("**配额** " + " · ".join(quota_parts))
+        else:
+            # Fallback: stream event rate_limit_info
+            rli = cost_info.get("rate_limit_info")
+            if rli:
+                status = rli.get("status", "")
+                limit_type = rli.get("rateLimitType", "")
+                label = "7d" if "seven_day" in limit_type else "5h"
+                if status == "rejected":
                     import time as _time
-                    remaining = max(0, resets_at - _time.time())
+                    resets_at = rli.get("resetsAt", 0)
+                    remaining = max(0, resets_at - _time.time()) if resets_at else 0
                     hours, mins = divmod(int(remaining) // 60, 60)
-                    if remaining > 0:
-                        line += f" · 重置 {hours}h{mins:02d}m"
-                lines.append(line)
+                    reset_str = f" · 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
+                    lines.append(f"**配额** \U0001f6ab {label} 已用尽{reset_str}")
+                else:
+                    lines.append(f"**配额** \U0001f7e2 {label}: {status}")
+
+        # Cookie expiry warning
+        if snap:
+            cookie_warn = snap.cookie_expiry_warning
+            if cookie_warn:
+                lines.append("")
+                lines.append(cookie_warn)
+
+        # --- Section 4: Codex quota (if auth available) ---
+        codex_snap = fetch_codex_quota()
+        if codex_snap.available:
+            import time as _time
+            lines.append("")
+            parts = []
+            # 5h window
+            pu = codex_snap.primary_used_pct
+            pr = max(0, codex_snap.primary_resets_at - _time.time())
+            ph, pm = divmod(int(pr) // 60, 60)
+            p_icon = ("\U0001f6ab" if pu >= 100
+                      else "\U0001f534" if pu >= 80
+                      else "\U0001f7e1" if pu >= 50
+                      else "\U0001f7e2")
+            p_reset = f" 重置 {ph}h{pm:02d}m" if pr > 0 else ""
+            parts.append(f"{p_icon} 5h: {pu:.0f}%{p_reset}")
+            # 7d window
+            su = codex_snap.secondary_used_pct
+            sr = max(0, codex_snap.secondary_resets_at - _time.time())
+            sh, sm = divmod(int(sr) // 60, 60)
+            s_icon = ("\U0001f6ab" if su >= 100
+                      else "\U0001f534" if su >= 80
+                      else "\U0001f7e1" if su >= 50
+                      else "\U0001f7e2")
+            s_reset = f" 重置 {sh}h{sm:02d}m" if sr > 0 else ""
+            parts.append(f"{s_icon} 7d: {su:.0f}%{s_reset}")
+            plan = f" ({codex_snap.plan_type})" if codex_snap.plan_type else ""
+            lines.append(f"**Codex{plan}** " + " · ".join(parts))
 
         handle.deliver("\n".join(lines))
 

@@ -13,19 +13,83 @@ from feishu_bridge.parsers import (
     fetch_forward_messages,
     fetch_quoted_message,
 )
+from feishu_bridge.quota import WINDOW_LABELS
 from feishu_bridge.runtime import BaseRunner, SessionMap
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
 
 log = logging.getLogger("feishu-bridge")
 
 
-def _context_health_alert(result: dict) -> str | None:
+def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
+    """Build quota alert string from stream event + API snapshot.
+
+    Priority: stream event ``status=rejected`` is authoritative (real-time).
+    For utilization percentages, prefer API snapshot (stream event lacks them).
+    """
+    import time as _time
+
+    parts = []
+
+    # 1. Stream event: rejected status (real-time, highest priority)
+    rli = result.get("rate_limit_info")
+    if rli and rli.get("status") == "rejected":
+        utilization = rli.get("utilization", 0)
+        resets_at = rli.get("resetsAt", 0)
+        limit_type = rli.get("rateLimitType", "")
+        label = "7 天" if "seven_day" in limit_type else "5 小时"
+        reset_str = ""
+        if resets_at:
+            remaining = max(0, resets_at - _time.time())
+            hours, mins = divmod(int(remaining) // 60, 60)
+            if remaining > 0:
+                reset_str = f"，约 {hours}h{mins:02d}m 后重置"
+        parts.append(f"🚫 {label}配额已用尽（{utilization:.0%}）{reset_str}")
+        return "\n".join(parts)
+
+    # 2. Stream event: allowed_warning with utilization (if present)
+    if rli and rli.get("status") == "allowed_warning":
+        util = rli.get("utilization", 0)
+        if util >= 0.75:
+            limit_type = rli.get("rateLimitType", "")
+            label = "7 天" if "seven_day" in limit_type else "5 小时"
+            parts.append(f"⚠️ {label}配额 {util:.0%}")
+
+    # 3. API snapshot: add utilization for all windows above threshold
+    if quota_snapshot and quota_snapshot.available and not quota_snapshot.stale:
+        for key, label in WINDOW_LABELS.items():
+            w = quota_snapshot.windows.get(key)
+            if not w:
+                continue
+            util_pct = w.utilization  # already in percentage (e.g. 18.0)
+            if util_pct >= 50:
+                icon = "🔴" if util_pct >= 80 else "🟡"
+                remaining = max(0, w.resets_at_epoch - _time.time())
+                hours, mins = divmod(int(remaining) // 60, 60)
+                reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
+                alert = f"{icon} {label}: {util_pct:.0f}%{reset_str}"
+                # Avoid duplicate if stream event already covered this window
+                if not any(label in p for p in parts):
+                    parts.append(alert)
+
+    # 4. Cookie expiry warning (only in card alert, not every message)
+    if quota_snapshot:
+        cookie_warn = quota_snapshot.cookie_expiry_warning
+        if cookie_warn:
+            parts.append(cookie_warn)
+
+    return "\n".join(parts)
+
+
+def _context_health_alert(result: dict, quota_snapshot=None) -> str | None:
     """Check context utilization and return an alert suffix, or None.
 
     Uses ``peak_context_tokens`` (high-water mark before auto-compact)
     when available, falling back to ``last_call_usage`` or ``usage``.
     Also reports when auto-compact was detected so the user knows
     earlier conversation turns may have been summarised.
+
+    Args:
+        quota_snapshot: Optional QuotaSnapshot from the API poller.
     """
     # Determine context window size (prefer modelUsage, fallback to runner default)
     max_ctx = result.get("default_context_window", 200_000)
@@ -58,28 +122,10 @@ def _context_health_alert(result: dict) -> str | None:
 
     pct = total_ctx / max_ctx * 100
 
-    # Rate limit alert (append to context alert if applicable)
-    rate_alert = ""
-    rli = result.get("rate_limit_info")
-    if rli:
-        utilization = rli.get("utilization", 0)
-        status = rli.get("status", "")
-        if status == "rejected":
-            resets_at = rli.get("resetsAt", 0)
-            limit_type = rli.get("rateLimitType", "")
-            label = "7 天" if "seven_day" in limit_type else "5 小时"
-            if resets_at:
-                import time as _time
-                remaining = max(0, resets_at - _time.time())
-                hours, mins = divmod(int(remaining) // 60, 60)
-                reset_str = f"，约 {hours}h{mins:02d}m 后重置" if remaining > 0 else ""
-            else:
-                reset_str = ""
-            rate_alert = f"\n🚫 {label}配额已用尽（{utilization:.0%}）{reset_str}"
-        elif status == "allowed_warning" and utilization >= 0.75:
-            limit_type = rli.get("rateLimitType", "")
-            label = "7 天" if "seven_day" in limit_type else "5 小时"
-            rate_alert = f"\n⚠️ {label}配额 {utilization:.0%}"
+    # Build quota alert from both stream event and API snapshot
+    rate_alert = _build_quota_alert(result, quota_snapshot)
+    if rate_alert:
+        rate_alert = "\n" + rate_alert
 
     if pct >= 85:
         return (
@@ -625,7 +671,9 @@ def process_message(
 
         # --- Context health alert ---
         if effective_sid and not result.get("is_error"):
-            ctx_alert = _context_health_alert(result)
+            quota_poller = item.get("_quota_poller")
+            quota_snap = quota_poller.snapshot if quota_poller else None
+            ctx_alert = _context_health_alert(result, quota_snap)
             if ctx_alert:
                 result["result"] = (result.get("result") or "") + ctx_alert
 

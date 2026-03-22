@@ -870,6 +870,9 @@ class ClaudeRunner(BaseRunner):
         }
 
     def get_default_context_window(self):
+        m = (self.model or "").lower()
+        if "opus" in m:
+            return 1_000_000
         return 200_000
 
     def get_session_not_found_signatures(self):

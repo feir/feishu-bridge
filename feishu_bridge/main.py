@@ -386,6 +386,16 @@ class FeishuBot:
         self.runner = create_runner(self.agent_config, self.bot_config, _extra_prompts)
         self.command_handler = BridgeCommandHandler(self)
 
+        # Quota poller (claude.ai API, cookie-based auth)
+        from feishu_bridge.quota import QuotaPoller
+        quota_cfg = config.get("quota", {})
+        self._quota_poller = QuotaPoller(
+            cookie_path=quota_cfg.get("cookie_path"),
+            poll_interval=quota_cfg.get("poll_interval", 300),
+            org_uuid=quota_cfg.get("org_uuid"),
+        )
+        self._quota_poller.start()
+
         # Work queue: ChatTaskQueue manages per-session FIFO,
         # _work_queue is the shared worker pool queue
         self._work_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
@@ -905,6 +915,7 @@ class FeishuBot:
                 "_merge_forward_message_id": _merge_forward_message_id,
                 "_feishu_urls": _feishu_urls,
                 "_cost_store": self._session_cost,
+                "_quota_poller": getattr(self, "_quota_poller", None),
             }
             msg_key = SessionMap._key_str(
                 (self.bot_id, chat_id, thread_id))
@@ -990,6 +1001,7 @@ class FeishuBot:
                 "_merge_forward_message_id": None,
                 "_feishu_urls": [],
                 "_cost_store": self._session_cost,
+                "_quota_poller": getattr(self, "_quota_poller", None),
                 "_queue_key": msg_key,
             }
             try:
