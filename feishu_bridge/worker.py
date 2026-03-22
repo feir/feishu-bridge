@@ -614,8 +614,13 @@ def process_message(
             usage = result.get("usage") or {}
             total_tokens = (usage.get("input_tokens", 0)
                             + usage.get("output_tokens", 0))
+            # First key only; multi-model sessions show the primary model
+            model_usage = result.get("modelUsage") or {}
+            model_name = next(iter(model_usage), None)
             handle.deliver(result["result"], is_error=result["is_error"],
-                           total_tokens=total_tokens)
+                           total_tokens=total_tokens,
+                           model_name=model_name,
+                           workspace=runner.workspace)
 
         return handle
 

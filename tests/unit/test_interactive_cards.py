@@ -1,6 +1,6 @@
 """Unit tests for interactive-cards feature (P0 URL sidebar + P1 markers)."""
 
-import pytest
+from unittest.mock import patch
 
 from feishu_bridge.ui import (
     extract_urls,
@@ -11,6 +11,7 @@ from feishu_bridge.ui import (
     parse_action_markers,
     _build_action_buttons,
     build_cardkit_final_card,
+    _get_git_label,
 )
 
 
@@ -248,3 +249,73 @@ class TestBuildCardkitFinalCard:
         md_content = card["body"]["elements"][0]["content"]
         assert "feishu:" not in md_content
         assert "Before" in md_content and "After" in md_content
+
+    def test_footer_includes_model_name(self):
+        card = build_cardkit_final_card("Hi", model_name="claude-opus-4-6")
+        footer = card["body"]["elements"][-1]["content"]
+        assert "opus-4-6" in footer
+        # Should not contain the "claude-" prefix
+        assert "claude-" not in footer
+
+    @patch("feishu_bridge.ui._get_git_label", return_value="main*")
+    def test_footer_includes_git_label(self, mock_git):
+        card = build_cardkit_final_card("Hi", workspace="/tmp/fake")
+        footer = card["body"]["elements"][-1]["content"]
+        assert "main*" in footer
+
+    def test_footer_full(self):
+        """All footer fields present: status · model · git · elapsed · tokens."""
+        with patch("feishu_bridge.ui._get_git_label", return_value="dev"):
+            card = build_cardkit_final_card(
+                "Hi", elapsed_s=90, total_tokens=12345,
+                model_name="claude-sonnet-4-6", workspace="/tmp/fake")
+        footer = card["body"]["elements"][-1]["content"]
+        assert "✅ 完成" in footer
+        assert "sonnet-4-6" in footer
+        assert "dev" in footer
+        assert "1m30s" in footer
+        assert "12.3k tokens" in footer
+
+    def test_footer_no_model_no_workspace(self):
+        """Footer gracefully omits model/git when not provided."""
+        card = build_cardkit_final_card("Hi", elapsed_s=5)
+        footer = card["body"]["elements"][-1]["content"]
+        assert "✅ 完成" in footer
+        assert "5.0s" in footer
+        # No model or git info
+        parts = footer.split(" · ")
+        assert len(parts) == 2  # status + elapsed
+
+
+# ---------------------------------------------------------------------------
+# _get_git_label
+# ---------------------------------------------------------------------------
+
+class TestGetGitLabel:
+    @patch("feishu_bridge.ui.subprocess.run")
+    def test_clean_repo(self, mock_run):
+        from subprocess import CompletedProcess
+        mock_run.side_effect = [
+            CompletedProcess([], 0, stdout="main\n", stderr=""),
+            CompletedProcess([], 0, stdout="", stderr=""),
+        ]
+        assert _get_git_label("/tmp") == "main"
+
+    @patch("feishu_bridge.ui.subprocess.run")
+    def test_dirty_repo(self, mock_run):
+        from subprocess import CompletedProcess
+        mock_run.side_effect = [
+            CompletedProcess([], 0, stdout="feat/ui\n", stderr=""),
+            CompletedProcess([], 0, stdout=" M file.py\n", stderr=""),
+        ]
+        assert _get_git_label("/tmp") == "feat/ui*"
+
+    @patch("feishu_bridge.ui.subprocess.run")
+    def test_not_a_git_repo(self, mock_run):
+        from subprocess import CompletedProcess
+        mock_run.return_value = CompletedProcess([], 128, stdout="", stderr="not a repo")
+        assert _get_git_label("/tmp") is None
+
+    @patch("feishu_bridge.ui.subprocess.run", side_effect=OSError("no git"))
+    def test_exception_returns_none(self, mock_run):
+        assert _get_git_label("/tmp") is None

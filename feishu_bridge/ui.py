@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -621,11 +622,35 @@ def _format_tokens(n: int) -> str:
     return str(n)
 
 
+def _get_git_label(workspace: str) -> str | None:
+    """Return 'branch' or 'branch*' (dirty), or None on failure."""
+    try:
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=workspace, capture_output=True, text=True, timeout=5,
+        )
+        if branch.returncode != 0:
+            return None
+        name = branch.stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=workspace, capture_output=True, text=True, timeout=5,
+        )
+        if dirty.returncode == 0 and dirty.stdout.strip():
+            name += "*"
+        return name
+    except Exception as e:
+        log.debug("_get_git_label failed for %s: %s", workspace, e)
+        return None
+
+
 def build_cardkit_final_card(content: str, is_error: bool = False,
                              elapsed_s: float = 0,
                              total_tokens: int = 0,
                              chat_id: str | None = None,
-                             bot_id: str | None = None) -> dict:
+                             bot_id: str | None = None,
+                             model_name: str | None = None,
+                             workspace: str | None = None) -> dict:
     # P1: parse action markers BEFORE optimize (Finding 6 ordering fix)
     content, markers = parse_action_markers(content)
     content = optimize_markdown_style(content)
@@ -667,9 +692,16 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
             }],
         })
 
-    # Footer with status and elapsed time
+    # Footer with status, model, git, elapsed time, tokens
     status = "❌ 出错" if is_error else "✅ 完成"
     footer_parts = [status]
+    if model_name:
+        # Strip "claude-" prefix for brevity (e.g. "claude-opus-4-6" → "opus-4-6")
+        short_model = model_name.removeprefix("claude-")
+        footer_parts.append(short_model)
+    git_label = _get_git_label(workspace) if workspace else None
+    if git_label:
+        footer_parts.append(git_label)
     if elapsed_s > 0:
         footer_parts.append(f"耗时 {_format_elapsed(elapsed_s)}")
     if total_tokens > 0:
@@ -840,7 +872,8 @@ class ResponseHandle:
             return False
 
     def deliver(self, content: str, is_error: bool = False,
-                total_tokens: int = 0):
+                total_tokens: int = 0, model_name: str | None = None,
+                workspace: str | None = None):
         if self._card_fallback_timer:
             self._card_fallback_timer.cancel()
             self._card_fallback_timer = None
@@ -859,12 +892,14 @@ class ResponseHandle:
                  len(content), is_error,
                  bool(self._use_cardkit and self._cardkit_card_id))
         if self._use_cardkit and self._cardkit_card_id:
-            self._deliver_cardkit(content, is_error, total_tokens=total_tokens)
+            self._deliver_cardkit(content, is_error, total_tokens=total_tokens,
+                                  model_name=model_name, workspace=workspace)
         else:
             self._deliver_im_patch(content, is_error)
 
     def _deliver_cardkit(self, content: str, is_error: bool,
-                         total_tokens: int = 0):
+                         total_tokens: int = 0, model_name: str | None = None,
+                         workspace: str | None = None):
         card_id = self._cardkit_card_id
         seq = self._next_seq()
         settings_json = json.dumps({"config": {"streaming_mode": False}})
@@ -897,7 +932,8 @@ class ResponseHandle:
         seq = self._next_seq()
         final_card_json = build_cardkit_final_card(
             content, is_error, elapsed_s=elapsed_s, total_tokens=total_tokens,
-            chat_id=self.chat_id, bot_id=self.bot_id)
+            chat_id=self.chat_id, bot_id=self.bot_id,
+            model_name=model_name, workspace=workspace)
         card_data = json.dumps(final_card_json, ensure_ascii=False)
         log.info("CardKit card.update: card_id=%s content_len=%d payload_bytes=%d seq=%d",
                  card_id, len(content), len(card_data.encode("utf-8")), seq)
