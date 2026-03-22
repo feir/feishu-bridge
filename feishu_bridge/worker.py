@@ -13,6 +13,7 @@ from feishu_bridge.parsers import (
     fetch_forward_messages,
     fetch_quoted_message,
 )
+from feishu_bridge.commands import _context_window_for_model
 from feishu_bridge.quota import WINDOW_LABELS
 from feishu_bridge.runtime import BaseRunner, SessionMap
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
@@ -91,14 +92,15 @@ def _context_health_alert(result: dict, quota_snapshot=None) -> str | None:
     Args:
         quota_snapshot: Optional QuotaSnapshot from the API poller.
     """
-    # Determine context window size (prefer modelUsage, fallback to runner default)
+    # Determine context window size (model-based, API only if larger)
     max_ctx = result.get("default_context_window", 200_000)
     model_usage = result.get("modelUsage", {})
     for _model, mu in model_usage.items():
+        max_ctx = _context_window_for_model(_model)
         cw = mu.get("contextWindow", 0)
-        if cw > 0:
+        if cw > max_ctx:
             max_ctx = cw
-            break
+        break
 
     # If auto-compact was detected, alert with pre-compact peak usage
     compact_detected = result.get("compact_detected", False)

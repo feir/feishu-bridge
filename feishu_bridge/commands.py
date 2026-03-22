@@ -190,12 +190,12 @@ class BridgeCommandHandler:
         model_name = self.bot.runner.model or ""
         for m, mu in model_usage.items():
             model_name = m
+            # API may under-report (e.g. Opus returns 200K instead of 1M)
+            # Use model-based inference, only trust API if larger
+            max_ctx = _context_window_for_model(m)
             cw = mu.get("contextWindow", 0)
-            if cw > 0:
+            if cw > max_ctx:
                 max_ctx = cw
-            else:
-                # Fallback: infer context window from model name
-                max_ctx = _context_window_for_model(m)
             break
 
         pct = total_ctx / max_ctx * 100 if max_ctx else 0
@@ -219,24 +219,27 @@ class BridgeCommandHandler:
         elif pct >= 70:
             lines.append(f"\U0001f7e1 接近上限{compact_hint}")
 
-        # --- Section 2: Cost (API mode only) ---
-        turn_cost = cost_info.get("total_cost_usd")
-        accumulated = cost_info.get("accumulated_cost_usd", turn_cost or 0)
-        out_tokens = usage.get("output_tokens", 0)
+        # Determine subscription vs API mode early (needed for cost section)
+        quota_poller = getattr(self.bot, "_quota_poller", None)
+        snap = quota_poller.snapshot if quota_poller else None
+        is_subscription = snap and snap.available
 
-        if turn_cost and turn_cost > 0:
-            lines.append("")
-            cost_parts = [f"本次 ${turn_cost:.4f}"]
-            if accumulated and accumulated > 0:
-                cost_parts.append(f"累计 **${accumulated:.4f}**")
-            lines.append("**费用** " + " · ".join(cost_parts))
-            lines.append(f"in: {inp + cache_read + cache_create:,} · out: {out_tokens:,}")
+        # --- Section 2: Cost (API mode only, skip for subscription) ---
+        if not is_subscription:
+            turn_cost = cost_info.get("total_cost_usd")
+            accumulated = cost_info.get("accumulated_cost_usd", turn_cost or 0)
+            out_tokens = usage.get("output_tokens", 0)
+
+            if turn_cost and turn_cost > 0:
+                lines.append("")
+                cost_parts = [f"本次 ${turn_cost:.4f}"]
+                if accumulated and accumulated > 0:
+                    cost_parts.append(f"累计 **${accumulated:.4f}**")
+                lines.append("**费用** " + " · ".join(cost_parts))
+                lines.append(f"in: {inp + cache_read + cache_create:,} · out: {out_tokens:,}")
 
         # --- Section 3: Quota (API poller preferred, stream event fallback) ---
         lines.append("")
-
-        quota_poller = getattr(self.bot, "_quota_poller", None)
-        snap = quota_poller.snapshot if quota_poller else None
 
         if snap and snap.available and not snap.stale:
             import time as _time
