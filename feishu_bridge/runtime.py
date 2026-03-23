@@ -99,6 +99,7 @@ class StreamState:
     done: bool = False
     pending_output: list[str] = field(default_factory=list)
     pending_tool_status: list[str] = field(default_factory=list)
+    pending_todo_update: list[dict] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +464,7 @@ class BaseRunner(ABC):
 
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
-            on_output=None, on_tool_status=None,
+            on_output=None, on_tool_status=None, on_todo_update=None,
             env_extra: Optional[dict] = None) -> dict:
 
         if len(prompt) > MAX_PROMPT_CHARS:
@@ -502,7 +503,8 @@ class BaseRunner(ABC):
 
         if streaming:
             result = self._run_streaming(proc, session_id, tag, on_output,
-                                         on_tool_status=on_tool_status)
+                                         on_tool_status=on_tool_status,
+                                         on_todo_update=on_todo_update)
         else:
             result = self._run_blocking(proc, session_id, tag)
 
@@ -550,7 +552,7 @@ class BaseRunner(ABC):
         return self.parse_blocking_output(stdout, session_id)
 
     def _run_streaming(self, proc, session_id, tag, on_output,
-                        on_tool_status=None) -> dict:
+                        on_tool_status=None, on_todo_update=None) -> dict:
         state = StreamState(session_id=session_id)
         timed_out = False
         result_received = threading.Event()
@@ -606,6 +608,11 @@ class BaseRunner(ABC):
                 if on_tool_status and state.pending_tool_status:
                     on_tool_status(state.pending_tool_status[-1])
                     state.pending_tool_status.clear()
+
+                # Drain pending_todo_update → on_todo_update callback
+                if on_todo_update and state.pending_todo_update is not None:
+                    on_todo_update(state.pending_todo_update)
+                    state.pending_todo_update = None
 
                 if state.done:
                     result_received.set()
@@ -791,6 +798,10 @@ class ClaudeRunner(BaseRunner):
                     tool_name = block.get("name", "")
                     if tool_name:
                         state.pending_tool_status.append(tool_name)
+                    if tool_name == "TodoWrite":
+                        todos = block.get("input", {}).get("todos")
+                        if isinstance(todos, list):
+                            state.pending_todo_update = todos
         elif etype == "rate_limit_event":
             rli = event.get("rate_limit_info")
             if rli:
@@ -959,7 +970,7 @@ class CodexRunner(BaseRunner):
 
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
-            on_output=None, on_tool_status=None,
+            on_output=None, on_tool_status=None, on_todo_update=None,
             env_extra: Optional[dict] = None) -> dict:
         """Override run() to manage per-invocation system prompt temp file."""
         self._tls.instructions_path = None
@@ -977,7 +988,7 @@ class CodexRunner(BaseRunner):
             return super().run(
                 prompt, session_id=session_id, resume=resume,
                 tag=tag, on_output=on_output, on_tool_status=on_tool_status,
-                env_extra=env_extra,
+                on_todo_update=on_todo_update, env_extra=env_extra,
             )
         finally:
             path = getattr(self._tls, "instructions_path", None)

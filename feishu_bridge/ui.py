@@ -349,6 +349,7 @@ MAX_CARD_PAYLOAD_BYTES = 28 * 1024
 COMPACT_MAX_CHARS = 4_000
 
 CARDKIT_ELEMENT_ID = "streaming_output"
+CARDKIT_TODO_ELEMENT_ID = "loading_icon"
 CARDKIT_THROTTLE_MS = 100
 PATCH_THROTTLE_MS = 1500
 GAP_THRESHOLD_MS = 2000
@@ -674,13 +675,8 @@ def build_cardkit_streaming_card() -> dict:
                 },
                 {
                     "tag": "markdown",
-                    "content": " ",
-                    "icon": {
-                        "tag": "custom_icon",
-                        "img_key": "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg",
-                        "size": "16px 16px",
-                    },
-                    "element_id": "loading_icon",
+                    "content": "",
+                    "element_id": CARDKIT_TODO_ELEMENT_ID,
                 },
             ],
         },
@@ -731,7 +727,8 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
                              chat_id: str | None = None,
                              bot_id: str | None = None,
                              model_name: str | None = None,
-                             workspace: str | None = None) -> dict:
+                             workspace: str | None = None,
+                             todos: list[dict] | None = None) -> dict:
     # P1: parse action markers BEFORE optimize (Finding 6 ordering fix)
     content, markers = parse_action_markers(content)
     content = optimize_markdown_style(content)
@@ -791,6 +788,9 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
         footer_parts.append(git_label)
     if elapsed_s > 0:
         footer_parts.append(f"耗时 {_format_elapsed(elapsed_s)}")
+    if todos:
+        done = sum(1 for t in todos if t.get("status") == "completed")
+        footer_parts.append(f"{done}/{len(todos)} tasks")
     if total_tokens > 0:
         footer_parts.append(f"{_format_tokens(total_tokens)} tokens")
     elements.append({
@@ -898,6 +898,7 @@ class ResponseHandle:
         self._handle_start_time: float = time.time()
         self._runner: Optional[ClaudeRunner] = None
         self._runner_tag: Optional[str] = None
+        self._last_todos: list[dict] | None = None
 
     def _next_seq(self) -> int:
         with self._seq_lock:
@@ -1030,7 +1031,8 @@ class ResponseHandle:
         final_card_json = build_cardkit_final_card(
             content, is_error, elapsed_s=elapsed_s, total_tokens=total_tokens,
             chat_id=self.chat_id, bot_id=self.bot_id,
-            model_name=model_name, workspace=workspace)
+            model_name=model_name, workspace=workspace,
+            todos=self._last_todos)
         card_data = json.dumps(final_card_json, ensure_ascii=False)
         log.info("CardKit card.update: card_id=%s content_len=%d payload_bytes=%d seq=%d",
                  card_id, len(content), len(card_data.encode("utf-8")), seq)
@@ -1145,6 +1147,47 @@ class ResponseHandle:
                           resp.code, resp.msg)
         except Exception:
             log.debug("Tool body update error", exc_info=True)
+
+    @staticmethod
+    def _format_todos(todos: list[dict]) -> str:
+        """Format TodoWrite todos list as markdown for card display."""
+        lines = []
+        for t in todos:
+            status = t.get("status", "pending")
+            content = t.get("content", "")
+            if status == "completed":
+                lines.append(f"~~☑ {content}~~")
+            elif status == "in_progress":
+                lines.append(f"◉ **{content}**")
+            else:
+                lines.append(f"☐ {content}")
+        return "\n".join(lines)
+
+    def todo_list_update(self, todos: list[dict]):
+        """Update the todo element in the streaming card."""
+        if self._terminated:
+            return
+        if not self._cardkit_card_id:
+            return
+        self._last_todos = todos
+        md = self._format_todos(todos)
+        try:
+            body = ContentCardElementRequestBody.builder() \
+                .uuid(str(uuid.uuid4())) \
+                .content(md) \
+                .sequence(self._next_seq()) \
+                .build()
+            req = ContentCardElementRequest.builder() \
+                .card_id(self._cardkit_card_id) \
+                .element_id(CARDKIT_TODO_ELEMENT_ID) \
+                .request_body(body) \
+                .build()
+            resp = self.client.cardkit.v1.card_element.content(req)
+            if not resp.success():
+                log.debug("Todo list update failed: code=%s msg=%s",
+                          resp.code, resp.msg)
+        except Exception:
+            log.debug("Todo list update error", exc_info=True)
 
     def _update_summary_to_typing(self):
         """Switch CardKit summary from '思考中...' to '输入中...' on first content."""
