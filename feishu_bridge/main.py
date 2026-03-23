@@ -1291,7 +1291,8 @@ def main():
                 log.warning("Startup task failed: %s", exc)
 
     # Start (blocking)
-    log.info("=== Feishu Bridge starting (bot=%s) ===", args.bot)
+    from feishu_bridge import __version__
+    log.info("=== Feishu Bridge v%s starting (bot=%s) ===", __version__, args.bot)
     try:
         bot.start()
     except KeyboardInterrupt:
