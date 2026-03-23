@@ -516,6 +516,9 @@ def process_message(
         def on_stream(text_so_far):
             handle.stream_update(text_so_far)
 
+        def on_tool_status(tool_name):
+            handle.tool_status_update(tool_name)
+
         todo_task_id = item.get("_todo_task_id")
         if todo_task_id and not feishu_api_error_cls:
             log.debug(
@@ -644,13 +647,15 @@ def process_message(
         if existing_sid:
             result = runner.run(
                 text, session_id=existing_sid, resume=True, tag=tag,
-                on_output=on_stream, env_extra=env_extra
+                on_output=on_stream, on_tool_status=on_tool_status,
+                env_extra=env_extra,
             )
         else:
             new_sid = str(uuid.uuid4())
             result = runner.run(
                 text, session_id=new_sid, resume=False, tag=tag,
-                on_output=on_stream, env_extra=env_extra
+                on_output=on_stream, on_tool_status=on_tool_status,
+                env_extra=env_extra,
             )
 
         if result.get("cancelled"):
@@ -666,7 +671,8 @@ def process_message(
                 retry_sid = str(uuid.uuid4())
                 result = runner.run(
                     text, session_id=retry_sid, resume=False, tag=tag,
-                    on_output=on_stream, env_extra=env_extra
+                    on_output=on_stream, on_tool_status=on_tool_status,
+                    env_extra=env_extra,
                 )
                 if result.get("cancelled"):
                     handle.deliver(result["result"])

@@ -1067,14 +1067,47 @@ class ResponseHandle:
             card = build_card(content, is_error, compact=True)
         self._send_card(card)
 
-    def _update_summary_to_typing(self):
-        """Switch CardKit summary from '思考中...' to '输入中...' on first content."""
-        if self._summary_updated or not self._cardkit_card_id:
+    # Tool name → user-friendly status for CardKit summary.
+    _TOOL_STATUS_MAP = {
+        "Bash": "执行命令",
+        "Read": "读取文件",
+        "Write": "写入文件",
+        "Edit": "编辑文件",
+        "Grep": "搜索代码",
+        "Glob": "查找文件",
+        "WebFetch": "抓取网页",
+        "WebSearch": "搜索网页",
+        "Agent": "分发子任务",
+        "Skill": "执行技能",
+        "TodoWrite": "更新任务",
+        "NotebookEdit": "编辑笔记",
+    }
+
+    def tool_status_update(self, tool_name: str):
+        """Update CardKit summary and card body to reflect current tool."""
+        if self._terminated:
             return
-        self._summary_updated = True
+        # Once text output has started, summary is already "输入中...", don't revert.
+        if self._summary_updated:
+            return
+        # Create card eagerly so we can show progress during tool-only phases.
+        if not self.card_message_id:
+            if not self._ensure_card():
+                return
+        if not self._cardkit_card_id:
+            return
+        label = self._TOOL_STATUS_MAP.get(tool_name, tool_name)
+        self._update_summary(f"{label}...")
+        # Also update card body so the user sees progress inside the card.
+        self._update_tool_body(label)
+
+    def _update_summary(self, text: str):
+        """Update CardKit card summary text."""
+        if not self._cardkit_card_id:
+            return
         try:
             settings_json = json.dumps(
-                {"config": {"summary": {"content": "输入中..."}}})
+                {"config": {"summary": {"content": text}}})
             body = SettingsCardRequestBody.builder() \
                 .uuid(str(uuid.uuid4())) \
                 .settings(settings_json) \
@@ -1090,6 +1123,35 @@ class ResponseHandle:
                           resp.code, resp.msg)
         except Exception:
             log.debug("Summary update error", exc_info=True)
+
+    def _update_tool_body(self, label: str):
+        """Update card body element with tool progress indicator."""
+        if not self._cardkit_card_id:
+            return
+        try:
+            body = ContentCardElementRequestBody.builder() \
+                .uuid(str(uuid.uuid4())) \
+                .content(f"*{label}...*") \
+                .sequence(self._next_seq()) \
+                .build()
+            req = ContentCardElementRequest.builder() \
+                .card_id(self._cardkit_card_id) \
+                .element_id(CARDKIT_ELEMENT_ID) \
+                .request_body(body) \
+                .build()
+            resp = self.client.cardkit.v1.card_element.content(req)
+            if not resp.success():
+                log.debug("Tool body update failed: code=%s msg=%s",
+                          resp.code, resp.msg)
+        except Exception:
+            log.debug("Tool body update error", exc_info=True)
+
+    def _update_summary_to_typing(self):
+        """Switch CardKit summary from '思考中...' to '输入中...' on first content."""
+        if self._summary_updated or not self._cardkit_card_id:
+            return
+        self._summary_updated = True
+        self._update_summary("输入中...")
 
     def _perform_flush(self, text: str):
         if self._use_cardkit and self._cardkit_card_id:

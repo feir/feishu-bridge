@@ -98,6 +98,7 @@ class StreamState:
     is_error: bool = False
     done: bool = False
     pending_output: list[str] = field(default_factory=list)
+    pending_tool_status: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -356,8 +357,20 @@ class BaseRunner(ABC):
         return []
 
     def get_extra_env(self) -> dict:
-        """额外环境变量。默认空。"""
-        return {}
+        """额外环境变量。默认注入用户 PATH。"""
+        env = {}
+        # Ensure user-local bin dirs are in PATH for subprocesses.
+        # systemd services don't source ~/.profile, so ~/.local/bin etc.
+        # are missing from PATH, causing tools like gh to be not found.
+        user_bins = [
+            os.path.expanduser("~/.local/bin"),
+            os.path.expanduser("~/bin"),
+        ]
+        existing = os.environ.get("PATH", "")
+        additions = [p for p in user_bins if os.path.isdir(p) and p not in existing]
+        if additions:
+            env["PATH"] = ":".join(additions) + ":" + existing
+        return env
 
     def get_display_name(self) -> str:
         """用户可见的 Agent 名称。"""
@@ -450,7 +463,8 @@ class BaseRunner(ABC):
 
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
-            on_output=None, env_extra: Optional[dict] = None) -> dict:
+            on_output=None, on_tool_status=None,
+            env_extra: Optional[dict] = None) -> dict:
 
         if len(prompt) > MAX_PROMPT_CHARS:
             log.warning("Prompt truncated: %d -> %d chars", len(prompt), MAX_PROMPT_CHARS)
@@ -487,7 +501,8 @@ class BaseRunner(ABC):
                 self._active[tag] = proc
 
         if streaming:
-            result = self._run_streaming(proc, session_id, tag, on_output)
+            result = self._run_streaming(proc, session_id, tag, on_output,
+                                         on_tool_status=on_tool_status)
         else:
             result = self._run_blocking(proc, session_id, tag)
 
@@ -534,7 +549,8 @@ class BaseRunner(ABC):
 
         return self.parse_blocking_output(stdout, session_id)
 
-    def _run_streaming(self, proc, session_id, tag, on_output) -> dict:
+    def _run_streaming(self, proc, session_id, tag, on_output,
+                        on_tool_status=None) -> dict:
         state = StreamState(session_id=session_id)
         timed_out = False
         result_received = threading.Event()
@@ -584,6 +600,12 @@ class BaseRunner(ABC):
                     for text in state.pending_output:
                         on_output(text)
                     state.pending_output.clear()
+
+                # Drain pending_tool_status → on_tool_status callback
+                # Only send the last tool name (the one visually shown).
+                if on_tool_status and state.pending_tool_status:
+                    on_tool_status(state.pending_tool_status[-1])
+                    state.pending_tool_status.clear()
 
                 if state.done:
                     result_received.set()
@@ -753,7 +775,8 @@ class ClaudeRunner(BaseRunner):
             state.final_result = event
             state.done = True
         elif etype == "assistant":
-            msg_usage = event.get("message", {}).get("usage")
+            msg = event.get("message", {})
+            msg_usage = msg.get("usage")
             if msg_usage:
                 state.last_call_usage = msg_usage
                 # Track peak context tokens (pre-compact high-water mark).
@@ -762,6 +785,12 @@ class ClaudeRunner(BaseRunner):
                               + msg_usage.get("cache_creation_input_tokens", 0))
                 if ctx_tokens > state.peak_context_tokens:
                     state.peak_context_tokens = ctx_tokens
+            # Extract tool-use names for progress feedback.
+            for block in msg.get("content", []):
+                if block.get("type") == "tool_use":
+                    tool_name = block.get("name", "")
+                    if tool_name:
+                        state.pending_tool_status.append(tool_name)
         elif etype == "rate_limit_event":
             rli = event.get("rate_limit_info")
             if rli:
@@ -930,7 +959,8 @@ class CodexRunner(BaseRunner):
 
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
-            on_output=None, env_extra: Optional[dict] = None) -> dict:
+            on_output=None, on_tool_status=None,
+            env_extra: Optional[dict] = None) -> dict:
         """Override run() to manage per-invocation system prompt temp file."""
         self._tls.instructions_path = None
         try:
@@ -946,7 +976,8 @@ class CodexRunner(BaseRunner):
 
             return super().run(
                 prompt, session_id=session_id, resume=resume,
-                tag=tag, on_output=on_output, env_extra=env_extra,
+                tag=tag, on_output=on_output, on_tool_status=on_tool_status,
+                env_extra=env_extra,
             )
         finally:
             path = getattr(self._tls, "instructions_path", None)
