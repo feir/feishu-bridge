@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "feishu-bridge"
-version = "2026.03.23.1"
-description = "Feishu ↔ AI Agent bridge with 40+ API integrations"
+version = "2026.03.23.2"
+description = "Feishu ↔ Claude Code / Codex bridge — remote AI agent control + 80+ Feishu API commands"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
