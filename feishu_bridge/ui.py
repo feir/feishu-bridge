@@ -776,23 +776,23 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
             }],
         })
 
-    # Footer with status, model, git, elapsed time, tokens
-    status = "❌ 出错" if is_error else "✅ 完成"
+    # Footer: ✅ tasks · model · elapsed · tokens · git
+    status = "❌" if is_error else "✅"
     footer_parts = [status]
+    if todos:
+        done = sum(1 for t in todos if t.get("status") == "completed")
+        footer_parts.append(f"{done}/{len(todos)} tasks")
     if model_name:
         # Strip "claude-" prefix for brevity (e.g. "claude-opus-4-6" → "opus-4-6")
         short_model = model_name.removeprefix("claude-")
         footer_parts.append(short_model)
+    if elapsed_s > 0:
+        footer_parts.append(_format_elapsed(elapsed_s))
+    if total_tokens > 0:
+        footer_parts.append(f"{_format_tokens(total_tokens)} tokens")
     git_label = _get_git_label(workspace) if workspace else None
     if git_label:
         footer_parts.append(git_label)
-    if elapsed_s > 0:
-        footer_parts.append(f"耗时 {_format_elapsed(elapsed_s)}")
-    if todos:
-        done = sum(1 for t in todos if t.get("status") == "completed")
-        footer_parts.append(f"{done}/{len(todos)} tasks")
-    if total_tokens > 0:
-        footer_parts.append(f"{_format_tokens(total_tokens)} tokens")
     elements.append({
         "tag": "markdown",
         "content": "---\n" + " · ".join(footer_parts),

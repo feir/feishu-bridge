@@ -266,13 +266,13 @@ class TestBuildCardkitFinalCard:
         assert "main*" in footer
 
     def test_footer_full(self):
-        """All footer fields present: status · model · git · elapsed · tokens."""
+        """All footer fields present: ✅ · model · elapsed · tokens · git."""
         with patch("feishu_bridge.ui._get_git_label", return_value="dev"):
             card = build_cardkit_final_card(
                 "Hi", elapsed_s=90, total_tokens=12345,
                 model_name="claude-sonnet-4-6", workspace="/tmp/fake")
         footer = card["body"]["elements"][-1]["content"]
-        assert "✅ 完成" in footer
+        assert "✅" in footer
         assert "sonnet-4-6" in footer
         assert "dev" in footer
         assert "1m30s" in footer
@@ -282,7 +282,7 @@ class TestBuildCardkitFinalCard:
         """Footer gracefully omits model/git when not provided."""
         card = build_cardkit_final_card("Hi", elapsed_s=5)
         footer = card["body"]["elements"][-1]["content"]
-        assert "✅ 完成" in footer
+        assert "✅" in footer
         assert "5.0s" in footer
         # No model or git info
         parts = footer.split(" · ")
