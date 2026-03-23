@@ -923,10 +923,8 @@ class ResponseHandle:
                 self._card_fallback_timer.cancel()
                 self._card_fallback_timer = None
 
-            if self._typing_reaction_id and self.source_message_id:
-                remove_typing_indicator(
-                    self.client, self.source_message_id, self._typing_reaction_id)
-                self._typing_reaction_id = None
+            # Keep typing indicator active during streaming — it will be
+            # removed in deliver() or the finally block in process_message().
 
             card_id = self._try_create_cardkit()
             if card_id:
