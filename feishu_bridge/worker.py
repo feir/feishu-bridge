@@ -136,14 +136,12 @@ def _context_health_alert(result: dict, quota_snapshot=None) -> str | None:
     Args:
         quota_snapshot: Optional QuotaSnapshot from the API poller.
     """
-    # Determine context window size (model-based, API only if larger)
+    # Determine context window size (API value preferred, model inference fallback)
     max_ctx = result.get("default_context_window", 200_000)
     model_usage = result.get("modelUsage", {})
     for _model, mu in model_usage.items():
-        max_ctx = _context_window_for_model(_model)
         cw = mu.get("contextWindow", 0)
-        if cw > max_ctx:
-            max_ctx = cw
+        max_ctx = cw if cw > 0 else _context_window_for_model(_model)
         break
 
     # If auto-compact was detected, alert with pre-compact peak usage

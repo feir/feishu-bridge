@@ -190,12 +190,9 @@ class BridgeCommandHandler:
         model_name = self.bot.runner.model or ""
         for m, mu in model_usage.items():
             model_name = m
-            # API may under-report (e.g. Opus returns 200K instead of 1M)
-            # Use model-based inference, only trust API if larger
-            max_ctx = _context_window_for_model(m)
+            # API value preferred, model inference as fallback
             cw = mu.get("contextWindow", 0)
-            if cw > max_ctx:
-                max_ctx = cw
+            max_ctx = cw if cw > 0 else _context_window_for_model(m)
             break
 
         pct = total_ctx / max_ctx * 100 if max_ctx else 0
