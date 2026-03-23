@@ -9,11 +9,24 @@ description = "Feishu ↔ AI Agent bridge with 40+ API integrations"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+keywords = ["feishu", "lark", "claude", "ai", "chatbot", "bridge"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Communications :: Chat",
+    "Programming Language :: Python :: 3",
+]
 dependencies = [
     "lark-oapi>=1.5",
     "requests",
     "cryptography",
 ]
+
+[project.urls]
+Homepage = "https://github.com/feir/feishu-bridge"
+Repository = "https://github.com/feir/feishu-bridge"
+Issues = "https://github.com/feir/feishu-bridge/issues"
 
 [project.optional-dependencies]
 dev = ["pytest", "python-dotenv"]
