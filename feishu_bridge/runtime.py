@@ -332,7 +332,8 @@ class BaseRunner(ABC):
 
     @abstractmethod
     def build_args(self, prompt: str, session_id: Optional[str],
-                   resume: bool, streaming: bool) -> list:
+                   resume: bool, streaming: bool, *,
+                   fork_session: bool = False) -> list:
         """构建 CLI 命令行参数列表。"""
 
     @abstractmethod
@@ -465,14 +466,16 @@ class BaseRunner(ABC):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            env_extra: Optional[dict] = None) -> dict:
+            env_extra: Optional[dict] = None,
+            fork_session: bool = False) -> dict:
 
         if len(prompt) > MAX_PROMPT_CHARS:
             log.warning("Prompt truncated: %d -> %d chars", len(prompt), MAX_PROMPT_CHARS)
             prompt = prompt[:MAX_PROMPT_CHARS] + "\n\n...(message truncated)"
 
         streaming = bool(on_output) or self.ALWAYS_STREAMING
-        args = self.build_args(prompt, session_id, resume, streaming)
+        args = self.build_args(prompt, session_id, resume, streaming,
+                               fork_session=fork_session)
 
         log.info("%s: resume=%s sid=%s stream=%s prompt=%d chars",
                  self.get_display_name(), resume,
@@ -748,7 +751,8 @@ class ClaudeRunner(BaseRunner):
         "no such file or directory",
     ]
 
-    def build_args(self, prompt, session_id, resume, streaming):
+    def build_args(self, prompt, session_id, resume, streaming, *,
+                   fork_session=False):
         args = [
             self.command, "-p",
             "--dangerously-skip-permissions",
@@ -769,6 +773,8 @@ class ClaudeRunner(BaseRunner):
 
         if resume and session_id:
             args.extend(["--resume", session_id])
+            if fork_session:
+                args.extend(["--fork-session", "--disallowed-tools", "*"])
         elif session_id:
             args.extend(["--session-id", session_id])
 
@@ -946,7 +952,8 @@ class CodexRunner(BaseRunner):
         # run() writes the path; build_args() reads it (same thread).
         self._tls = threading.local()
 
-    def build_args(self, prompt, session_id, resume, streaming):
+    def build_args(self, prompt, session_id, resume, streaming, *,
+                   fork_session=False):
         args = [
             self.command, "exec",
             "--dangerously-bypass-approvals-and-sandbox",

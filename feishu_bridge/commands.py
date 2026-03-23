@@ -7,7 +7,7 @@ import threading
 from feishu_bridge.api.client import FeishuAPIError
 from feishu_bridge.quota import WINDOW_LABELS, fetch_codex_quota
 from feishu_bridge.ui import ResponseHandle, add_queued_reaction
-from feishu_bridge.runtime import SessionMap
+from feishu_bridge.runtime import ClaudeRunner, SessionMap
 
 log = logging.getLogger("feishu-bridge")
 
@@ -62,6 +62,7 @@ class BridgeCommandHandler:
             if self.bot.runner.supports_compact():
                 lines.append("`/compact [指示]` — 压缩当前会话上下文")
             lines.extend([
+                "`/btw <问题>` — 快速提问（不中断当前任务，基于当前上下文）",
                 "`/model [模型名]` — 查看或切换模型",
                 "`/status` — 查看会话状态（context / 费用 / 配额）",
                 "`/feishu-tasks [命令]` — 飞书任务管理（list/get/subtasks/add-subtask）",
@@ -81,6 +82,9 @@ class BridgeCommandHandler:
                 "`disabled` — 不响应该群消息",
             ])
             handle.deliver("\n".join(lines))
+
+        elif cmd == "btw":
+            self._handle_btw(item, arg, handle)
 
         elif cmd == "compact":
             if not self.bot.runner.supports_compact():
@@ -163,6 +167,40 @@ class BridgeCommandHandler:
         if action == "help":
             return self._task_help()
         return self._task_help()
+
+    def _handle_btw(self, item: dict, arg: str, handle):
+        """Handle /btw — side question via fork-session, no tools."""
+        if not arg.strip():
+            handle.deliver("用法: `/btw <问题>` — 在当前上下文中快速提问（不中断正在执行的任务）")
+            return
+
+        if not isinstance(self.bot.runner, ClaudeRunner):
+            handle.deliver("当前 Agent 不支持 /btw 命令。")
+            return
+
+        key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
+        sid = self.bot.session_map.get(key)
+        if not sid:
+            handle.deliver("当前无活跃会话，请直接发送消息。")
+            return
+
+        try:
+            result = self.bot.runner.run(
+                arg.strip(), session_id=sid, resume=True,
+                fork_session=True,
+            )
+        except Exception:
+            log.exception("/btw runner.run failed")
+            handle.deliver("[/btw] 调用失败，请稍后重试。", is_error=True)
+            return
+
+        if result.get("is_error"):
+            handle.deliver(f"[/btw] {result['result']}", is_error=True)
+        else:
+            answer = result.get("result", "").strip()
+            if not answer:
+                answer = "（无回复）"
+            handle.deliver(f"[/btw] {answer}")
 
     def _handle_status(self, item: dict, handle):
         """Unified /status: context + cost + quota in one view."""

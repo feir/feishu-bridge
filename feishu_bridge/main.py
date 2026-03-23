@@ -91,7 +91,7 @@ log = logging.getLogger("feishu-bridge")
 # Known bridge commands (exact-match whitelist for gate exemption).
 _BRIDGE_CMD_EXACT = frozenset({
     "/help", "/new", "/clear", "/reset", "/stop", "/cancel",
-    "/compact", "/model", "/status",
+    "/compact", "/model", "/status", "/btw",
     "/restart-all", "/restart",
 })
 
@@ -853,6 +853,8 @@ class FeishuBot:
                 bridge_cmd = "model"
             elif cmd == "/status":
                 bridge_cmd = "status"
+            elif cmd == "/btw":
+                bridge_cmd = "btw"
             elif cmd == "/feishu-tasks":
                 bridge_cmd = "feishu-tasks"
             elif cmd == "/feishu-doc":

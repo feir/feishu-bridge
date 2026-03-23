@@ -2389,3 +2389,178 @@ class TestWorkerCleanupAuthCard:
             def cleanup_auth_card(self, uid):
                 raise RuntimeError("boom")
         bridge_worker._cleanup_auth_card(BadMod(), "user1")  # should not raise
+
+
+# ============================================================
+# /btw command tests
+# ============================================================
+
+def test_is_bridge_command_btw():
+    """Verify /btw is recognized as a bridge command."""
+    assert bridge._is_bridge_command("/btw what is this?") is True
+    assert bridge._is_bridge_command("/btw") is True
+    # Must NOT match prefix-collision
+    assert bridge._is_bridge_command("/btweet something") is False
+
+
+def test_claude_runner_build_args_fork_session():
+    """ClaudeRunner build_args with fork_session=True adds correct flags."""
+    runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="sonnet", workspace="/tmp", timeout=30)
+    args = runner.build_args(
+        "question", session_id="sid-123", resume=True,
+        streaming=False, fork_session=True)
+    assert "--fork-session" in args
+    assert "--disallowed-tools" in args
+    dt_idx = args.index("--disallowed-tools")
+    assert args[dt_idx + 1] == "*"
+    assert "--resume" in args
+    assert "--output-format" in args
+    of_idx = args.index("--output-format")
+    assert args[of_idx + 1] == "json"
+
+
+def test_claude_runner_build_args_no_fork_by_default():
+    """ClaudeRunner build_args without fork_session has no fork flags."""
+    runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="sonnet", workspace="/tmp", timeout=30)
+    args = runner.build_args(
+        "hello", session_id="sid-123", resume=True, streaming=False)
+    assert "--fork-session" not in args
+    assert "--disallowed-tools" not in args
+
+
+def test_codex_runner_build_args_ignores_fork_session():
+    """CodexRunner accepts fork_session but ignores it."""
+    runner = _make_codex_runner()
+    args = runner.build_args(
+        "hello", session_id="sid-123", resume=True,
+        streaming=False, fork_session=True)
+    assert "--fork-session" not in args
+
+
+def test_btw_empty_arg_shows_usage():
+    """/btw with no argument returns usage hint."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="sonnet", workspace="/tmp", timeout=30)
+    bot.session_map = DummySessionMap()
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+    handler._handle_btw(
+        {"bot_id": "b", "chat_id": "chat", "thread_id": None},
+        "", handle)
+    assert len(handle.deliveries) == 1
+    assert "/btw" in handle.deliveries[0][0]
+
+
+def test_btw_no_session_returns_hint():
+    """/btw with no active session returns helpful message."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="sonnet", workspace="/tmp", timeout=30)
+    bot.session_map = DummySessionMap()  # always returns None
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+    handler._handle_btw(
+        {"bot_id": "b", "chat_id": "chat", "thread_id": None},
+        "what is 42?", handle)
+    assert len(handle.deliveries) == 1
+    assert "无活跃会话" in handle.deliveries[0][0]
+
+
+def test_btw_non_claude_runner_returns_unsupported():
+    """/btw with non-ClaudeRunner returns unsupported message."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.runner = _make_codex_runner()
+    bot.session_map = DummySessionMap()
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+    handler._handle_btw(
+        {"bot_id": "b", "chat_id": "chat", "thread_id": None},
+        "question", handle)
+    assert len(handle.deliveries) == 1
+    assert "不支持" in handle.deliveries[0][0]
+
+
+def test_btw_success_with_session(monkeypatch):
+    """/btw with active session calls runner.run with fork_session=True."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="sonnet", workspace="/tmp", timeout=30)
+
+    class SessionMapWithSid:
+        def get(self, key):
+            return "existing-sid-abc"
+    bot.session_map = SessionMapWithSid()
+
+    run_calls = []
+    def fake_run(prompt, session_id=None, resume=False, fork_session=False, **kw):
+        run_calls.append({
+            "prompt": prompt, "session_id": session_id,
+            "resume": resume, "fork_session": fork_session,
+        })
+        return {"result": "The answer is 42.", "is_error": False, "session_id": "fork-sid"}
+
+    monkeypatch.setattr(bot.runner, "run", fake_run)
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+    handler._handle_btw(
+        {"bot_id": "b", "chat_id": "chat", "thread_id": None},
+        "what is 42?", handle)
+
+    assert len(run_calls) == 1
+    assert run_calls[0]["fork_session"] is True
+    assert run_calls[0]["resume"] is True
+    assert run_calls[0]["session_id"] == "existing-sid-abc"
+    assert len(handle.deliveries) == 1
+    assert "[/btw]" in handle.deliveries[0][0]
+    assert "42" in handle.deliveries[0][0]
+
+
+def test_btw_runner_error_delivers_error(monkeypatch):
+    """/btw delivers error when runner returns is_error."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="sonnet", workspace="/tmp", timeout=30)
+
+    class SessionMapWithSid:
+        def get(self, key):
+            return "sid-err"
+    bot.session_map = SessionMapWithSid()
+
+    monkeypatch.setattr(bot.runner, "run",
+        lambda *a, **kw: {"result": "timeout", "is_error": True})
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+    handler._handle_btw(
+        {"bot_id": "b", "chat_id": "chat", "thread_id": None},
+        "question", handle)
+
+    assert len(handle.deliveries) == 1
+    assert handle.deliveries[0][1] is True  # is_error
+    assert "[/btw]" in handle.deliveries[0][0]
+
+
+def test_btw_runner_exception_delivers_error(monkeypatch):
+    """/btw delivers error when runner.run() raises an exception."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="sonnet", workspace="/tmp", timeout=30)
+
+    class SessionMapWithSid:
+        def get(self, key):
+            return "sid-exc"
+    bot.session_map = SessionMapWithSid()
+
+    monkeypatch.setattr(bot.runner, "run",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+    handler._handle_btw(
+        {"bot_id": "b", "chat_id": "chat", "thread_id": None},
+        "question", handle)
+
+    assert len(handle.deliveries) == 1
+    assert handle.deliveries[0][1] is True  # is_error
+    assert "调用失败" in handle.deliveries[0][0]
