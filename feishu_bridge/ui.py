@@ -672,6 +672,16 @@ def build_cardkit_streaming_card() -> dict:
                     "element_id": CARDKIT_ELEMENT_ID,
                     "content": "",
                 },
+                {
+                    "tag": "markdown",
+                    "content": " ",
+                    "icon": {
+                        "tag": "custom_icon",
+                        "img_key": "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg",
+                        "size": "16px 16px",
+                    },
+                    "element_id": "loading_icon",
+                },
             ],
         },
     }
@@ -829,11 +839,14 @@ def add_typing_indicator(lark_client, message_id: str) -> Optional[str]:
             .build()
         resp = lark_client.im.v1.message_reaction.create(req)
         if resp.success() and resp.data:
+            log.debug("Typing indicator added: msg=%s reaction=%s",
+                      message_id, resp.data.reaction_id)
             return resp.data.reaction_id
         _check_terminal_code(resp, message_id)
-        log.debug("Typing indicator add failed: code=%s msg=%s", resp.code, resp.msg)
+        log.warning("Typing indicator add failed: code=%s msg=%s",
+                    resp.code, resp.msg)
     except Exception:
-        log.debug("Typing indicator add error", exc_info=True)
+        log.warning("Typing indicator add error", exc_info=True)
     return None
 
 
