@@ -349,7 +349,9 @@ MAX_CARD_PAYLOAD_BYTES = 28 * 1024
 COMPACT_MAX_CHARS = 4_000
 
 CARDKIT_ELEMENT_ID = "streaming_output"
-CARDKIT_TODO_ELEMENT_ID = "loading_icon"
+CARDKIT_LOADING_ELEMENT_ID = "loading_icon"
+CARDKIT_LOADING_ICON_IMG_KEY = "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
+CARDKIT_TODO_ELEMENT_ID = "todo_progress"
 CARDKIT_THROTTLE_MS = 100
 PATCH_THROTTLE_MS = 1500
 GAP_THRESHOLD_MS = 2000
@@ -684,6 +686,16 @@ def build_cardkit_streaming_card() -> dict:
                 },
                 {
                     "tag": "markdown",
+                    "content": " ",
+                    "icon": {
+                        "tag": "custom_icon",
+                        "img_key": CARDKIT_LOADING_ICON_IMG_KEY,
+                        "size": "16px 16px",
+                    },
+                    "element_id": CARDKIT_LOADING_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
                     "content": "",
                     "element_id": CARDKIT_TODO_ELEMENT_ID,
                 },
@@ -915,6 +927,7 @@ class ResponseHandle:
         self._card_fallback_timeout = 8
         self._summary_updated = False
         self._terminated = False
+        self._loading_icon_cleared = False
         self._handle_start_time: float = time.time()
         self._runner: Optional[ClaudeRunner] = None
         self._runner_tag: Optional[str] = None
@@ -1146,27 +1159,36 @@ class ResponseHandle:
         except Exception:
             log.debug("Summary update error", exc_info=True)
 
-    def _update_tool_body(self, label: str):
-        """Update card body element with tool progress indicator."""
-        if not self._cardkit_card_id:
-            return
+    def _update_element(self, element_id: str, content: str,
+                        card_id: str | None = None) -> bool:
+        """Push content to a CardKit element. Returns True on success."""
+        cid = card_id or self._cardkit_card_id
+        if not cid:
+            return False
         try:
             body = ContentCardElementRequestBody.builder() \
                 .uuid(str(uuid.uuid4())) \
-                .content(f"*{label}...*") \
+                .content(content) \
                 .sequence(self._next_seq()) \
                 .build()
             req = ContentCardElementRequest.builder() \
-                .card_id(self._cardkit_card_id) \
-                .element_id(CARDKIT_ELEMENT_ID) \
+                .card_id(cid) \
+                .element_id(element_id) \
                 .request_body(body) \
                 .build()
             resp = self.client.cardkit.v1.card_element.content(req)
             if not resp.success():
-                log.debug("Tool body update failed: code=%s msg=%s",
-                          resp.code, resp.msg)
+                log.debug("Element update failed (%s): code=%s msg=%s",
+                          element_id, resp.code, resp.msg)
+                return False
+            return True
         except Exception:
-            log.debug("Tool body update error", exc_info=True)
+            log.debug("Element update error (%s)", element_id, exc_info=True)
+            return False
+
+    def _update_tool_body(self, label: str):
+        """Update card body element with tool progress indicator."""
+        self._update_element(CARDKIT_ELEMENT_ID, f"*{label}...*")
 
     @staticmethod
     def _format_todos(todos: list[dict]) -> str:
@@ -1183,6 +1205,13 @@ class ResponseHandle:
                 lines.append(f"☐ {content}")
         return "\n".join(lines)
 
+    def _clear_loading_icon(self):
+        """Clear loading icon element (called once when todo list appears)."""
+        if self._loading_icon_cleared or not self._cardkit_card_id:
+            return
+        self._loading_icon_cleared = True
+        self._update_element(CARDKIT_LOADING_ELEMENT_ID, "")
+
     def todo_list_update(self, todos: list[dict]):
         """Update the todo element in the streaming card."""
         if self._terminated:
@@ -1190,24 +1219,8 @@ class ResponseHandle:
         if not self._cardkit_card_id:
             return
         self._last_todos = todos
-        md = self._format_todos(todos)
-        try:
-            body = ContentCardElementRequestBody.builder() \
-                .uuid(str(uuid.uuid4())) \
-                .content(md) \
-                .sequence(self._next_seq()) \
-                .build()
-            req = ContentCardElementRequest.builder() \
-                .card_id(self._cardkit_card_id) \
-                .element_id(CARDKIT_TODO_ELEMENT_ID) \
-                .request_body(body) \
-                .build()
-            resp = self.client.cardkit.v1.card_element.content(req)
-            if not resp.success():
-                log.debug("Todo list update failed: code=%s msg=%s",
-                          resp.code, resp.msg)
-        except Exception:
-            log.debug("Todo list update error", exc_info=True)
+        self._clear_loading_icon()
+        self._update_element(CARDKIT_TODO_ELEMENT_ID, self._format_todos(todos))
 
     def _update_summary_to_typing(self):
         """Switch CardKit summary from '思考中...' to '输入中...' on first content."""
@@ -1221,23 +1234,7 @@ class ResponseHandle:
             self._update_summary_to_typing()
             text = strip_action_markers(text)
             text = optimize_markdown_style(text)
-            seq = self._next_seq()
-            try:
-                body = ContentCardElementRequestBody.builder() \
-                    .uuid(str(uuid.uuid4())) \
-                    .content(text) \
-                    .sequence(seq) \
-                    .build()
-                req = ContentCardElementRequest.builder() \
-                    .card_id(self._cardkit_card_id) \
-                    .element_id(CARDKIT_ELEMENT_ID) \
-                    .request_body(body) \
-                    .build()
-                resp = self.client.cardkit.v1.card_element.content(req)
-                if not resp.success():
-                    log.debug("CardKit stream update: code=%s msg=%s", resp.code, resp.msg)
-            except Exception:
-                log.exception("CardKit stream update error")
+            self._update_element(CARDKIT_ELEMENT_ID, text)
         elif self.card_message_id:
             self._try_patch(self.card_message_id, build_streaming_card(text))
 
@@ -1251,22 +1248,7 @@ class ResponseHandle:
             self._runner.cancel(self._runner_tag)
 
     def _pre_send_content(self, card_id: str, content: str):
-        try:
-            body = ContentCardElementRequestBody.builder() \
-                .uuid(str(uuid.uuid4())) \
-                .content(content) \
-                .sequence(self._next_seq()) \
-                .build()
-            req = ContentCardElementRequest.builder() \
-                .card_id(card_id) \
-                .element_id(CARDKIT_ELEMENT_ID) \
-                .request_body(body) \
-                .build()
-            resp = self.client.cardkit.v1.card_element.content(req)
-            if not resp.success():
-                log.debug("Pre-send content push: code=%s msg=%s", resp.code, resp.msg)
-        except Exception:
-            log.debug("Pre-send content push failed", exc_info=True)
+        self._update_element(CARDKIT_ELEMENT_ID, content, card_id=card_id)
 
     def _try_create_cardkit(self) -> Optional[str]:
         try:
