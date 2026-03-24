@@ -932,6 +932,7 @@ class ResponseHandle:
         self._runner: Optional[ClaudeRunner] = None
         self._runner_tag: Optional[str] = None
         self._last_todos: list[dict] | None = None
+        self._active_agents: list[dict] = []
 
     def _next_seq(self) -> int:
         with self._seq_lock:
@@ -1113,6 +1114,8 @@ class ResponseHandle:
         "WebFetch": "抓取网页",
         "WebSearch": "搜索网页",
         "Agent": "分发子任务",
+        "TeamCreate": "创建团队",
+        "SendMessage": "团队通信",
         "Skill": "执行技能",
         "TodoWrite": "更新任务",
         "NotebookEdit": "编辑笔记",
@@ -1212,6 +1215,43 @@ class ResponseHandle:
         self._loading_icon_cleared = True
         self._update_element(CARDKIT_LOADING_ELEMENT_ID, "")
 
+    def _render_progress(self):
+        """Render combined agent + todo progress to the todo element."""
+        if not self._cardkit_card_id:
+            return
+        parts = []
+        for a in self._active_agents:
+            desc = a.get("description", "")
+            atype = a.get("subagent_type", "")
+            suffix = f" ({atype})" if atype else ""
+            if a.get("status") == "completed":
+                parts.append(f"~~☑ {desc}{suffix}~~")
+            else:
+                parts.append(f"◉ **{desc}{suffix}**")
+        if self._last_todos:
+            if parts:
+                parts.append("")
+            parts.append(self._format_todos(self._last_todos))
+        self._clear_loading_icon()
+        self._update_element(CARDKIT_TODO_ELEMENT_ID, "\n".join(parts))
+
+    def agent_list_update(self, launches: list[dict]):
+        """Update agent list when new agents are dispatched."""
+        if self._terminated:
+            return
+        if not self._cardkit_card_id:
+            if not self._ensure_card():
+                return
+        self._active_agents = [{"status": "in_progress", **a} for a in launches]
+        self._render_progress()
+
+    def _mark_agents_completed(self):
+        """Clear agent display when text starts flowing."""
+        if not self._active_agents:
+            return
+        self._active_agents = []
+        self._render_progress()
+
     def todo_list_update(self, todos: list[dict]):
         """Update the todo element in the streaming card."""
         if self._terminated:
@@ -1219,8 +1259,7 @@ class ResponseHandle:
         if not self._cardkit_card_id:
             return
         self._last_todos = todos
-        self._clear_loading_icon()
-        self._update_element(CARDKIT_TODO_ELEMENT_ID, self._format_todos(todos))
+        self._render_progress()
 
     def _update_summary_to_typing(self):
         """Switch CardKit summary from '思考中...' to '输入中...' on first content."""
@@ -1231,6 +1270,7 @@ class ResponseHandle:
 
     def _perform_flush(self, text: str):
         if self._use_cardkit and self._cardkit_card_id:
+            self._mark_agents_completed()
             self._update_summary_to_typing()
             text = strip_action_markers(text)
             text = optimize_markdown_style(text)

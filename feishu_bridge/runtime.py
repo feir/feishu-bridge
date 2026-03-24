@@ -100,6 +100,7 @@ class StreamState:
     pending_output: list[str] = field(default_factory=list)
     pending_tool_status: list[str] = field(default_factory=list)
     pending_todo_update: list[dict] | None = None
+    pending_agent_launches: list[dict] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +467,7 @@ class BaseRunner(ABC):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            env_extra: Optional[dict] = None,
+            on_agent_update=None, env_extra: Optional[dict] = None,
             fork_session: bool = False) -> dict:
 
         if len(prompt) > MAX_PROMPT_CHARS:
@@ -507,7 +508,8 @@ class BaseRunner(ABC):
         if streaming:
             result = self._run_streaming(proc, session_id, tag, on_output,
                                          on_tool_status=on_tool_status,
-                                         on_todo_update=on_todo_update)
+                                         on_todo_update=on_todo_update,
+                                         on_agent_update=on_agent_update)
         else:
             result = self._run_blocking(proc, session_id, tag)
 
@@ -555,7 +557,8 @@ class BaseRunner(ABC):
         return self.parse_blocking_output(stdout, session_id)
 
     def _run_streaming(self, proc, session_id, tag, on_output,
-                        on_tool_status=None, on_todo_update=None) -> dict:
+                        on_tool_status=None, on_todo_update=None,
+                        on_agent_update=None) -> dict:
         state = StreamState(session_id=session_id)
         timed_out = False
         result_received = threading.Event()
@@ -616,6 +619,11 @@ class BaseRunner(ABC):
                 if on_todo_update and state.pending_todo_update is not None:
                     on_todo_update(state.pending_todo_update)
                     state.pending_todo_update = None
+
+                # Drain pending_agent_launches → on_agent_update callback
+                if on_agent_update and state.pending_agent_launches is not None:
+                    on_agent_update(state.pending_agent_launches)
+                    state.pending_agent_launches = None
 
                 if state.done:
                     result_received.set()
@@ -808,6 +816,17 @@ class ClaudeRunner(BaseRunner):
                         todos = block.get("input", {}).get("todos")
                         if isinstance(todos, list):
                             state.pending_todo_update = todos
+                    elif tool_name == "Agent":
+                        ai = block.get("input", {})
+                        if not ai.get("run_in_background"):
+                            launch = {
+                                "description": ai.get("description", ""),
+                                "name": ai.get("name"),
+                                "subagent_type": ai.get("subagent_type", ""),
+                            }
+                            if state.pending_agent_launches is None:
+                                state.pending_agent_launches = []
+                            state.pending_agent_launches.append(launch)
         elif etype == "rate_limit_event":
             rli = event.get("rate_limit_info")
             if rli:
@@ -978,7 +997,7 @@ class CodexRunner(BaseRunner):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            env_extra: Optional[dict] = None) -> dict:
+            on_agent_update=None, env_extra: Optional[dict] = None) -> dict:
         """Override run() to manage per-invocation system prompt temp file."""
         self._tls.instructions_path = None
         try:
@@ -995,7 +1014,8 @@ class CodexRunner(BaseRunner):
             return super().run(
                 prompt, session_id=session_id, resume=resume,
                 tag=tag, on_output=on_output, on_tool_status=on_tool_status,
-                on_todo_update=on_todo_update, env_extra=env_extra,
+                on_todo_update=on_todo_update, on_agent_update=on_agent_update,
+                env_extra=env_extra,
             )
         finally:
             path = getattr(self._tls, "instructions_path", None)
