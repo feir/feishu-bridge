@@ -92,21 +92,9 @@ class BridgeCommandHandler:
                 "`/btw <问题>` — 快速提问（不中断当前任务，基于当前上下文）",
                 "`/model [模型名]` — 查看或切换模型",
                 "`/status` — 查看会话状态（context / 费用 / 配额）",
-                "`/feishu-tasks [命令]` — 飞书任务管理（list/get/subtasks/add-subtask）",
-                "`/feishu-doc` — 云文档读写（Markdown）",
-                "`/feishu-sheet` — 电子表格读写",
-                "`/feishu-bitable` — 多维表格操作",
                 "`/restart` — 重启当前 Bot 实例",
                 "`/restart-all` — 重启所有 Bot 实例",
                 "`/help` — 显示本帮助",
-                "",
-                "飞书命令首次使用需授权（自动弹出授权卡片）",
-                "",
-                "**群聊模式**",
-                "`owner-only` — 仅 owner @机器人并附上消息时响应",
-                "`mention-all` — 任何人 @机器人并附上消息时响应",
-                "`auto-reply` — 群内所有消息自动响应（无需 @）",
-                "`disabled` — 不响应该群消息",
             ])
             # Version & upgrade info
             mode, plat, src_path = _get_install_info()
