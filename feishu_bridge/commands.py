@@ -1,13 +1,39 @@
 """Bridge command handlers for Feishu bridge."""
 
 import datetime
+import importlib.metadata
+import json
 import logging
+import platform as _platform
 import threading
 
 from feishu_bridge.api.client import FeishuAPIError
 from feishu_bridge.quota import WINDOW_LABELS, fetch_codex_quota
 from feishu_bridge.ui import ResponseHandle, add_queued_reaction
 from feishu_bridge.runtime import ClaudeRunner, SessionMap
+
+
+def _get_install_info() -> tuple[str, str, str | None]:
+    """Detect installation mode and platform.
+
+    Returns (mode, platform, source_path):
+        mode: "pypi" or "git"
+        platform: "linux" or "macos"
+        source_path: local source directory (git mode only)
+    """
+    plat = "macos" if _platform.system() == "Darwin" else "linux"
+    try:
+        dist = importlib.metadata.distribution("feishu-bridge")
+        raw = dist.read_text("direct_url.json")
+        if raw:
+            info = json.loads(raw)
+            if info.get("dir_info", {}).get("editable"):
+                url = info.get("url", "")
+                path = url.removeprefix("file://") if url.startswith("file://") else url
+                return "git", plat, path
+    except Exception:
+        pass
+    return "pypi", plat, None
 
 log = logging.getLogger("feishu-bridge")
 
@@ -53,6 +79,7 @@ class BridgeCommandHandler:
                 handle.deliver("当前没有正在执行的任务。")
 
         elif cmd == "help":
+            from feishu_bridge import __version__
             lines = [
                 "**Bridge 命令**",
                 "`/new` `/clear` `/reset` — 重置会话（清除上下文）",
@@ -80,6 +107,25 @@ class BridgeCommandHandler:
                 "`mention-all` — 任何人 @机器人并附上消息时响应",
                 "`auto-reply` — 群内所有消息自动响应（无需 @）",
                 "`disabled` — 不响应该群消息",
+            ])
+            # Version & upgrade info
+            mode, plat, src_path = _get_install_info()
+            bot_id = self.bot.bot_id
+            if mode == "git":
+                upgrade_cmd = f"cd {src_path} && git pull"
+            else:
+                upgrade_cmd = "pipx upgrade feishu-bridge"
+            if plat == "macos":
+                restart_hint = "或 `launchctl kickstart -k` 重启服务"
+            else:
+                restart_hint = (
+                    f"或 `systemctl --user restart feishu-bridge@{bot_id}`"
+                )
+            lines.extend([
+                "",
+                f"**v{__version__}** ({mode}{'・macOS' if plat == 'macos' else ''})",
+                f"升级: `{upgrade_cmd}` → `/restart`",
+                restart_hint,
             ])
             handle.deliver("\n".join(lines))
 
