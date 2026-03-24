@@ -749,7 +749,8 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
                              bot_id: str | None = None,
                              model_name: str | None = None,
                              workspace: str | None = None,
-                             todos: list[dict] | None = None) -> dict:
+                             todos: list[dict] | None = None,
+                             context_alert: str | None = None) -> dict:
     # P1: parse action markers BEFORE optimize (Finding 6 ordering fix)
     content, markers = parse_action_markers(content)
     content = optimize_markdown_style(content)
@@ -797,37 +798,39 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
             }],
         })
 
-    # Footer: ✅ tasks · model · elapsed · tokens · git
+    # Footer: all status info in one notation-sized element
+    # Line 1: ✅ 9/9 tasks · model · elapsed · tokens · git
+    # Line 2: context alert (if any)
+    # Line 3: update banner (if any)
     status = "❌" if is_error else "✅"
-    footer_parts = [status]
+    detail_parts = []
     if todos:
         done = sum(1 for t in todos if t.get("status") == "completed")
-        footer_parts.append(f"{done}/{len(todos)} tasks")
+        detail_parts.append(f"{done}/{len(todos)} tasks")
     if model_name:
         # Strip "claude-" prefix for brevity (e.g. "claude-opus-4-6" → "opus-4-6")
         short_model = model_name.removeprefix("claude-")
-        footer_parts.append(short_model)
+        detail_parts.append(short_model)
     if elapsed_s > 0:
-        footer_parts.append(_format_elapsed(elapsed_s))
+        detail_parts.append(_format_elapsed(elapsed_s))
     if total_tokens > 0:
-        footer_parts.append(f"{_format_tokens(total_tokens)} tokens")
+        detail_parts.append(f"{_format_tokens(total_tokens)} tokens")
     git_label = _get_git_label(workspace) if workspace else None
     if git_label:
-        footer_parts.append(git_label)
+        detail_parts.append(git_label)
 
-    # Update notification footer (orange text before status line)
+    status_line = status + (" " + " · ".join(detail_parts) if detail_parts else "")
+    footer_lines = [status_line]
+    if context_alert:
+        footer_lines.append(context_alert)
     from feishu_bridge.updater import get_update_banner_text
     _banner = get_update_banner_text()
     if _banner:
-        elements.append({
-            "tag": "markdown",
-            "content": _banner,
-            "text_size": "notation",
-        })
+        footer_lines.append(_banner)
 
     elements.append({
         "tag": "markdown",
-        "content": "---\n" + " · ".join(footer_parts),
+        "content": "---\n" + "\n".join(footer_lines),
         "text_size": "notation",
     })
 
@@ -1005,7 +1008,8 @@ class ResponseHandle:
 
     def deliver(self, content: str, is_error: bool = False,
                 total_tokens: int = 0, model_name: str | None = None,
-                workspace: str | None = None):
+                workspace: str | None = None,
+                context_alert: str | None = None):
         if self._card_fallback_timer:
             self._card_fallback_timer.cancel()
             self._card_fallback_timer = None
@@ -1025,13 +1029,16 @@ class ResponseHandle:
                  bool(self._use_cardkit and self._cardkit_card_id))
         if self._use_cardkit and self._cardkit_card_id:
             self._deliver_cardkit(content, is_error, total_tokens=total_tokens,
-                                  model_name=model_name, workspace=workspace)
+                                  model_name=model_name, workspace=workspace,
+                                  context_alert=context_alert)
         else:
-            self._deliver_im_patch(content, is_error)
+            self._deliver_im_patch(content, is_error,
+                                   context_alert=context_alert)
 
     def _deliver_cardkit(self, content: str, is_error: bool,
                          total_tokens: int = 0, model_name: str | None = None,
-                         workspace: str | None = None):
+                         workspace: str | None = None,
+                         context_alert: str | None = None):
         card_id = self._cardkit_card_id
         seq = self._next_seq()
         settings_json = json.dumps({"config": {"streaming_mode": False}})
@@ -1057,7 +1064,8 @@ class ResponseHandle:
         if not settings_ok:
             log.warning("CardKit settings failed, falling back to IM patch")
             self.card_message_id = None
-            self._deliver_im_patch(content, is_error)
+            self._deliver_im_patch(content, is_error,
+                                   context_alert=context_alert)
             return
 
         elapsed_s = time.time() - self._handle_start_time
@@ -1066,7 +1074,7 @@ class ResponseHandle:
             content, is_error, elapsed_s=elapsed_s, total_tokens=total_tokens,
             chat_id=self.chat_id, bot_id=self.bot_id,
             model_name=model_name, workspace=workspace,
-            todos=self._last_todos)
+            todos=self._last_todos, context_alert=context_alert)
         card_data = json.dumps(final_card_json, ensure_ascii=False)
         log.info("CardKit card.update: card_id=%s content_len=%d payload_bytes=%d seq=%d",
                  card_id, len(content), len(card_data.encode("utf-8")), seq)
@@ -1088,13 +1096,19 @@ class ResponseHandle:
             if not resp.success():
                 log.error("CardKit card.update failed: code=%s msg=%s", resp.code, resp.msg)
                 self.card_message_id = None
-                self._deliver_im_patch(content, is_error)
+                self._deliver_im_patch(content, is_error,
+                                       context_alert=context_alert)
         except Exception:
             log.exception("CardKit card.update error")
             self.card_message_id = None
-            self._deliver_im_patch(content, is_error)
+            self._deliver_im_patch(content, is_error,
+                                   context_alert=context_alert)
 
-    def _deliver_im_patch(self, content: str, is_error: bool):
+    def _deliver_im_patch(self, content: str, is_error: bool,
+                          context_alert: str | None = None):
+        # IM patch has no structured footer; append alerts to content body
+        if context_alert:
+            content = content + "\n\n---\n" + context_alert
         card = build_card(content, is_error)
         if self.card_message_id:
             if self._try_patch(self.card_message_id, card):

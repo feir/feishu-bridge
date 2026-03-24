@@ -126,7 +126,11 @@ def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
 
 
 def _context_health_alert(result: dict, quota_snapshot=None) -> str | None:
-    """Check context utilization and return an alert suffix, or None.
+    """Check context utilization and return a plain alert string, or None.
+
+    Returns clean text (no ``---`` divider or leading newlines) suitable
+    for embedding in a card footer.  The caller is responsible for
+    presentation formatting.
 
     Uses ``peak_context_tokens`` (high-water mark before auto-compact)
     when available, falling back to ``last_call_usage`` or ``usage``.
@@ -150,7 +154,7 @@ def _context_health_alert(result: dict, quota_snapshot=None) -> str | None:
     if compact_detected and peak_tokens > 0:
         peak_pct = peak_tokens / max_ctx * 100
         return (
-            f"\n\n---\n⚠️ 上下文已自动压缩（压缩前 {peak_pct:.0f}%）"
+            f"⚠️ 上下文已自动压缩（压缩前 {peak_pct:.0f}%）"
             "— 早期对话可能被概括，建议关注上下文完整性"
         )
 
@@ -168,22 +172,14 @@ def _context_health_alert(result: dict, quota_snapshot=None) -> str | None:
 
     # Build quota alert from both stream event and API snapshot
     rate_alert = _build_quota_alert(result, quota_snapshot)
-    if rate_alert:
-        rate_alert = "\n" + rate_alert
 
     if pct >= 85:
-        return (
-            f"\n\n---\n🔴 Context {pct:.0f}% — 建议 `/new` 新会话或 `/compact` 压缩"
-            + rate_alert
-        )
+        alert = f"🔴 Context {pct:.0f}% — 建议 `/new` 新会话或 `/compact` 压缩"
+        return "\n".join(filter(None, [alert, rate_alert]))
     if pct >= 70:
-        return (
-            f"\n\n---\n🟡 Context {pct:.0f}% — 可考虑 `/compact` 压缩上下文"
-            + rate_alert
-        )
-    if rate_alert:
-        return f"\n\n---{rate_alert}"
-    return None
+        alert = f"🟡 Context {pct:.0f}% — 可考虑 `/compact` 压缩上下文"
+        return "\n".join(filter(None, [alert, rate_alert]))
+    return rate_alert or None
 
 
 def format_task_detail_bridge(task: dict) -> str:
@@ -729,12 +725,11 @@ def process_message(
             result["result"] = _text
 
         # --- Context health alert ---
+        ctx_alert = None
         if effective_sid and not result.get("is_error"):
             quota_poller = item.get("_quota_poller")
             quota_snap = quota_poller.snapshot if quota_poller else None
             ctx_alert = _context_health_alert(result, quota_snap)
-            if ctx_alert:
-                result["result"] = (result.get("result") or "") + ctx_alert
 
         if not handle._terminated:
             usage = result.get("usage") or {}
@@ -746,7 +741,8 @@ def process_message(
             handle.deliver(result["result"], is_error=result["is_error"],
                            total_tokens=total_tokens,
                            model_name=model_name,
-                           workspace=runner.workspace)
+                           workspace=runner.workspace,
+                           context_alert=ctx_alert)
 
         return handle
 
