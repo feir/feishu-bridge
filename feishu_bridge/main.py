@@ -91,7 +91,7 @@ log = logging.getLogger("feishu-bridge")
 # Known bridge commands (exact-match whitelist for gate exemption).
 _BRIDGE_CMD_EXACT = frozenset({
     "/help", "/new", "/clear", "/reset", "/stop", "/cancel",
-    "/compact", "/model", "/status", "/btw",
+    "/compact", "/model", "/status", "/btw", "/update",
     "/restart-all", "/restart",
 })
 
@@ -855,6 +855,8 @@ class FeishuBot:
                 bridge_cmd = "status"
             elif cmd == "/btw":
                 bridge_cmd = "btw"
+            elif cmd == "/update":
+                bridge_cmd = "update"
             elif cmd == "/feishu-tasks":
                 bridge_cmd = "feishu-tasks"
             elif cmd == "/feishu-doc":
@@ -1289,6 +1291,12 @@ def main():
             exc = f.exception()
             if exc:
                 log.warning("Startup task failed: %s", exc)
+
+    # Start background update checker
+    from feishu_bridge.commands import _get_install_info
+    from feishu_bridge.updater import init_updater
+    _mode, _plat, _src_path = _get_install_info()
+    init_updater(_mode, _src_path)
 
     # Start (blocking)
     from feishu_bridge import __version__

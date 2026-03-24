@@ -92,6 +92,7 @@ class BridgeCommandHandler:
                 "`/btw <问题>` — 快速提问（不中断当前任务，基于当前上下文）",
                 "`/model [模型名]` — 查看或切换模型",
                 "`/status` — 查看会话状态（context / 费用 / 配额）",
+                "`/update` — 检查并拉取最新版本（不重启）",
                 "`/restart` — 重启当前 Bot 实例",
                 "`/restart-all` — 重启所有 Bot 实例",
                 "`/help` — 显示本帮助",
@@ -119,6 +120,9 @@ class BridgeCommandHandler:
 
         elif cmd == "btw":
             self._handle_btw(item, arg, handle)
+
+        elif cmd == "update":
+            self._handle_update(handle)
 
         elif cmd == "compact":
             if not self.bot.runner.supports_compact():
@@ -201,6 +205,30 @@ class BridgeCommandHandler:
         if action == "help":
             return self._task_help()
         return self._task_help()
+
+    def _handle_update(self, handle):
+        """Handle /update — check for new version and pull if available."""
+        from feishu_bridge import __version__
+        from feishu_bridge.updater import check_and_update, get_pending_version
+
+        pv = get_pending_version()
+        if pv:
+            handle.deliver(
+                f"v{pv} 已就绪（当前运行 v{__version__}），`/restart` 部署。")
+            return
+
+        handle.send_processing_indicator()
+        result = check_and_update()
+        status = result.get("status")
+        if status == "updated":
+            handle.deliver(
+                f"已拉取新版本 v{result['version']}（当前运行 v{__version__}），"
+                f"`/restart` 部署。")
+        elif status == "up_to_date":
+            handle.deliver(f"已是最新版本 v{__version__}。")
+        else:
+            handle.deliver(
+                f"检查更新失败: {result.get('message', '未知错误')}", is_error=True)
 
     def _handle_btw(self, item: dict, arg: str, handle):
         """Handle /btw — side question via fork-session, no tools."""

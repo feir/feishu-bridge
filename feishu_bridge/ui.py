@@ -616,6 +616,15 @@ def build_card(content: str, is_error: bool = False,
         for chunk in chunks
     ]
 
+    # Update notification (IM patch fallback path)
+    from feishu_bridge.updater import get_update_banner_text
+    _banner = get_update_banner_text()
+    if _banner:
+        elements.append({
+            "tag": "div",
+            "text": {"content": _banner, "tag": "lark_md"},
+        })
+
     title_text = "❌ 错误" if is_error else f"✅ {_bot_display_name}"
     template = "red" if is_error else "green"
     card = {
@@ -793,6 +802,17 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
     git_label = _get_git_label(workspace) if workspace else None
     if git_label:
         footer_parts.append(git_label)
+
+    # Update notification footer (orange text before status line)
+    from feishu_bridge.updater import get_update_banner_text
+    _banner = get_update_banner_text()
+    if _banner:
+        elements.append({
+            "tag": "markdown",
+            "content": _banner,
+            "text_size": "notation",
+        })
+
     elements.append({
         "tag": "markdown",
         "content": "---\n" + " · ".join(footer_parts),
