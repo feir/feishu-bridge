@@ -449,6 +449,10 @@ class FeishuBot:
         if chat_type == "p2p":
             return True
 
+        # Trusted bots bypass group gate entirely
+        if sender_id in self.trusted_bots:
+            return True
+
         # No group_policy configured — compat mode, pass all
         if self._group_default_mode is None:
             return True
