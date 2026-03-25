@@ -194,14 +194,6 @@ def load_config(config_path: str, bot_name: str) -> dict:
         log.error("allowed_users entries must be non-empty strings")
         sys.exit(1)
 
-    # Validate trusted_bots (optional)
-    trusted = bot.get("trusted_bots", [])
-    if trusted:
-        if not isinstance(trusted, list) or not all(isinstance(x, str) and x for x in trusted):
-            log.error("trusted_bots must be a list of non-empty strings")
-            sys.exit(1)
-        log.info("trusted_bots: %s", trusted)
-
     # Migrate legacy "claude" key → "agent" (backward compat)
     if "claude" in config and "agent" not in config:
         claude_legacy = config.pop("claude")
@@ -356,7 +348,6 @@ class FeishuBot:
         self.workspace = self.bot_config["workspace"]
         self.allowed_users = self.bot_config.get("allowed_users", ["*"])
         self.allowed_chats = self.bot_config.get("allowed_chats", ["*"])
-        self.trusted_bots = set(self.bot_config.get("trusted_bots", []))
         self._todo_auto_drive = config.get("todo_auto_drive", True)
         self._all_bot_names = config.get("all_bot_names", [self.bot_id])
         self.bot_open_id: str | None = None  # set by main() via fetch_bot_info
@@ -447,10 +438,6 @@ class FeishuBot:
         """Group chat gate policy. Returns True to allow, False to reject."""
         # p2p (DM) — always pass, no group gate
         if chat_type == "p2p":
-            return True
-
-        # Trusted bots bypass group gate entirely
-        if sender_id in self.trusted_bots:
             return True
 
         # No group_policy configured — compat mode, pass all
@@ -584,27 +571,14 @@ class FeishuBot:
                 return
 
             # Permission: sender
-            # For bot senders (sender_type="app"), WebSocket event sender_id
-            # fields are all empty.  Defer identity resolution to worker
-            # thread (GetMessage API = network I/O, forbidden here).
-            _needs_bot_auth = False
-            if not sender_id and sender_type == "app" and self.trusted_bots:
-                _needs_bot_auth = True
-            elif not sender_id:
+            if not sender_id:
                 log.debug("Rejected message with no sender_id (system)")
                 return
-            else:
-                is_trusted_bot = (sender_type == "app"
-                                  and sender_id in self.trusted_bots)
-                if (not is_trusted_bot
-                        and "*" not in self.allowed_users
-                        and sender_id not in self.allowed_users):
-                    log.info("Unauthorized sender: %s (type=%s)",
-                             sender_id, sender_type)
-                    return
-                if is_trusted_bot:
-                    log.info("Trusted bot message from %s in chat %s",
-                             sender_id, chat_id)
+            if ("*" not in self.allowed_users
+                    and sender_id not in self.allowed_users):
+                log.info("Unauthorized sender: %s (type=%s)",
+                         sender_id, sender_type)
+                return
 
             # Permission: chat
             if ("*" not in self.allowed_chats
@@ -636,7 +610,7 @@ class FeishuBot:
                 if _is_bridge_command(_pre_text):
                     _skip_gate = True
 
-            if not _skip_gate and not _needs_bot_auth:
+            if not _skip_gate:
                 if not self._check_group_gate(
                         chat_type, sender_id, _msg_mentions, chat_id):
                     return
@@ -903,7 +877,6 @@ class FeishuBot:
                     "thread_id": thread_id,
                     "message_id": message_id,
                     "sender_id": sender_id,
-                    "_needs_bot_auth": _needs_bot_auth,
                     "_queued_reaction_id": None,
                 }
                 # Heavy commands (/compact, /new, /reset, /clear, /status)
@@ -942,8 +915,6 @@ class FeishuBot:
                 "parent_id": parent_id,
                 "message_id": message_id,
                 "sender_id": sender_id,
-                "sender_type": sender_type,
-                "_needs_bot_auth": _needs_bot_auth,
                 "text": text,
                 "image_key": image_key,
                 "file_key": file_key,
@@ -1011,8 +982,7 @@ class FeishuBot:
 
             # Authorization: enforce same allowed_users / allowed_chats gates
             if sender_id:
-                if (sender_id not in self.trusted_bots
-                        and "*" not in self.allowed_users
+                if ("*" not in self.allowed_users
                         and sender_id not in self.allowed_users):
                     log.info("Card action rejected: sender %s not allowed", sender_id)
                     return _toast("warning", "无权操作")
@@ -1118,28 +1088,6 @@ class FeishuBot:
     def _reply_queue_full(self, chat_id: str, thread_id, message_id: str):
         self._command_handler().reply_queue_full(chat_id, thread_id, message_id)
 
-    def _resolve_bot_sender(self, message_id: str) -> str | None:
-        """Resolve bot sender app_id via GetMessage REST API.
-
-        Called in worker thread (network I/O is safe here).
-        Returns app_id string (e.g. 'cli_xxx') or None on failure.
-        """
-        try:
-            from lark_oapi.api.im.v1 import GetMessageRequest
-            req = GetMessageRequest.builder() \
-                .message_id(message_id).build()
-            resp = self.lark_client.im.v1.message.get(req)
-            if resp.code == 0 and resp.data and resp.data.items:
-                sender = resp.data.items[0].sender
-                if sender:
-                    return sender.id
-            log.warning("GetMessage no sender for %s (code=%s)",
-                        message_id, resp.code if resp else "?")
-        except Exception as e:
-            log.warning("Failed to resolve bot sender for %s: %s",
-                        message_id, e)
-        return None
-
     def _worker_loop(self):
         """Consumer loop — pulls from work queue and processes.
 
@@ -1159,18 +1107,6 @@ class FeishuBot:
                     self._io_executor.submit(
                         remove_queued_reaction,
                         self.lark_client, item["message_id"], queued_reaction)
-
-                # Deferred bot sender auth (network I/O, safe in worker)
-                if item.get("_needs_bot_auth"):
-                    resolved_id = self._resolve_bot_sender(
-                        item["message_id"])
-                    if not resolved_id or resolved_id not in self.trusted_bots:
-                        log.info("Deferred bot auth failed: resolved=%s",
-                                 resolved_id)
-                        continue
-                    item["sender_id"] = resolved_id
-                    log.info("Trusted bot message from %s in chat %s",
-                             resolved_id, item["chat_id"])
 
                 if item.get("_bridge_command"):
                     self._handle_bridge_command(item)
