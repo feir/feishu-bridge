@@ -384,6 +384,20 @@ class FeishuBot:
                 _cli_text = _cli_text.replace("feishu-cli", _cli_abs)
             _extra_prompts.append(_cli_text)
 
+        # Load cron-mgr prompt (self-describing: `cron-mgr prompt`)
+        _cron_mgr_abs = shutil.which("cron-mgr")
+        if _cron_mgr_abs:
+            try:
+                _cron_result = subprocess.run(
+                    [_cron_mgr_abs, "prompt"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if _cron_result.returncode == 0 and _cron_result.stdout.strip():
+                    _cron_text = _cron_result.stdout.replace("cron-mgr", _cron_mgr_abs)
+                    _extra_prompts.append(_cron_text)
+            except (subprocess.TimeoutExpired, OSError):
+                pass  # cron-mgr not functional, skip silently
+
         self.runner = create_runner(self.agent_config, self.bot_config, _extra_prompts)
         self.command_handler = BridgeCommandHandler(self)
 
