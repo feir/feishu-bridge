@@ -571,11 +571,22 @@ class FeishuBot:
             sender_id = (sender.sender_id.open_id
                          if sender and sender.sender_id else None)
 
-            # For bot senders (sender_type="app"), open_id may be empty;
-            # fall back to union_id which is populated for cross-app bots.
-            if not sender_id and sender and sender.sender_id:
-                sender_id = (getattr(sender.sender_id, "union_id", None)
-                             or getattr(sender.sender_id, "user_id", None))
+            # For bot senders (sender_type="app"), WebSocket event sender_id
+            # fields (open_id/union_id/user_id) are all empty. Resolve the
+            # actual app_id via GetMessage REST API (only when trusted_bots
+            # is configured, ~50ms single call).
+            if not sender_id and sender_type == "app" and self.trusted_bots:
+                try:
+                    from lark_oapi.api.im.v1 import GetMessageRequest
+                    req = GetMessageRequest.builder() \
+                        .message_id(message_id).build()
+                    resp = self.lark_client.im.v1.message.get(req)
+                    if resp.code == 0 and resp.data and resp.data.items:
+                        sender_id = resp.data.items[0].sender.id
+                        log.debug("Resolved bot sender_id via API: %s",
+                                  sender_id)
+                except Exception as e:
+                    log.warning("Failed to resolve bot sender: %s", e)
 
             # Dedup (in-memory only)
             if self.dedup.is_duplicate(message_id):
