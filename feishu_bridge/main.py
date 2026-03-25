@@ -194,6 +194,14 @@ def load_config(config_path: str, bot_name: str) -> dict:
         log.error("allowed_users entries must be non-empty strings")
         sys.exit(1)
 
+    # Validate trusted_bots (optional)
+    trusted = bot.get("trusted_bots", [])
+    if trusted:
+        if not isinstance(trusted, list) or not all(isinstance(x, str) and x for x in trusted):
+            log.error("trusted_bots must be a list of non-empty strings")
+            sys.exit(1)
+        log.info("trusted_bots: %s", trusted)
+
     # Migrate legacy "claude" key → "agent" (backward compat)
     if "claude" in config and "agent" not in config:
         claude_legacy = config.pop("claude")
@@ -348,6 +356,7 @@ class FeishuBot:
         self.workspace = self.bot_config["workspace"]
         self.allowed_users = self.bot_config.get("allowed_users", ["*"])
         self.allowed_chats = self.bot_config.get("allowed_chats", ["*"])
+        self.trusted_bots = set(self.bot_config.get("trusted_bots", []))
         self._todo_auto_drive = config.get("todo_auto_drive", True)
         self._all_bot_names = config.get("all_bot_names", [self.bot_id])
         self.bot_open_id: str | None = None  # set by main() via fetch_bot_info
@@ -554,8 +563,15 @@ class FeishuBot:
             msg_type = msg.message_type
             thread_id = getattr(msg, 'thread_id', None) or None
             parent_id = getattr(msg, 'parent_id', None) or None
+            sender_type = getattr(sender, "sender_type", None) if sender else None
             sender_id = (sender.sender_id.open_id
                          if sender and sender.sender_id else None)
+
+            # For bot senders (sender_type="app"), open_id may be empty;
+            # fall back to union_id which is populated for cross-app bots.
+            if not sender_id and sender and sender.sender_id:
+                sender_id = (getattr(sender.sender_id, "union_id", None)
+                             or getattr(sender.sender_id, "user_id", None))
 
             # Dedup (in-memory only)
             if self.dedup.is_duplicate(message_id):
@@ -569,14 +585,20 @@ class FeishuBot:
                          message_id, msg_create_time, self._startup_ms)
                 return
 
-            # Permission: user (reject None sender early — system/bot messages)
+            # Permission: sender
             if not sender_id:
-                log.debug("Rejected message with no sender_id (system/bot)")
+                log.debug("Rejected message with no sender_id (system)")
                 return
-            if ("*" not in self.allowed_users
+            is_trusted_bot = (sender_type == "app"
+                              and sender_id in self.trusted_bots)
+            if (not is_trusted_bot
+                    and "*" not in self.allowed_users
                     and sender_id not in self.allowed_users):
-                log.debug("Unauthorized user: %s", sender_id)
+                log.info("Unauthorized sender: %s (type=%s)", sender_id, sender_type)
                 return
+            if is_trusted_bot:
+                log.info("Trusted bot message from %s in chat %s",
+                         sender_id, chat_id)
 
             # Permission: chat
             if ("*" not in self.allowed_chats
@@ -980,9 +1002,10 @@ class FeishuBot:
 
             # Authorization: enforce same allowed_users / allowed_chats gates
             if sender_id:
-                if ("*" not in self.allowed_users
+                if (sender_id not in self.trusted_bots
+                        and "*" not in self.allowed_users
                         and sender_id not in self.allowed_users):
-                    log.info("Card action rejected: user %s not allowed", sender_id)
+                    log.info("Card action rejected: sender %s not allowed", sender_id)
                     return _toast("warning", "无权操作")
             if ("*" not in self.allowed_chats
                     and chat_id not in self.allowed_chats):
