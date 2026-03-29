@@ -10,7 +10,7 @@ import threading
 from feishu_bridge.api.client import FeishuAPIError
 from feishu_bridge.quota import WINDOW_LABELS, fetch_codex_quota
 from feishu_bridge.ui import ResponseHandle, add_queued_reaction
-from feishu_bridge.runtime import ClaudeRunner, SessionMap
+from feishu_bridge.runtime import ClaudeRunner, SessionMap, feishu_cli_activated
 
 
 def _get_install_info() -> tuple[str, str, str | None]:
@@ -67,6 +67,7 @@ class BridgeCommandHandler:
             if old_sid:
                 self.bot.session_map.delete(key)
                 log.info("Session cleared: %s", old_sid[:8])
+            feishu_cli_activated.pop(key, None)
             handle.deliver("会话已重置，下一条消息将开始新对话。")
 
         elif cmd == "stop":

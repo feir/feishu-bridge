@@ -54,6 +54,7 @@ from feishu_bridge.runtime import (
     SessionMap,
     SessionQueueFull,
     get_cli_prompt_path,
+    get_cli_prompt_summary_path,
     materialize_data_files,
     _resource_stack,
 )
@@ -284,7 +285,8 @@ def load_config(config_path: str, bot_name: str) -> dict:
             "all_bot_names": all_bot_names}
 
 def create_runner(agent_cfg: dict, bot_cfg: dict,
-                  extra_prompts: list[str]) -> BaseRunner:
+                  extra_prompts: list[str],
+                  extra_prompts_summary: list[str] | None = None) -> BaseRunner:
     """Factory: create the appropriate Runner based on agent.type."""
     agent_type = agent_cfg["type"]
     runner_cls = _RUNNER_CLASSES[agent_type]  # validated in load_config()
@@ -296,6 +298,7 @@ def create_runner(agent_cfg: dict, bot_cfg: dict,
         timeout=agent_cfg.get("timeout_seconds", DEFAULT_TIMEOUT),
         max_budget_usd=agent_cfg.get("max_budget_usd"),
         extra_system_prompts=extra_prompts,
+        extra_system_prompts_summary=extra_prompts_summary or [],
     )
 
 
@@ -373,16 +376,24 @@ class FeishuBot:
             Path(self.workspace) / "state" / "feishu-bridge" / f"sessions-{self.bot_id}.json",
             agent_type=self.agent_config.get("type"),
         )
-        # Load CLI prompt for Feishu operations (materialized via importlib.resources)
+        # Load CLI prompts for Feishu operations (materialized via importlib.resources)
         _extra_prompts = []
+        _extra_prompts_summary = []
+        _cli_abs = shutil.which("feishu-cli")
+
         _cli_prompt = get_cli_prompt_path()
         if _cli_prompt:
             _cli_text = Path(_cli_prompt).read_text()
-            # Resolve feishu-cli to absolute path for subprocess invocation
-            _cli_abs = shutil.which("feishu-cli")
             if _cli_abs:
                 _cli_text = _cli_text.replace("feishu-cli", _cli_abs)
             _extra_prompts.append(_cli_text)
+
+        _cli_summary = get_cli_prompt_summary_path()
+        if _cli_summary:
+            _cli_sum_text = Path(_cli_summary).read_text()
+            if _cli_abs:
+                _cli_sum_text = _cli_sum_text.replace("feishu-cli", _cli_abs)
+            _extra_prompts_summary.append(_cli_sum_text)
 
         # Load cron-mgr prompt (self-describing: `cron-mgr prompt`)
         _cron_mgr_abs = shutil.which("cron-mgr")
@@ -395,10 +406,14 @@ class FeishuBot:
                 if _cron_result.returncode == 0 and _cron_result.stdout.strip():
                     _cron_text = _cron_result.stdout.replace("cron-mgr", _cron_mgr_abs)
                     _extra_prompts.append(_cron_text)
+                    _extra_prompts_summary.append(_cron_text)
             except (subprocess.TimeoutExpired, OSError):
                 pass  # cron-mgr not functional, skip silently
 
-        self.runner = create_runner(self.agent_config, self.bot_config, _extra_prompts)
+        self.runner = create_runner(
+            self.agent_config, self.bot_config,
+            _extra_prompts, extra_prompts_summary=_extra_prompts_summary,
+        )
         self.command_handler = BridgeCommandHandler(self)
 
         # Quota poller (claude.ai API, cookie-based auth)

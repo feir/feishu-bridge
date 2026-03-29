@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import subprocess
 import tempfile
@@ -25,21 +26,35 @@ DEDUP_MAX = 5000
 QUEUE_MAX = 50
 MAX_PROMPT_CHARS = 50_000
 
+# In-memory per-session flag: once a session uses Feishu features,
+# inject the full CLI prompt for the rest of that session.
+# Key: (bot_id, chat_id, thread_id) → True.  Cleared on /new.
+feishu_cli_activated: dict[tuple, bool] = {}
+
+# Regex for detecting feishu-related Chinese keywords in message text
+_FEISHU_KEYWORD_RE = re.compile(
+    r"飞书|文档|表格|日历|邮件|任务|多维表格|wiki|bitable"
+)
+
 # Static resources — materialized once at startup via ExitStack
 _DATA = files("feishu_bridge.data")
 _resource_stack = contextlib.ExitStack()
 _BRIDGE_SETTINGS_PATH: Optional[str] = None
 _CLI_PROMPT_PATH: Optional[str] = None
+_CLI_PROMPT_SUMMARY_PATH: Optional[str] = None
 
 
 def materialize_data_files():
     """Call once at startup. Extracts data files and holds them for process lifetime."""
-    global _BRIDGE_SETTINGS_PATH, _CLI_PROMPT_PATH
+    global _BRIDGE_SETTINGS_PATH, _CLI_PROMPT_PATH, _CLI_PROMPT_SUMMARY_PATH
     _BRIDGE_SETTINGS_PATH = str(
         _resource_stack.enter_context(as_file(_DATA.joinpath("bridge-settings.json")))
     )
     _CLI_PROMPT_PATH = str(
         _resource_stack.enter_context(as_file(_DATA.joinpath("cli_prompt.md")))
+    )
+    _CLI_PROMPT_SUMMARY_PATH = str(
+        _resource_stack.enter_context(as_file(_DATA.joinpath("cli_prompt_summary.md")))
     )
 
 
@@ -51,6 +66,11 @@ def get_bridge_settings_path() -> Optional[str]:
 def get_cli_prompt_path() -> Optional[str]:
     """Return materialized cli_prompt.md path."""
     return _CLI_PROMPT_PATH
+
+
+def get_cli_prompt_summary_path() -> Optional[str]:
+    """Return materialized cli_prompt_summary.md path."""
+    return _CLI_PROMPT_SUMMARY_PATH
 
 EMPTY_RESULT_MESSAGE = "Claude 本次未返回任何内容，请稍后重试。"
 SILENT_OK_MESSAGE = "✓ 操作已完成（无文本输出）"
@@ -320,13 +340,15 @@ class BaseRunner(ABC):
 
     def __init__(self, command: str, model: str, workspace: str, timeout: int,
                  max_budget_usd: Optional[float] = None,
-                 extra_system_prompts: Optional[list[str]] = None):
+                 extra_system_prompts: Optional[list[str]] = None,
+                 extra_system_prompts_summary: Optional[list[str]] = None):
         self.command = command
         self.model = model
         self.workspace = workspace
         self.timeout = timeout
         self.max_budget_usd = max_budget_usd
-        self._extra_system_prompts = extra_system_prompts or []
+        self._extra_system_prompts_full = extra_system_prompts or []
+        self._extra_system_prompts_summary = extra_system_prompts_summary or []
         self._active: dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
@@ -336,7 +358,8 @@ class BaseRunner(ABC):
     @abstractmethod
     def build_args(self, prompt: str, session_id: Optional[str],
                    resume: bool, streaming: bool, *,
-                   fork_session: bool = False) -> list:
+                   fork_session: bool = False,
+                   full_cli_prompt: bool = True) -> list:
         """构建 CLI 命令行参数列表。"""
 
     @abstractmethod
@@ -385,10 +408,17 @@ class BaseRunner(ABC):
         """是否支持 /compact 命令。"""
         return True
 
-    def _build_system_prompt(self) -> str:
-        """Merge safety guard + extra system prompts into one string."""
+    def _build_system_prompt(self, full: bool = True) -> str:
+        """Merge safety guard + extra system prompts into one string.
+
+        Args:
+            full: If True, use full CLI prompt. If False, use summary version.
+        """
         parts = [self._SAFETY_PROMPT]
-        parts.extend(self._extra_system_prompts)
+        if full:
+            parts.extend(self._extra_system_prompts_full)
+        else:
+            parts.extend(self._extra_system_prompts_summary)
         return "\n\n".join(parts)
 
     def _build_streaming_result(self, state: StreamState,
@@ -470,7 +500,8 @@ class BaseRunner(ABC):
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
             on_agent_update=None, env_extra: Optional[dict] = None,
-            fork_session: bool = False) -> dict:
+            fork_session: bool = False,
+            full_cli_prompt: bool = True) -> dict:
 
         if len(prompt) > MAX_PROMPT_CHARS:
             log.warning("Prompt truncated: %d -> %d chars", len(prompt), MAX_PROMPT_CHARS)
@@ -478,13 +509,14 @@ class BaseRunner(ABC):
 
         streaming = bool(on_output) or self.ALWAYS_STREAMING
         args = self.build_args(prompt, session_id, resume, streaming,
-                               fork_session=fork_session)
+                               fork_session=fork_session,
+                               full_cli_prompt=full_cli_prompt)
 
-        _sp = self._build_system_prompt()
-        log.info("%s: resume=%s sid=%s stream=%s prompt=%d chars sys_prompt=%d chars (~%d tokens)",
+        _sp = self._build_system_prompt(full=full_cli_prompt)
+        log.info("%s: resume=%s sid=%s stream=%s full_cli=%s prompt=%d chars sys_prompt=%d chars (~%d tokens)",
                  self.get_display_name(), resume,
                  session_id[:8] if session_id else "-",
-                 streaming, len(prompt), len(_sp), len(_sp) // 4)
+                 streaming, full_cli_prompt, len(prompt), len(_sp), len(_sp) // 4)
 
         env = None
         extra_env = self.get_extra_env()
@@ -763,14 +795,14 @@ class ClaudeRunner(BaseRunner):
     ]
 
     def build_args(self, prompt, session_id, resume, streaming, *,
-                   fork_session=False):
+                   fork_session=False, full_cli_prompt=True):
         args = [
             self.command, "-p",
             "--dangerously-skip-permissions",
             "--settings", get_bridge_settings_path(),
             "--model", self.model,
             "--append-system-prompt",
-            self._build_system_prompt(),
+            self._build_system_prompt(full=full_cli_prompt),
         ]
 
         if self.max_budget_usd is not None:
@@ -962,20 +994,22 @@ class CodexRunner(BaseRunner):
 
     def __init__(self, command: str, model: str, workspace: str, timeout: int,
                  max_budget_usd: Optional[float] = None,
-                 extra_system_prompts: Optional[list[str]] = None):
+                 extra_system_prompts: Optional[list[str]] = None,
+                 extra_system_prompts_summary: Optional[list[str]] = None):
         if max_budget_usd is not None:
             log.warning("Codex does not support budget tracking, max_budget_usd ignored")
         super().__init__(
             command=command, model=model, workspace=workspace,
             timeout=timeout, max_budget_usd=None,
             extra_system_prompts=extra_system_prompts,
+            extra_system_prompts_summary=extra_system_prompts_summary,
         )
         # Thread-local storage for per-invocation temp file path.
         # run() writes the path; build_args() reads it (same thread).
         self._tls = threading.local()
 
     def build_args(self, prompt, session_id, resume, streaming, *,
-                   fork_session=False):
+                   fork_session=False, full_cli_prompt=True):
         args = [
             self.command, "exec",
             "--dangerously-bypass-approvals-and-sandbox",
@@ -1000,11 +1034,12 @@ class CodexRunner(BaseRunner):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            on_agent_update=None, env_extra: Optional[dict] = None) -> dict:
+            on_agent_update=None, env_extra: Optional[dict] = None,
+            full_cli_prompt: bool = True) -> dict:
         """Override run() to manage per-invocation system prompt temp file."""
         self._tls.instructions_path = None
         try:
-            system_prompt = self._build_system_prompt()
+            system_prompt = self._build_system_prompt(full=full_cli_prompt)
             if system_prompt:
                 fd, path = tempfile.mkstemp(
                     prefix="codex-instructions-", suffix=".md", text=True,
@@ -1018,7 +1053,7 @@ class CodexRunner(BaseRunner):
                 prompt, session_id=session_id, resume=resume,
                 tag=tag, on_output=on_output, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
-                env_extra=env_extra,
+                env_extra=env_extra, full_cli_prompt=full_cli_prompt,
             )
         finally:
             path = getattr(self._tls, "instructions_path", None)
