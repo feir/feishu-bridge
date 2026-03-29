@@ -313,7 +313,9 @@ class BaseRunner(ABC):
     _SAFETY_PROMPT = (
         "CRITICAL: You are running as a subprocess of feishu-bridge. "
         "NEVER execute systemctl restart/stop/reload on feishu-bridge - "
-        "doing so kills your own parent process, causing an infinite restart loop."
+        "doing so kills your own parent process, causing an infinite restart loop.\n\n"
+        "Do not output 'Status:' lines at the end of responses — "
+        "status is tracked externally by the bridge."
     )
 
     def __init__(self, command: str, model: str, workspace: str, timeout: int,
@@ -478,10 +480,11 @@ class BaseRunner(ABC):
         args = self.build_args(prompt, session_id, resume, streaming,
                                fork_session=fork_session)
 
-        log.info("%s: resume=%s sid=%s stream=%s prompt=%d chars",
+        _sp = self._build_system_prompt()
+        log.info("%s: resume=%s sid=%s stream=%s prompt=%d chars sys_prompt=%d chars (~%d tokens)",
                  self.get_display_name(), resume,
                  session_id[:8] if session_id else "-",
-                 streaming, len(prompt))
+                 streaming, len(prompt), len(_sp), len(_sp) // 4)
 
         env = None
         extra_env = self.get_extra_env()

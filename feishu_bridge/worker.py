@@ -368,6 +368,10 @@ def process_message(
             _doc_token = feishu_docs.get_cached_token(sender_id) if feishu_docs else None
             _sheet_token = feishu_sheets.get_cached_token(sender_id) if feishu_sheets else None
             fetched_parts = []
+            # Count doc-type URLs for adaptive fetch strategy:
+            # single short doc → full content; single long / multi → preview only
+            _doc_url_count = sum(1 for t, _ in feishu_urls
+                                if t in ("doc", "docx", "wiki"))
             for url_type, url_token in feishu_urls:
                 try:
                     if url_type == "wiki":
@@ -425,10 +429,20 @@ def process_message(
                         md = result.get("markdown", "")
                         if not md:
                             md = result.get("text", str(result))
-                        if len(md) > 8000:
-                            md = md[:8000] + "\n\n... (内容过长，已截断)"
                         header = f"[飞书文档: {title}]" if title else f"[飞书文档 {url_token}]"
-                        fetched_parts.append(f"{header}\n{md}\n[/飞书文档]")
+                        cli_hint = f"feishu-cli read-doc --token {obj_token}"
+                        if _doc_url_count >= 2 and len(md) > 200:
+                            preview = md[:200].rstrip()
+                            fetched_parts.append(
+                                f"{header}\n{preview}...\n"
+                                f"(共 {len(md)} 字，使用 `{cli_hint}` 获取全文)\n[/飞书文档]")
+                        elif len(md) >= 2000:
+                            preview = md[:500].rstrip()
+                            fetched_parts.append(
+                                f"{header}\n{preview}...\n"
+                                f"(共 {len(md)} 字，使用 `{cli_hint}` 获取全文)\n[/飞书文档]")
+                        else:
+                            fetched_parts.append(f"{header}\n{md}\n[/飞书文档]")
                         continue
                     if url_type in ("doc", "docx"):
                         if not feishu_docs or not _doc_token:
@@ -444,11 +458,20 @@ def process_message(
                         md = result.get("markdown", "")
                         if not md:
                             md = result.get("text", str(result))
-                        # Truncate very large docs
-                        if len(md) > 8000:
-                            md = md[:8000] + "\n\n... (内容过长，已截断)"
                         header = f"[飞书文档: {title}]" if title else f"[飞书文档 {url_token}]"
-                        fetched_parts.append(f"{header}\n{md}\n[/飞书文档]")
+                        cli_hint = f"feishu-cli read-doc --token {url_token}"
+                        if _doc_url_count >= 2 and len(md) > 200:
+                            preview = md[:200].rstrip()
+                            fetched_parts.append(
+                                f"{header}\n{preview}...\n"
+                                f"(共 {len(md)} 字，使用 `{cli_hint}` 获取全文)\n[/飞书文档]")
+                        elif len(md) >= 2000:
+                            preview = md[:500].rstrip()
+                            fetched_parts.append(
+                                f"{header}\n{preview}...\n"
+                                f"(共 {len(md)} 字，使用 `{cli_hint}` 获取全文)\n[/飞书文档]")
+                        else:
+                            fetched_parts.append(f"{header}\n{md}\n[/飞书文档]")
                     elif url_type == "sheets":
                         if not feishu_sheets or not _sheet_token:
                             fetched_parts.append(
