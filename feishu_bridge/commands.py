@@ -56,6 +56,12 @@ class BridgeCommandHandler:
         """Handle bridge-level commands (not sent to Claude)."""
         cmd = item["_bridge_command"]
         arg = item.get("_cmd_arg", "")
+
+        # Silent commands — no ResponseHandle needed
+        if cmd == "idle-compact":
+            self._handle_idle_compact(item)
+            return
+
         handle = ResponseHandle(
             self.bot.lark_client, item["chat_id"],
             item.get("thread_id"), item.get("message_id"),
@@ -65,6 +71,8 @@ class BridgeCommandHandler:
             key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
             old_sid = self.bot.session_map.get(key)
             if old_sid:
+                from feishu_bridge.worker import idle_compact_mgr
+                idle_compact_mgr.cancel(SessionMap._key_str(key))
                 self.bot.session_map.delete(key)
                 log.info("Session cleared: %s", old_sid[:8])
             feishu_cli_activated.pop(key, None)
@@ -206,6 +214,29 @@ class BridgeCommandHandler:
         if action == "help":
             return self._task_help()
         return self._task_help()
+
+    def _handle_idle_compact(self, item: dict):
+        """Silent proactive compact — no card to user."""
+        sid = item.get("_session_id")
+        if not sid or not self.bot.runner.supports_compact():
+            return
+        key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
+        current_sid = self.bot.session_map.get(key)
+        if current_sid != sid:
+            log.info("Idle compact skipped: session changed sid=%s", sid[:8])
+            return
+        tag = SessionMap._key_str(key)
+        result = self.bot.runner.run(
+            "/compact", session_id=sid, resume=True, tag=tag,
+        )
+        if result["is_error"]:
+            log.warning("Idle compact failed: sid=%s err=%s",
+                        sid[:8], (result.get("result") or "")[:200])
+        else:
+            new_sid = result.get("session_id") or sid
+            if new_sid != sid:
+                self.bot.session_map.put(key, new_sid)
+            log.info("Idle compact done: sid=%s", sid[:8])
 
     def _handle_update(self, handle):
         """Handle /update — check for new version and pull if available."""

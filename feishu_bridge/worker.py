@@ -27,6 +27,113 @@ log = logging.getLogger("feishu-bridge")
 
 _MEDIA_MAX_AGE_SECS = 3600  # 1 hour
 
+# ---------------------------------------------------------------------------
+# Idle Auto-Compact: proactive compact before prompt cache TTL expires
+# ---------------------------------------------------------------------------
+
+# Anthropic prompt cache TTL is 1 hour (ephemeral_1h).  If we compact while
+# the cache is still warm (~50 min), the compact call pays cache_read price
+# (cheap).  After compact the session history shrinks, so if the cache later
+# expires, the cold-start re-cache cost is much smaller.
+_IDLE_COMPACT_DELAY = 50 * 60      # 50 minutes — 10 min buffer before 1h TTL
+_IDLE_COMPACT_MIN_CTX = 50_000     # Don't compact small sessions
+
+
+class IdleCompactManager:
+    """Schedule a proactive /compact when a session goes idle.
+
+    After each successful interaction, a per-session timer is (re)started.
+    When the timer fires, the manager submits a silent compact command
+    through the ChatTaskQueue so it serialises with user messages.
+    """
+
+    def __init__(self):
+        # Keyed by session_key (chat tuple string), not session_id,
+        # so session-id rotation (auto-heal) doesn't orphan timers.
+        self._timers: dict[str, threading.Timer] = {}
+        self._generation: dict[str, int] = {}  # session_key → monotonic counter
+        self._lock = threading.Lock()
+        # Set by FeishuBot.start() after queue is ready.
+        self._enqueue_fn = None   # ChatTaskQueue.enqueue
+
+    def bind(self, enqueue_fn):
+        """Bind the queue reference once the bot is running."""
+        self._enqueue_fn = enqueue_fn
+
+    def touch(self, session_id: str, session_key: str,
+              total_ctx: int, bot_id: str, chat_id: str,
+              thread_id: str | None):
+        """Register or reset the idle timer for a session."""
+        with self._lock:
+            old = self._timers.pop(session_key, None)
+            if old:
+                old.cancel()
+
+            # Bump generation so any in-flight _fire() for an older timer
+            # will see a stale generation and skip the enqueue.
+            gen = self._generation.get(session_key, 0) + 1
+            self._generation[session_key] = gen
+
+            if total_ctx < _IDLE_COMPACT_MIN_CTX:
+                return
+
+            timer = threading.Timer(
+                _IDLE_COMPACT_DELAY,
+                self._fire,
+                args=(session_id, session_key, total_ctx,
+                      bot_id, chat_id, thread_id, gen),
+            )
+            timer.daemon = True
+            timer.start()
+            self._timers[session_key] = timer
+
+    def cancel(self, session_key: str):
+        """Cancel the timer for a session (e.g. on /new)."""
+        with self._lock:
+            old = self._timers.pop(session_key, None)
+            if old:
+                old.cancel()
+            self._generation.pop(session_key, None)
+
+    def _fire(self, session_id: str, session_key: str, total_ctx: int,
+              bot_id: str, chat_id: str, thread_id: str | None,
+              gen: int = 0):
+        with self._lock:
+            self._timers.pop(session_key, None)
+            # If generation has advanced (touch() was called after this timer
+            # was created), this compact is stale — skip it.
+            if self._generation.get(session_key, 0) != gen:
+                log.debug("Idle compact skipped (stale generation): key=%s",
+                          session_key)
+                return
+
+        if not self._enqueue_fn:
+            return
+
+        log.info("Idle auto-compact firing: sid=%s ctx=%d tokens",
+                 session_id[:8], total_ctx)
+
+        item = {
+            "_bridge_command": "idle-compact",
+            "_cmd_arg": "",
+            "_session_id": session_id,
+            "bot_id": bot_id,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "message_id": None,
+            "sender_id": None,
+            "_queued_reaction_id": None,
+            "_queue_key": session_key,
+        }
+        try:
+            self._enqueue_fn(session_key, item)
+        except Exception:
+            log.warning("Idle auto-compact enqueue failed: sid=%s",
+                        session_id[:8], exc_info=True)
+
+
+idle_compact_mgr = IdleCompactManager()
+
 
 def cleanup_stale_media(workspace: str, max_age: int = _MEDIA_MAX_AGE_SECS):
     """Delete media files older than *max_age* seconds from temp dirs."""
@@ -751,6 +858,21 @@ def process_message(
                     "rate_limit_info": result.get("rate_limit_info") or existing.get("rate_limit_info"),
                 }
 
+            # --- Idle auto-compact timer ---
+            if not result["is_error"] and runner.supports_compact():
+                _usage = result.get("last_call_usage") or result.get("usage") or {}
+                _total_ctx = (_usage.get("input_tokens", 0)
+                              + _usage.get("cache_read_input_tokens", 0)
+                              + _usage.get("cache_creation_input_tokens", 0))
+                idle_compact_mgr.touch(
+                    session_id=effective_sid,
+                    session_key=SessionMap._key_str(key),
+                    total_ctx=_total_ctx,
+                    bot_id=item["bot_id"],
+                    chat_id=chat_id,
+                    thread_id=item.get("thread_id"),
+                )
+
         # --- Strip trailing Status: line (redundant with card footer) ---
         _text = result.get("result") or ""
         _text = re.sub(
@@ -768,14 +890,12 @@ def process_message(
             ctx_alert = _context_health_alert(result, quota_snap)
 
         if not handle._terminated:
-            usage = result.get("usage") or {}
-            total_tokens = (usage.get("input_tokens", 0)
-                            + usage.get("output_tokens", 0))
+            _last_usage = result.get("last_call_usage") or result.get("usage") or {}
             # First key only; multi-model sessions show the primary model
             model_usage = result.get("modelUsage") or {}
             model_name = next(iter(model_usage), None)
             handle.deliver(result["result"], is_error=result["is_error"],
-                           total_tokens=total_tokens,
+                           last_call_usage=_last_usage,
                            model_name=model_name,
                            workspace=runner.workspace,
                            context_alert=ctx_alert)

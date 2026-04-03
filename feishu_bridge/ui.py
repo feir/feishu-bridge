@@ -720,6 +720,31 @@ def _format_tokens(n: int) -> str:
     return str(n)
 
 
+def _format_usage_footer(usage: dict) -> str:
+    """Format last_call_usage into a compact footer string.
+
+    Examples:
+        "12.3k in (85% ⚡) · 1.2k out"    — cache hit
+        "12.3k in · 1.2k out"              — no cache / cold start
+    """
+    inp = usage.get("input_tokens", 0)
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    cache_create = usage.get("cache_creation_input_tokens", 0)
+    out = usage.get("output_tokens", 0)
+    total_in = inp + cache_read + cache_create
+
+    parts = []
+    if total_in > 0:
+        in_str = f"{_format_tokens(total_in)} in"
+        if cache_read > 0:
+            hit_pct = int(cache_read / total_in * 100)
+            in_str += f" ({hit_pct}% ⚡)"
+        parts.append(in_str)
+    if out > 0:
+        parts.append(f"{_format_tokens(out)} out")
+    return " · ".join(parts) if parts else ""
+
+
 def _get_git_label(workspace: str) -> str | None:
     """Return 'branch' or 'branch*' (dirty), or None on failure."""
     try:
@@ -745,6 +770,7 @@ def _get_git_label(workspace: str) -> str | None:
 def build_cardkit_final_card(content: str, is_error: bool = False,
                              elapsed_s: float = 0,
                              total_tokens: int = 0,
+                             last_call_usage: dict | None = None,
                              chat_id: str | None = None,
                              bot_id: str | None = None,
                              model_name: str | None = None,
@@ -813,7 +839,11 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
         detail_parts.append(short_model)
     if elapsed_s > 0:
         detail_parts.append(_format_elapsed(elapsed_s))
-    if total_tokens > 0:
+    # Token usage: prefer detailed last_call_usage with cache hit info,
+    # fall back to simple total_tokens for backward compat.
+    if last_call_usage:
+        detail_parts.append(_format_usage_footer(last_call_usage))
+    elif total_tokens > 0:
         detail_parts.append(f"{_format_tokens(total_tokens)} tokens")
     git_label = _get_git_label(workspace) if workspace else None
     if git_label:
@@ -1009,7 +1039,8 @@ class ResponseHandle:
     def deliver(self, content: str, is_error: bool = False,
                 total_tokens: int = 0, model_name: str | None = None,
                 workspace: str | None = None,
-                context_alert: str | None = None):
+                context_alert: str | None = None,
+                last_call_usage: dict | None = None):
         if self._card_fallback_timer:
             self._card_fallback_timer.cancel()
             self._card_fallback_timer = None
@@ -1028,7 +1059,8 @@ class ResponseHandle:
                  len(content), is_error,
                  bool(self._use_cardkit and self._cardkit_card_id))
         if self._use_cardkit and self._cardkit_card_id:
-            self._deliver_cardkit(content, is_error, total_tokens=total_tokens,
+            self._deliver_cardkit(content, is_error,
+                                  last_call_usage=last_call_usage,
                                   model_name=model_name, workspace=workspace,
                                   context_alert=context_alert)
         else:
@@ -1036,7 +1068,8 @@ class ResponseHandle:
                                    context_alert=context_alert)
 
     def _deliver_cardkit(self, content: str, is_error: bool,
-                         total_tokens: int = 0, model_name: str | None = None,
+                         last_call_usage: dict | None = None,
+                         model_name: str | None = None,
                          workspace: str | None = None,
                          context_alert: str | None = None):
         card_id = self._cardkit_card_id
@@ -1071,7 +1104,8 @@ class ResponseHandle:
         elapsed_s = time.time() - self._handle_start_time
         seq = self._next_seq()
         final_card_json = build_cardkit_final_card(
-            content, is_error, elapsed_s=elapsed_s, total_tokens=total_tokens,
+            content, is_error, elapsed_s=elapsed_s,
+            last_call_usage=last_call_usage,
             chat_id=self.chat_id, bot_id=self.bot_id,
             model_name=model_name, workspace=workspace,
             todos=self._last_todos, context_alert=context_alert)

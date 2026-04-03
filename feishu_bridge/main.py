@@ -66,6 +66,7 @@ from feishu_bridge.ui import (
 )
 from feishu_bridge.worker import (
     format_task_detail_bridge as _bridge_worker_format_task_detail,
+    idle_compact_mgr,
     process_message as _bridge_worker_process_message,
     start_media_cleanup_timer,
 )
@@ -430,6 +431,7 @@ class FeishuBot:
         # _work_queue is the shared worker pool queue
         self._work_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
         self._chat_queue = ChatTaskQueue(self._work_queue)
+        idle_compact_mgr.bind(self._chat_queue.enqueue)
         self._io_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="io")
 
