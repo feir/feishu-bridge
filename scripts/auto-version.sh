@@ -24,7 +24,7 @@ else
 fi
 
 # Update both sources of truth
-sed -i "s/^__version__ = .*/__version__ = \"$NEW\"/" "$INIT_FILE"
-sed -i "s/^version = .*/version = \"$NEW\"/" "$TOML_FILE"
+sed -i '' "s/^__version__ = .*/__version__ = \"$NEW\"/" "$INIT_FILE"
+sed -i '' "s/^version = .*/version = \"$NEW\"/" "$TOML_FILE"
 
 echo "$NEW"
