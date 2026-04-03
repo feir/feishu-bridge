@@ -19,7 +19,7 @@ from feishu_bridge.parsers import (
 from feishu_bridge.commands import _context_window_for_model
 from feishu_bridge.quota import WINDOW_LABELS
 from feishu_bridge.runtime import (
-    BaseRunner, SessionMap, feishu_cli_activated, _FEISHU_KEYWORD_RE,
+    BaseRunner, SessionMap,
 )
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
 
@@ -775,24 +775,13 @@ def process_message(
         except Exception:
             log.warning("Failed to create auth file for CLI", exc_info=True)
 
-        # --- Session-sticky Feishu mode detection ---
-        # Once any feishu signal fires, inject full CLI prompt for the session.
-        _full_cli = feishu_cli_activated.get(key, False)
-        if not _full_cli:
-            if (feishu_urls
-                    or text.lstrip().startswith("/feishu-")
-                    or _FEISHU_KEYWORD_RE.search(text)
-                    or todo_task_id):
-                _full_cli = True
-                feishu_cli_activated[key] = True
-
         existing_sid = session_map.get(key)
         if existing_sid:
             result = runner.run(
                 text, session_id=existing_sid, resume=True, tag=tag,
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
-                env_extra=env_extra, full_cli_prompt=_full_cli,
+                env_extra=env_extra,
             )
         else:
             new_sid = str(uuid.uuid4())
@@ -800,7 +789,7 @@ def process_message(
                 text, session_id=new_sid, resume=False, tag=tag,
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
-                env_extra=env_extra, full_cli_prompt=_full_cli,
+                env_extra=env_extra,
             )
 
         if result.get("cancelled"):
@@ -818,7 +807,7 @@ def process_message(
                     text, session_id=retry_sid, resume=False, tag=tag,
                     on_output=on_stream, on_tool_status=on_tool_status,
                     on_todo_update=on_todo_update, on_agent_update=on_agent_update,
-                    env_extra=env_extra, full_cli_prompt=_full_cli,
+                    env_extra=env_extra,
                 )
                 if result.get("cancelled"):
                     handle.deliver(result["result"])
