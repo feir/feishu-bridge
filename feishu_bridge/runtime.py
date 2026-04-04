@@ -892,6 +892,14 @@ class ClaudeRunner(BaseRunner):
         result_text = fr.get("result") or state.accumulated_text
         sid = fr.get("session_id", session_id)
 
+        # Fix output_tokens: assistant events report per-turn start values
+        # (often single-digit), while result.usage has the cumulative total.
+        # Merge the correct output_tokens into last_call_usage (which has
+        # the detailed cache breakdown we want for input).
+        result_usage = fr.get("usage") or {}
+        if state.last_call_usage and result_usage.get("output_tokens"):
+            state.last_call_usage["output_tokens"] = result_usage["output_tokens"]
+
         if not fr.get("is_error", False) and not result_text:
             log.info(
                 "Claude returned empty streaming result (silent OK): sid=%s accumulated=%d",
