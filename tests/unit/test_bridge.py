@@ -2231,6 +2231,83 @@ def test_create_runner_unknown_type_raises():
         bridge.create_runner(agent_cfg, bot_cfg, [])
 
 
+def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path):
+    """Bot-level agent switch rebuilds runner and clears incompatible sessions."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.bot_id = "test-bot"
+    bot.bot_config = {"workspace": "/tmp", "model": "claude-opus-4-6"}
+    bot.agent_config = {
+        "type": "claude",
+        "command": "claude",
+        "commands": {"claude": "claude"},
+        "_resolved_command": bridge.shutil.which("python3"),
+        "timeout_seconds": 30,
+    }
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-opus-4-6", workspace="/tmp", timeout=30
+    )
+    bot._extra_prompts = []
+    bot._agent_models = {"claude": "claude-opus-4-6", "codex": "gpt-5.1-codex-mini"}
+    bot._session_cost = {"sid-old": {"usage": {}}}
+    bot._session_map_path = tmp_path / "sessions.json"
+    bot._session_map_path.write_text(json.dumps({
+        "_agent_type": "claude",
+        "chat-key": "sid-old",
+    }))
+    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
+
+    monkeypatch.setattr(
+        bridge,
+        "resolve_agent_command",
+        lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
+    )
+
+    ok, message, resolved = bot.switch_agent("codex")
+
+    assert ok is True
+    assert "codex" in message
+    assert resolved == bridge.shutil.which("python3")
+    assert isinstance(bot.runner, bridge_runtime.CodexRunner)
+    assert bot.runner.model == "gpt-5.1-codex-mini"
+    assert bot.agent_config["type"] == "codex"
+    assert bot._session_cost == {}
+    assert bot.session_map.get(("chat-key",)) is None
+    data = json.loads(bot._session_map_path.read_text())
+    assert data["_agent_type"] == "codex"
+
+
+def test_switch_agent_remembers_current_model_before_switch(monkeypatch, tmp_path):
+    """Switching agents remembers the last model used by the current backend."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.bot_id = "test-bot"
+    bot.bot_config = {"workspace": "/tmp", "model": "claude-opus-4-6"}
+    bot.agent_config = {
+        "type": "claude",
+        "command": "claude",
+        "commands": {"claude": "claude"},
+        "_resolved_command": bridge.shutil.which("python3"),
+        "timeout_seconds": 30,
+    }
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-sonnet-4-6", workspace="/tmp", timeout=30
+    )
+    bot._extra_prompts = []
+    bot._agent_models = {"claude": "claude-opus-4-6", "codex": "gpt-5.2-codex"}
+    bot._session_cost = {}
+    bot._session_map_path = tmp_path / "sessions.json"
+    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
+
+    monkeypatch.setattr(
+        bridge,
+        "resolve_agent_command",
+        lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
+    )
+
+    bot.switch_agent("codex")
+
+    assert bot._agent_models["claude"] == "claude-sonnet-4-6"
+
+
 def test_session_map_agent_type_reconcile_same(tmp_path):
     """SessionMap preserves sessions when agent_type matches."""
     path = tmp_path / "sessions.json"
@@ -2403,6 +2480,13 @@ def test_is_bridge_command_btw():
     assert bridge._is_bridge_command("/btweet something") is False
 
 
+def test_is_bridge_command_agent():
+    """Verify /agent is recognized as a bridge command."""
+    assert bridge._is_bridge_command("/agent codex") is True
+    assert bridge._is_bridge_command("/agent") is True
+    assert bridge._is_bridge_command("/agency") is False
+
+
 def test_claude_runner_build_args_fork_session():
     """ClaudeRunner build_args with fork_session=True adds correct flags."""
     runner = bridge_runtime.ClaudeRunner(
@@ -2564,3 +2648,45 @@ def test_btw_runner_exception_delivers_error(monkeypatch):
     assert len(handle.deliveries) == 1
     assert handle.deliveries[0][1] is True  # is_error
     assert "调用失败" in handle.deliveries[0][0]
+
+
+def test_agent_empty_arg_shows_current_agent():
+    """/agent with no argument returns current agent info."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.agent_config = {"type": "claude", "command": "claude"}
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+
+    handler._handle_agent("", handle)
+
+    assert len(handle.deliveries) == 1
+    assert "当前 Agent" in handle.deliveries[0][0]
+    assert "claude" in handle.deliveries[0][0]
+
+
+def test_agent_switch_success_reports_command():
+    """/agent reports success and resolved command path."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.agent_config = {"type": "claude", "command": "claude"}
+    bot.switch_agent = lambda target: (True, "Agent 已切换为 `codex`。", "/usr/bin/codex")
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+
+    handler._handle_agent("codex", handle)
+
+    assert len(handle.deliveries) == 1
+    assert "Agent 已切换为 `codex`" in handle.deliveries[0][0]
+    assert "/usr/bin/codex" in handle.deliveries[0][0]
+
+
+def test_agent_switch_failure_is_error():
+    """/agent surfaces switch errors to the user."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.agent_config = {"type": "claude", "command": "claude"}
+    bot.switch_agent = lambda target: (False, "切换失败", None)
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+
+    handler._handle_agent("codex", handle)
+
+    assert handle.deliveries == [("切换失败", True, 0)]

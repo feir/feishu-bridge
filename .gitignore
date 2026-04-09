@@ -6,3 +6,5 @@ build/
 .venv/
 .pytest_cache/
 *.egg
+CLAUDE.local.md
+.claude/settings.local.json

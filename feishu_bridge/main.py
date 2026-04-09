@@ -92,7 +92,7 @@ log = logging.getLogger("feishu-bridge")
 # Known bridge commands (exact-match whitelist for gate exemption).
 _BRIDGE_CMD_EXACT = frozenset({
     "/help", "/new", "/clear", "/reset", "/stop", "/cancel",
-    "/compact", "/model", "/status", "/btw", "/update",
+    "/compact", "/model", "/agent", "/status", "/btw", "/update",
     "/restart-all", "/restart",
 })
 
@@ -134,6 +134,28 @@ _RUNNER_CLASSES: dict[str, type[BaseRunner]] = {
     "claude": ClaudeRunner,
     "codex": CodexRunner,
 }
+
+
+def _normalize_agent_commands(agent_cfg: dict) -> dict[str, str]:
+    """Return optional per-agent command overrides in normalized form."""
+    raw = agent_cfg.get("commands")
+    commands = raw.copy() if isinstance(raw, dict) else {}
+    current_type = agent_cfg.get("type")
+    current_cmd = agent_cfg.get("command")
+    if current_type and current_cmd:
+        commands.setdefault(current_type, current_cmd)
+    return {
+        str(k).strip().lower(): str(v).strip()
+        for k, v in commands.items()
+        if str(k).strip() and str(v).strip()
+    }
+
+
+def resolve_agent_command(agent_cfg: dict, agent_type: str) -> tuple[str | None, str]:
+    """Resolve the CLI command for an agent type."""
+    commands = _normalize_agent_commands(agent_cfg)
+    configured = commands.get(agent_type, agent_type)
+    return shutil.which(configured), configured
 
 
 
@@ -213,8 +235,9 @@ def load_config(config_path: str, bot_name: str) -> dict:
 
     # Resolve agent CLI command
     default_cmd = "claude" if agent_type == "claude" else agent_type
-    agent_cmd = agent_cfg.get("command", default_cmd)
-    resolved_cmd = shutil.which(agent_cmd)
+    agent_cfg.setdefault("command", default_cmd)
+    agent_cfg["commands"] = _normalize_agent_commands(agent_cfg)
+    resolved_cmd, agent_cmd = resolve_agent_command(agent_cfg, agent_type)
     if not resolved_cmd:
         log.error(
             "Agent command '%s' not found in PATH. "
@@ -364,6 +387,9 @@ class FeishuBot:
             self._group_owner = None
             self._group_overrides = {}
         self._session_cost: dict[str, dict] = {}  # sid -> last {usage, model_usage, total_cost_usd}
+        self._session_map_path = (
+            Path(self.workspace) / "state" / "feishu-bridge" / f"sessions-{self.bot_id}.json"
+        )
 
         # Components
         self.dedup = MessageDedup(
@@ -371,7 +397,7 @@ class FeishuBot:
             max_entries=self.dedup_config.get("max_entries", DEDUP_MAX),
         )
         self.session_map = SessionMap(
-            Path(self.workspace) / "state" / "feishu-bridge" / f"sessions-{self.bot_id}.json",
+            self._session_map_path,
             agent_type=self.agent_config.get("type"),
         )
         # Load CLI prompts for Feishu operations (materialized via importlib.resources)
@@ -399,10 +425,16 @@ class FeishuBot:
             except (subprocess.TimeoutExpired, OSError):
                 pass  # cron-mgr not functional, skip silently
 
+        self._extra_prompts = _extra_prompts
         self.runner = create_runner(
             self.agent_config, self.bot_config,
-            _extra_prompts,
+            self._extra_prompts,
         )
+        self._agent_models = {
+            agent_type: runner_cls.DEFAULT_MODEL
+            for agent_type, runner_cls in _RUNNER_CLASSES.items()
+        }
+        self.remember_current_model()
         self.command_handler = BridgeCommandHandler(self)
 
         # Quota poller (claude.ai API, cookie-based auth)
@@ -452,6 +484,59 @@ class FeishuBot:
             self.feishu_calendar = None
             self.feishu_search = None
             log.warning("Feishu API services unavailable (missing dependencies)")
+
+    def remember_current_model(self):
+        """Persist the last selected model for the active agent type."""
+        agent_type = self.agent_config.get("type")
+        runner = getattr(self, "runner", None)
+        if agent_type and runner is not None:
+            self._agent_models[agent_type] = runner.model
+
+    def switch_agent(self, agent_type: str) -> tuple[bool, str, str | None]:
+        """Hot-swap the bot's backend runner."""
+        target_type = (agent_type or "").strip().lower()
+        if target_type not in _RUNNER_CLASSES:
+            supported = " / ".join(sorted(_RUNNER_CLASSES))
+            return False, f"未知 Agent 类型: `{agent_type}`。可选: {supported}", None
+
+        current_type = self.agent_config.get("type")
+        if current_type == target_type:
+            return (
+                True,
+                f"当前 Agent 已是 `{target_type}`。",
+                self.agent_config.get("_resolved_command"),
+            )
+
+        self.remember_current_model()
+
+        resolved_cmd, configured_cmd = resolve_agent_command(self.agent_config, target_type)
+        if not resolved_cmd:
+            return (
+                False,
+                f"Agent 命令 `{configured_cmd}` 未在 PATH 中找到，无法切换到 `{target_type}`。",
+                None,
+            )
+
+        next_cfg = dict(self.agent_config)
+        next_cfg["type"] = target_type
+        next_cfg["command"] = configured_cmd
+        next_cfg["commands"] = _normalize_agent_commands(next_cfg)
+        next_cfg["_resolved_command"] = resolved_cmd
+
+        next_model = self._agent_models.get(
+            target_type, _RUNNER_CLASSES[target_type].DEFAULT_MODEL
+        )
+        next_bot_cfg = {**self.bot_config, "model": next_model}
+        next_runner = create_runner(next_cfg, next_bot_cfg, self._extra_prompts)
+
+        self.agent_config = next_cfg
+        self.runner = next_runner
+        self.session_map = SessionMap(self._session_map_path, agent_type=target_type)
+        self._session_cost.clear()
+
+        log.info("Switched agent for bot %s: %s -> %s (%s)",
+                 self.bot_id, current_type, target_type, resolved_cmd)
+        return True, f"Agent 已切换为 `{target_type}`。", resolved_cmd
 
     def _check_group_gate(self, chat_type, sender_id, mentions, chat_id) -> bool:
         """Group chat gate policy. Returns True to allow, False to reject."""
@@ -872,6 +957,8 @@ class FeishuBot:
                 bridge_cmd = "compact"
             elif cmd == "/model":
                 bridge_cmd = "model"
+            elif cmd == "/agent":
+                bridge_cmd = "agent"
             elif cmd == "/status":
                 bridge_cmd = "status"
             elif cmd == "/btw":
@@ -900,7 +987,7 @@ class FeishuBot:
                 }
                 # Heavy commands (/compact, /new, /reset, /clear, /status)
                 # serialize with normal messages via ChatTaskQueue.
-                # Light commands (/help, /stop, /cancel, /model, /feishu-*)
+                # Light commands (/help, /stop, /cancel, /model, /agent, /feishu-*)
                 # go directly to work queue.
                 _heavy_cmds = {"new", "compact", "status"}
                 if bridge_cmd in _heavy_cmds:

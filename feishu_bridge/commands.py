@@ -99,6 +99,7 @@ class BridgeCommandHandler:
             lines.extend([
                 "`/btw <问题>` — 快速提问（不中断当前任务，基于当前上下文）",
                 "`/model [模型名]` — 查看或切换模型",
+                "`/agent [类型]` — 查看或切换后端（claude / codex）",
                 "`/status` — 查看会话状态（context / 费用 / 配额）",
                 "`/update` — 检查并拉取最新版本（不重启）",
                 "`/restart` — 重启当前 Bot 实例",
@@ -170,14 +171,20 @@ class BridgeCommandHandler:
                 )
             elif arg in aliases:
                 self.bot.runner.model = aliases[arg]
+                self._remember_current_model()
                 handle.deliver(f"模型已切换为 `{aliases[arg]}`")
             elif arg in aliases.values():
                 self.bot.runner.model = arg
+                self._remember_current_model()
                 handle.deliver(f"模型已切换为 `{arg}`")
             else:
                 # Passthrough unknown model name (allows new models)
                 self.bot.runner.model = arg
+                self._remember_current_model()
                 handle.deliver(f"模型已设置为 `{arg}`（未识别的名称，将直接传递给 CLI）")
+
+        elif cmd == "agent":
+            self._handle_agent(arg, handle)
 
         elif cmd == "status":
             self._handle_status(item, handle)
@@ -236,6 +243,33 @@ class BridgeCommandHandler:
             if new_sid != sid:
                 self.bot.session_map.put(key, new_sid)
             log.info("Idle compact done: sid=%s", sid[:8])
+
+    def _remember_current_model(self):
+        remember = getattr(self.bot, "remember_current_model", None)
+        if callable(remember):
+            remember()
+
+    def _handle_agent(self, arg: str, handle):
+        """Handle /agent — switch backend runner for this bot process."""
+        current_type = getattr(self.bot, "agent_config", {}).get("type", "unknown")
+        current_cmd = getattr(self.bot, "agent_config", {}).get("command", "")
+        if not arg.strip():
+            suffix = f" (`{current_cmd}`)" if current_cmd else ""
+            handle.deliver(
+                f"当前 Agent: `{current_type}`{suffix}\n可选: `claude` / `codex`"
+            )
+            return
+
+        switch = getattr(self.bot, "switch_agent", None)
+        if not callable(switch):
+            handle.deliver("当前 Bot 不支持 Agent 热切换。", is_error=True)
+            return
+
+        ok, message, resolved_cmd = switch(arg.strip())
+        if ok and resolved_cmd:
+            handle.deliver(f"{message}\n命令: `{resolved_cmd}`")
+        else:
+            handle.deliver(message, is_error=not ok)
 
     def _handle_update(self, handle):
         """Handle /update — check for new version and pull if available."""
