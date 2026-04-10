@@ -267,6 +267,22 @@ def test_build_quota_alert_no_data():
     assert alert == ""
 
 
+def test_build_quota_alert_allowed_warning_with_reset_time():
+    result = {
+        "rate_limit_info": {
+            "status": "allowed_warning",
+            "rateLimitType": "five_hour",
+            "resetsAt": time.time() + 5400,  # 1h30m
+            "utilization": 0.85,
+        }
+    }
+    alert = bridge_worker._build_quota_alert(result)
+    assert "⚠️" in alert
+    assert "5 小时" in alert
+    assert "85%" in alert
+    assert "后重置" in alert
+
+
 def test_build_quota_alert_stale_snapshot_ignored():
     result = {"rate_limit_info": {"status": "allowed"}}
     snap = _make_snap({"five_hour": (90.0, 3600)})

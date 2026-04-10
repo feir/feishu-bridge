@@ -672,7 +672,7 @@ def test_context_health_alert_uses_model_context_window():
 
 
 def test_cost_accumulation_across_turns():
-    """Cost store accumulates total_cost_usd across multiple turns."""
+    """Cost store tracks session-cumulative total_cost_usd and per-turn delta."""
     cost_store = {}
     session_map = DummySessionMap()
 
@@ -680,13 +680,14 @@ def test_cost_accumulation_across_turns():
         call_count = 0
         def run(self, text, **kwargs):
             self.call_count += 1
+            # total_cost_usd from Claude CLI is session-cumulative
             return {
                 "result": f"reply-{self.call_count}",
                 "session_id": "sid-1",
                 "is_error": False,
                 "usage": {"input_tokens": 100, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
                 "modelUsage": {},
-                "total_cost_usd": 0.05,
+                "total_cost_usd": 0.05 * self.call_count,
             }
 
     runner = OKRunner()
@@ -711,10 +712,10 @@ def test_cost_accumulation_across_turns():
             session_not_found_signatures=[],
         )
 
-    # 3 turns x $0.05 = $0.15 accumulated
-    assert cost_store["sid-1"]["accumulated_cost_usd"] == pytest.approx(0.15)
-    # Latest turn cost is still $0.05
-    assert cost_store["sid-1"]["total_cost_usd"] == pytest.approx(0.05)
+    # Session cost = latest cumulative value ($0.15)
+    assert cost_store["sid-1"]["session_cost_usd"] == pytest.approx(0.15)
+    # Turn cost = delta of last two turns ($0.15 - $0.10 = $0.05)
+    assert cost_store["sid-1"]["turn_cost_usd"] == pytest.approx(0.05)
 
 
 def test_get_cached_token_never_triggers_ensure(monkeypatch):

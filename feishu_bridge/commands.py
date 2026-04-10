@@ -388,15 +388,15 @@ class BridgeCommandHandler:
 
         # --- Section 2: Cost (API mode only, skip for subscription) ---
         if not is_subscription:
-            turn_cost = cost_info.get("total_cost_usd")
-            accumulated = cost_info.get("accumulated_cost_usd", turn_cost or 0)
+            session_cost = cost_info.get("session_cost_usd", 0)
+            turn_cost = cost_info.get("turn_cost_usd", 0)
             out_tokens = usage.get("output_tokens", 0)
 
-            if turn_cost and turn_cost > 0:
+            if session_cost and session_cost > 0:
                 lines.append("")
-                cost_parts = [f"本次 ${turn_cost:.4f}"]
-                if accumulated and accumulated > 0:
-                    cost_parts.append(f"累计 **${accumulated:.4f}**")
+                cost_parts = [f"累计 **${session_cost:.4f}**"]
+                if turn_cost > 0:
+                    cost_parts.append(f"本次 ${turn_cost:.4f}")
                 lines.append("**费用** " + " · ".join(cost_parts))
                 lines.append(f"in: {inp + cache_read + cache_create:,} · out: {out_tokens:,}")
 
@@ -425,18 +425,22 @@ class BridgeCommandHandler:
                 status = rli.get("status", "")
                 limit_type = rli.get("rateLimitType", "")
                 label = "7d" if "seven_day" in limit_type else "5h"
+                resets_at = rli.get("resetsAt", 0)
+                remaining = max(0, resets_at - _time.time()) if resets_at else 0
+                hours, mins = divmod(int(remaining) // 60, 60)
+                reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
+                util = rli.get("utilization", 0)
+
                 if status == "rejected":
-                    resets_at = rli.get("resetsAt", 0)
-                    remaining = max(0, resets_at - _time.time()) if resets_at else 0
-                    hours, mins = divmod(int(remaining) // 60, 60)
-                    reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
                     lines.append("")
                     lines.append(f"**Claude** \U0001f6ab")
                     lines.append(f"- {label}: 已用尽{reset_str}")
                 else:
                     lines.append("")
-                    lines.append(f"**Claude** \U0001f7e2")
-                    lines.append(f"- {label}: {status}")
+                    icon = "\U0001f7e1" if util >= 0.75 else "\U0001f7e2"
+                    lines.append(f"**Claude** {icon}")
+                    util_str = f" {util:.0%}" if util > 0 else ""
+                    lines.append(f"- {label}:{util_str}{reset_str}")
 
         # Cookie expiry warning
         if snap:

@@ -206,7 +206,14 @@ def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
         if util >= 0.75:
             limit_type = rli.get("rateLimitType", "")
             label = "7 天" if "seven_day" in limit_type else "5 小时"
-            parts.append(f"⚠️ {label}配额 {util:.0%}")
+            resets_at = rli.get("resetsAt", 0)
+            reset_str = ""
+            if resets_at:
+                remaining = max(0, resets_at - _time.time())
+                hours, mins = divmod(int(remaining) // 60, 60)
+                if remaining > 0:
+                    reset_str = f"，约 {hours}h{mins:02d}m 后重置"
+            parts.append(f"⚠️ {label}配额 {util:.0%}{reset_str}")
 
     # 3. API snapshot: add utilization for all windows above threshold
     if quota_snapshot and quota_snapshot.available and not quota_snapshot.stale:
@@ -837,13 +844,15 @@ def process_message(
                 result.get("usage") or result.get("total_cost_usd")
             ):
                 existing = cost_store.get(effective_sid, {})
-                prev_accumulated = existing.get("accumulated_cost_usd", 0)
+                prev_session_cost = existing.get("session_cost_usd", 0)
+                cur_session_cost = result.get("total_cost_usd") or 0
                 cost_store[effective_sid] = {
                     "usage": result.get("usage", {}),
                     "last_call_usage": result.get("last_call_usage"),
                     "model_usage": result.get("modelUsage", {}),
-                    "total_cost_usd": result.get("total_cost_usd"),
-                    "accumulated_cost_usd": prev_accumulated + (result.get("total_cost_usd") or 0),
+                    # total_cost_usd from Claude CLI is session-cumulative
+                    "session_cost_usd": cur_session_cost,
+                    "turn_cost_usd": max(0, cur_session_cost - prev_session_cost),
                     "rate_limit_info": result.get("rate_limit_info") or existing.get("rate_limit_info"),
                 }
 
