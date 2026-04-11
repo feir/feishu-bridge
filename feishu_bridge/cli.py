@@ -683,6 +683,15 @@ def main():
     p.add_argument("--content",
                    help="Raw JSON content string (for non-text msg types)")
 
+    p = sub.add_parser("send-audio",
+                       help="Upload audio file and send as audio message")
+    p.add_argument("--chat-id", required=True,
+                   help="Feishu chat_id (e.g. oc_xxx)")
+    p.add_argument("--file", required=True,
+                   help="Path to audio file (opus preferred, wav accepted)")
+    p.add_argument("--duration", type=int,
+                   help="Audio duration in milliseconds (auto-detected if omitted)")
+
     args = parser.parse_args()
 
     # --- Bot-only commands (no user auth / FEISHU_AUTH_FILE needed) ---
@@ -731,6 +740,79 @@ def main():
                 _output({"message_id": mid})
             else:
                 _output({"error": resp.msg, "code": resp.code})
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _output({"error": str(e)})
+            sys.exit(1)
+        return
+
+    if args.command == "send-audio":
+        try:
+            import lark_oapi as lark
+            from lark_oapi.api.im.v1 import (
+                CreateFileRequest, CreateFileRequestBody,
+                CreateMessageRequest, CreateMessageRequestBody,
+            )
+
+            file_path = Path(args.file)
+            if not file_path.exists():
+                _output({"error": f"File not found: {args.file}"})
+                sys.exit(1)
+
+            config = _load_config()
+            client = lark.Client.builder() \
+                .app_id(config["app_id"]) \
+                .app_secret(config["app_secret"]) \
+                .domain(lark.FEISHU_DOMAIN) \
+                .log_level(lark.LogLevel.WARNING) \
+                .build()
+
+            suffix = file_path.suffix.lower()
+            file_type = "opus" if suffix in (".opus", ".ogg") else "stream"
+            msg_type = "audio" if file_type == "opus" else "file"
+
+            with open(file_path, "rb") as f:
+                body = CreateFileRequestBody.builder() \
+                    .file_type(file_type) \
+                    .file_name(file_path.name) \
+                    .file(f)
+                if args.duration:
+                    body = body.duration(args.duration)
+                body = body.build()
+
+                upload_req = CreateFileRequest.builder() \
+                    .request_body(body) \
+                    .build()
+                upload_resp = client.im.v1.file.create(upload_req)
+
+            if not upload_resp.success():
+                _output({"error": f"Upload failed: {upload_resp.msg}",
+                         "code": upload_resp.code})
+                sys.exit(1)
+
+            file_key = upload_resp.data.file_key
+            content = json.dumps({"file_key": file_key})
+
+            msg_body = CreateMessageRequestBody.builder() \
+                .receive_id(args.chat_id) \
+                .msg_type(msg_type) \
+                .content(content) \
+                .build()
+            msg_req = CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(msg_body) \
+                .build()
+            msg_resp = client.im.v1.message.create(msg_req)
+
+            if msg_resp.success():
+                mid = msg_resp.data.message_id if msg_resp.data else None
+                _output({"message_id": mid, "file_key": file_key,
+                         "msg_type": msg_type})
+            else:
+                _output({"error": f"Send failed: {msg_resp.msg}",
+                         "code": msg_resp.code})
                 sys.exit(1)
         except SystemExit:
             raise
