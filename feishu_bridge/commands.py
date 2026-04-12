@@ -100,6 +100,7 @@ class BridgeCommandHandler:
                 "`/btw <问题>` — 快速提问（不中断当前任务，基于当前上下文）",
                 "`/model [模型名]` — 查看或切换模型",
                 "`/agent [类型]` — 查看或切换后端（claude / codex）",
+                "`/provider [名称]` — 查看或切换当前后端配置",
                 "`/status` — 查看会话状态（context / 费用 / 配额）",
                 "`/update` — 检查并拉取最新版本（不重启）",
                 "`/restart` — 重启当前 Bot 实例",
@@ -186,6 +187,9 @@ class BridgeCommandHandler:
         elif cmd == "agent":
             self._handle_agent(arg, handle)
 
+        elif cmd == "provider":
+            self._handle_provider(arg, handle)
+
         elif cmd == "status":
             self._handle_status(item, handle)
 
@@ -270,6 +274,26 @@ class BridgeCommandHandler:
             handle.deliver(f"{message}\n命令: `{resolved_cmd}`")
         else:
             handle.deliver(message, is_error=not ok)
+
+    def _handle_provider(self, arg: str, handle):
+        """Handle /provider — switch provider profile for the current agent."""
+        agent_cfg = getattr(self.bot, "agent_config", {})
+        current = agent_cfg.get("provider", "default")
+        profiles = sorted((agent_cfg.get("providers") or {"default": {}}).keys())
+        if not arg.strip():
+            options = " / ".join(f"`{name}`" for name in profiles)
+            handle.deliver(
+                f"当前 Provider: `{current}`\n可选: {options}"
+            )
+            return
+
+        switch = getattr(self.bot, "switch_provider", None)
+        if not callable(switch):
+            handle.deliver("当前 Bot 不支持 Provider 热切换。", is_error=True)
+            return
+
+        ok, message = switch(arg.strip())
+        handle.deliver(message, is_error=not ok)
 
     def _handle_update(self, handle):
         """Handle /update — check for new version and pull if available."""

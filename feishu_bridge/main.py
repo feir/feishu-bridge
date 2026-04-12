@@ -92,7 +92,7 @@ log = logging.getLogger("feishu-bridge")
 # Known bridge commands (exact-match whitelist for gate exemption).
 _BRIDGE_CMD_EXACT = frozenset({
     "/help", "/new", "/clear", "/reset", "/stop", "/cancel",
-    "/compact", "/model", "/agent", "/status", "/btw", "/update",
+    "/compact", "/model", "/agent", "/provider", "/status", "/btw", "/update",
     "/restart-all", "/restart",
 })
 
@@ -136,6 +136,77 @@ _RUNNER_CLASSES: dict[str, type[BaseRunner]] = {
 }
 
 
+def _normalize_provider_models(provider_cfg: dict) -> dict[str, str]:
+    """Return optional per-agent default models for a provider profile."""
+    raw = provider_cfg.get("models")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(agent_type).strip().lower(): str(model).strip()
+        for agent_type, model in raw.items()
+        if str(agent_type).strip() and str(model).strip()
+    }
+
+
+def _normalize_agent_args(agent_cfg: dict) -> dict[str, list[str]]:
+    """Return optional per-agent CLI args in normalized form."""
+    raw = agent_cfg.get("args_by_type")
+    args_by_type = raw.copy() if isinstance(raw, dict) else {}
+    current_type = agent_cfg.get("type")
+    current_args = agent_cfg.get("args")
+    if current_type and current_args is not None:
+        args_by_type.setdefault(current_type, current_args)
+
+    normalized: dict[str, list[str]] = {}
+    for agent_type, values in args_by_type.items():
+        key = str(agent_type).strip().lower()
+        if not key:
+            continue
+        if isinstance(values, str):
+            normalized[key] = [values]
+        elif isinstance(values, list):
+            normalized[key] = [str(v) for v in values if str(v).strip()]
+    return normalized
+
+
+def _normalize_agent_env(agent_cfg: dict) -> dict[str, dict[str, str]]:
+    """Return optional per-agent environment overrides in normalized form."""
+    raw = agent_cfg.get("env_by_type")
+    env_by_type = raw.copy() if isinstance(raw, dict) else {}
+    current_type = agent_cfg.get("type")
+    current_env = agent_cfg.get("env")
+    if current_type and isinstance(current_env, dict):
+        env_by_type.setdefault(current_type, current_env)
+
+    normalized: dict[str, dict[str, str]] = {}
+    for agent_type, values in env_by_type.items():
+        key = str(agent_type).strip().lower()
+        if not key or not isinstance(values, dict):
+            continue
+        normalized[key] = {
+            str(k): str(v) for k, v in values.items() if str(k).strip()
+        }
+    return normalized
+
+
+def _normalize_provider_profiles(agent_cfg: dict) -> dict[str, dict]:
+    """Return normalized provider profiles keyed by profile name."""
+    raw = agent_cfg.get("providers")
+    profiles = raw.copy() if isinstance(raw, dict) else {}
+    normalized: dict[str, dict] = {"default": {}}
+    for name, cfg in profiles.items():
+        key = str(name).strip().lower()
+        if not key or not isinstance(cfg, dict):
+            continue
+        normalized[key] = {
+            "commands": _normalize_agent_commands(cfg),
+            "args_by_type": _normalize_agent_args(cfg),
+            "env_by_type": _normalize_agent_env(cfg),
+            "models": _normalize_provider_models(cfg),
+        }
+    return normalized
+
+
 def _normalize_agent_commands(agent_cfg: dict) -> dict[str, str]:
     """Return optional per-agent command overrides in normalized form."""
     raw = agent_cfg.get("commands")
@@ -156,6 +227,58 @@ def resolve_agent_command(agent_cfg: dict, agent_type: str) -> tuple[str | None,
     commands = _normalize_agent_commands(agent_cfg)
     configured = commands.get(agent_type, agent_type)
     return shutil.which(configured), configured
+
+
+def resolve_provider_name(agent_cfg: dict) -> str:
+    """Resolve the active provider profile name."""
+    provider = str(agent_cfg.get("provider", "default")).strip().lower() or "default"
+    profiles = _normalize_provider_profiles(agent_cfg)
+    return provider if provider in profiles else "default"
+
+
+def _provider_profile(agent_cfg: dict, provider_name: str | None = None) -> dict:
+    """Return normalized provider profile for the active or specified provider."""
+    provider = provider_name or resolve_provider_name(agent_cfg)
+    return _normalize_provider_profiles(agent_cfg).get(provider, {})
+
+
+def resolve_effective_agent_command(agent_cfg: dict, agent_type: str) -> tuple[str | None, str]:
+    """Resolve the CLI command for an agent type under the active provider."""
+    configured = _provider_profile(agent_cfg).get("commands", {}).get(agent_type)
+    if configured:
+        return shutil.which(configured), configured
+    return resolve_agent_command(agent_cfg, agent_type)
+
+
+def resolve_agent_args(agent_cfg: dict, agent_type: str) -> list[str]:
+    """Resolve extra CLI args for an agent type."""
+    provider_args = _provider_profile(agent_cfg).get("args_by_type", {}).get(agent_type)
+    if provider_args is not None:
+        return provider_args
+    return _normalize_agent_args(agent_cfg).get(agent_type, [])
+
+
+def resolve_agent_env(agent_cfg: dict, agent_type: str) -> dict[str, str]:
+    """Resolve fixed environment overrides for an agent type."""
+    env = dict(_normalize_agent_env(agent_cfg).get(agent_type, {}))
+    env.update(_provider_profile(agent_cfg).get("env_by_type", {}).get(agent_type, {}))
+    return env
+
+
+def resolve_agent_model(agent_cfg: dict, agent_type: str) -> str | None:
+    """Resolve provider-specific default model for an agent type."""
+    return _provider_profile(agent_cfg).get("models", {}).get(agent_type)
+
+
+def session_identity(agent_cfg: dict) -> str:
+    """Return the identity marker used for session compatibility."""
+    agent_type = str(agent_cfg.get("type", "")).strip().lower()
+    provider = resolve_provider_name(agent_cfg)
+    return agent_type if provider == "default" else f"{agent_type}:{provider}"
+
+
+def _model_memory_key(agent_type: str, provider: str) -> str:
+    return f"{agent_type}@{provider}"
 
 
 
@@ -236,8 +359,12 @@ def load_config(config_path: str, bot_name: str) -> dict:
     # Resolve agent CLI command
     default_cmd = "claude" if agent_type == "claude" else agent_type
     agent_cfg.setdefault("command", default_cmd)
+    agent_cfg["provider"] = resolve_provider_name(agent_cfg)
     agent_cfg["commands"] = _normalize_agent_commands(agent_cfg)
-    resolved_cmd, agent_cmd = resolve_agent_command(agent_cfg, agent_type)
+    agent_cfg["args_by_type"] = _normalize_agent_args(agent_cfg)
+    agent_cfg["env_by_type"] = _normalize_agent_env(agent_cfg)
+    agent_cfg["providers"] = _normalize_provider_profiles(agent_cfg)
+    resolved_cmd, agent_cmd = resolve_effective_agent_command(agent_cfg, agent_type)
     if not resolved_cmd:
         log.error(
             "Agent command '%s' not found in PATH. "
@@ -312,7 +439,7 @@ def create_runner(agent_cfg: dict, bot_cfg: dict,
     """Factory: create the appropriate Runner based on agent.type."""
     agent_type = agent_cfg["type"]
     runner_cls = _RUNNER_CLASSES[agent_type]  # validated in load_config()
-    default_model = runner_cls.DEFAULT_MODEL
+    default_model = resolve_agent_model(agent_cfg, agent_type) or runner_cls.DEFAULT_MODEL
     return runner_cls(
         command=agent_cfg["_resolved_command"],
         model=bot_cfg.get("model", default_model),
@@ -320,6 +447,8 @@ def create_runner(agent_cfg: dict, bot_cfg: dict,
         timeout=agent_cfg.get("timeout_seconds", DEFAULT_TIMEOUT),
         max_budget_usd=agent_cfg.get("max_budget_usd"),
         extra_system_prompts=extra_prompts,
+        extra_cli_args=resolve_agent_args(agent_cfg, agent_type),
+        fixed_env=resolve_agent_env(agent_cfg, agent_type),
     )
 
 
@@ -398,7 +527,7 @@ class FeishuBot:
         )
         self.session_map = SessionMap(
             self._session_map_path,
-            agent_type=self.agent_config.get("type"),
+            agent_type=session_identity(self.agent_config),
         )
         # Load CLI prompts for Feishu operations (materialized via importlib.resources)
         _extra_prompts = []
@@ -430,10 +559,7 @@ class FeishuBot:
             self.agent_config, self.bot_config,
             self._extra_prompts,
         )
-        self._agent_models = {
-            agent_type: runner_cls.DEFAULT_MODEL
-            for agent_type, runner_cls in _RUNNER_CLASSES.items()
-        }
+        self._agent_models = {}
         self.remember_current_model()
         self.command_handler = BridgeCommandHandler(self)
 
@@ -488,9 +614,56 @@ class FeishuBot:
     def remember_current_model(self):
         """Persist the last selected model for the active agent type."""
         agent_type = self.agent_config.get("type")
+        provider = resolve_provider_name(self.agent_config)
         runner = getattr(self, "runner", None)
         if agent_type and runner is not None:
-            self._agent_models[agent_type] = runner.model
+            self._agent_models[_model_memory_key(agent_type, provider)] = runner.model
+
+    def switch_provider(self, provider_name: str) -> tuple[bool, str]:
+        """Hot-swap the active provider profile for the current agent."""
+        target = (provider_name or "").strip().lower()
+        profiles = self.agent_config.get("providers", {"default": {}})
+        if target not in profiles:
+            supported = " / ".join(sorted(profiles))
+            return False, f"未知 Provider: `{provider_name}`。可选: {supported}"
+
+        current = resolve_provider_name(self.agent_config)
+        if current == target:
+            return True, f"当前 Provider 已是 `{target}`。"
+
+        self.remember_current_model()
+
+        next_cfg = dict(self.agent_config)
+        next_cfg["provider"] = target
+        next_cfg["commands"] = _normalize_agent_commands(next_cfg)
+        next_cfg["args_by_type"] = _normalize_agent_args(next_cfg)
+        next_cfg["env_by_type"] = _normalize_agent_env(next_cfg)
+        next_cfg["providers"] = _normalize_provider_profiles(next_cfg)
+        target_type = next_cfg["type"]
+        resolved_cmd, configured_cmd = resolve_effective_agent_command(next_cfg, target_type)
+        if not resolved_cmd:
+            return (
+                False,
+                f"Agent 命令 `{configured_cmd}` 未在 PATH 中找到，无法切换到 `{target}` provider。",
+            )
+        next_cfg["command"] = configured_cmd
+        next_cfg["_resolved_command"] = resolved_cmd
+
+        next_model = self._agent_models.get(
+            _model_memory_key(target_type, target),
+            resolve_agent_model(next_cfg, target_type) or self.runner.DEFAULT_MODEL,
+        )
+        next_bot_cfg = {**self.bot_config, "model": next_model}
+        next_runner = create_runner(next_cfg, next_bot_cfg, self._extra_prompts)
+
+        self.agent_config = next_cfg
+        self.runner = next_runner
+        self.session_map = SessionMap(self._session_map_path, agent_type=session_identity(next_cfg))
+        self._session_cost.clear()
+
+        log.info("Switched provider for bot %s: %s -> %s (%s/%s)",
+                 self.bot_id, current, target, target_type, resolved_cmd)
+        return True, f"Provider 已切换为 `{target}`。"
 
     def switch_agent(self, agent_type: str) -> tuple[bool, str, str | None]:
         """Hot-swap the bot's backend runner."""
@@ -509,7 +682,14 @@ class FeishuBot:
 
         self.remember_current_model()
 
-        resolved_cmd, configured_cmd = resolve_agent_command(self.agent_config, target_type)
+        next_cfg = dict(self.agent_config)
+        next_cfg["type"] = target_type
+        next_cfg["commands"] = _normalize_agent_commands(next_cfg)
+        next_cfg["args_by_type"] = _normalize_agent_args(next_cfg)
+        next_cfg["env_by_type"] = _normalize_agent_env(next_cfg)
+        next_cfg["providers"] = _normalize_provider_profiles(next_cfg)
+
+        resolved_cmd, configured_cmd = resolve_effective_agent_command(next_cfg, target_type)
         if not resolved_cmd:
             return (
                 False,
@@ -517,21 +697,20 @@ class FeishuBot:
                 None,
             )
 
-        next_cfg = dict(self.agent_config)
-        next_cfg["type"] = target_type
         next_cfg["command"] = configured_cmd
-        next_cfg["commands"] = _normalize_agent_commands(next_cfg)
         next_cfg["_resolved_command"] = resolved_cmd
 
+        provider = resolve_provider_name(next_cfg)
         next_model = self._agent_models.get(
-            target_type, _RUNNER_CLASSES[target_type].DEFAULT_MODEL
+            _model_memory_key(target_type, provider),
+            resolve_agent_model(next_cfg, target_type) or _RUNNER_CLASSES[target_type].DEFAULT_MODEL,
         )
         next_bot_cfg = {**self.bot_config, "model": next_model}
         next_runner = create_runner(next_cfg, next_bot_cfg, self._extra_prompts)
 
         self.agent_config = next_cfg
         self.runner = next_runner
-        self.session_map = SessionMap(self._session_map_path, agent_type=target_type)
+        self.session_map = SessionMap(self._session_map_path, agent_type=session_identity(next_cfg))
         self._session_cost.clear()
 
         log.info("Switched agent for bot %s: %s -> %s (%s)",
@@ -959,6 +1138,8 @@ class FeishuBot:
                 bridge_cmd = "model"
             elif cmd == "/agent":
                 bridge_cmd = "agent"
+            elif cmd == "/provider":
+                bridge_cmd = "provider"
             elif cmd == "/status":
                 bridge_cmd = "status"
             elif cmd == "/btw":
@@ -987,7 +1168,7 @@ class FeishuBot:
                 }
                 # Heavy commands (/compact, /new, /reset, /clear, /status)
                 # serialize with normal messages via ChatTaskQueue.
-                # Light commands (/help, /stop, /cancel, /model, /agent, /feishu-*)
+                # Light commands (/help, /stop, /cancel, /model, /agent, /provider, /feishu-*)
                 # go directly to work queue.
                 _heavy_cmds = {"new", "compact", "status"}
                 if bridge_cmd in _heavy_cmds:

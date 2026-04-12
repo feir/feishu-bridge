@@ -321,13 +321,19 @@ class BaseRunner(ABC):
 
     def __init__(self, command: str, model: str, workspace: str, timeout: int,
                  max_budget_usd: Optional[float] = None,
-                 extra_system_prompts: Optional[list[str]] = None):
+                 extra_system_prompts: Optional[list[str]] = None,
+                 extra_cli_args: Optional[list[str]] = None,
+                 fixed_env: Optional[dict[str, str]] = None):
         self.command = command
         self.model = model
         self.workspace = workspace
         self.timeout = timeout
         self.max_budget_usd = max_budget_usd
         self._extra_system_prompts = extra_system_prompts or []
+        self._extra_cli_args = [str(arg) for arg in (extra_cli_args or [])]
+        self._fixed_env = {
+            str(key): str(value) for key, value in (fixed_env or {}).items()
+        }
         self._active: dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
@@ -364,7 +370,7 @@ class BaseRunner(ABC):
 
     def get_extra_env(self) -> dict:
         """额外环境变量。默认注入用户 PATH。"""
-        env = {}
+        env = dict(self._fixed_env)
         # Ensure user-local bin dirs are in PATH for subprocesses.
         # systemd services don't source ~/.profile, so ~/.local/bin etc.
         # are missing from PATH, causing tools like gh to be not found.
@@ -372,7 +378,7 @@ class BaseRunner(ABC):
             os.path.expanduser("~/.local/bin"),
             os.path.expanduser("~/bin"),
         ]
-        existing = os.environ.get("PATH", "")
+        existing = env.get("PATH") or os.environ.get("PATH", "")
         additions = [p for p in user_bins if os.path.isdir(p) and p not in existing]
         if additions:
             env["PATH"] = ":".join(additions) + ":" + existing
@@ -767,12 +773,18 @@ class ClaudeRunner(BaseRunner):
                    fork_session=False):
         args = [
             self.command, "-p",
+        ]
+
+        if self._extra_cli_args:
+            args.extend(self._extra_cli_args)
+
+        args.extend([
             "--dangerously-skip-permissions",
             "--settings", get_bridge_settings_path(),
             "--model", self.model,
             "--append-system-prompt",
             self._build_system_prompt(),
-        ]
+        ])
 
         if self.max_budget_usd is not None:
             args.extend(["--max-budget-usd", str(self.max_budget_usd)])
@@ -971,13 +983,17 @@ class CodexRunner(BaseRunner):
 
     def __init__(self, command: str, model: str, workspace: str, timeout: int,
                  max_budget_usd: Optional[float] = None,
-                 extra_system_prompts: Optional[list[str]] = None):
+                 extra_system_prompts: Optional[list[str]] = None,
+                 extra_cli_args: Optional[list[str]] = None,
+                 fixed_env: Optional[dict[str, str]] = None):
         if max_budget_usd is not None:
             log.warning("Codex does not support budget tracking, max_budget_usd ignored")
         super().__init__(
             command=command, model=model, workspace=workspace,
             timeout=timeout, max_budget_usd=None,
             extra_system_prompts=extra_system_prompts,
+            extra_cli_args=extra_cli_args,
+            fixed_env=fixed_env,
         )
         # Thread-local storage for per-invocation temp file path.
         # run() writes the path; build_args() reads it (same thread).
@@ -987,11 +1003,17 @@ class CodexRunner(BaseRunner):
                    fork_session=False):
         args = [
             self.command, "exec",
+        ]
+
+        if self._extra_cli_args:
+            args.extend(self._extra_cli_args)
+
+        args.extend([
             "--dangerously-bypass-approvals-and-sandbox",
             "--json",
             "-C", self.workspace,
             "-m", self.model,
-        ]
+        ])
 
         # Inject system prompt via -c model_instructions_file (set by run())
         instructions_path = getattr(self._tls, "instructions_path", None)
