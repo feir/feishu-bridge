@@ -3,6 +3,8 @@
 
 import json
 import os
+import sys
+import types
 
 import pytest
 
@@ -14,6 +16,48 @@ from feishu_bridge.api import auth as feishu_auth
 from feishu_bridge import main as bridge
 from feishu_bridge.api.client import FeishuAPIError
 from feishu_bridge.api.tasks import FeishuTasks
+
+
+@pytest.fixture(autouse=True)
+def _stub_cryptography_when_missing(monkeypatch):
+    """Provide a test-only AESGCM stub when cryptography isn't installed."""
+    try:
+        import cryptography  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    import hashlib
+
+    class FakeAESGCM:
+        def __init__(self, key):
+            self._key = key
+
+        def encrypt(self, nonce, data, associated_data):
+            aad = associated_data or b""
+            tag = hashlib.sha256(self._key + nonce + aad + data).digest()
+            return tag + data
+
+        def decrypt(self, nonce, data, associated_data):
+            aad = associated_data or b""
+            tag, payload = data[:32], data[32:]
+            expected = hashlib.sha256(self._key + nonce + aad + payload).digest()
+            if tag != expected:
+                raise ValueError("invalid tag")
+            return payload
+
+    cryptography_mod = types.ModuleType("cryptography")
+    hazmat_mod = types.ModuleType("cryptography.hazmat")
+    primitives_mod = types.ModuleType("cryptography.hazmat.primitives")
+    ciphers_mod = types.ModuleType("cryptography.hazmat.primitives.ciphers")
+    aead_mod = types.ModuleType("cryptography.hazmat.primitives.ciphers.aead")
+    aead_mod.AESGCM = FakeAESGCM
+
+    monkeypatch.setitem(sys.modules, "cryptography", cryptography_mod)
+    monkeypatch.setitem(sys.modules, "cryptography.hazmat", hazmat_mod)
+    monkeypatch.setitem(sys.modules, "cryptography.hazmat.primitives", primitives_mod)
+    monkeypatch.setitem(sys.modules, "cryptography.hazmat.primitives.ciphers", ciphers_mod)
+    monkeypatch.setitem(sys.modules, "cryptography.hazmat.primitives.ciphers.aead", aead_mod)
 
 
 class FakeHandle:
@@ -2189,6 +2233,66 @@ def test_load_config_new_agent_format(tmp_path):
     assert result["agent"]["timeout_seconds"] == 300
 
 
+def test_load_config_normalizes_agent_args_and_env(tmp_path):
+    """Agent config normalizes per-type args/env and current-type shorthands."""
+    config = {
+        "bots": [_base_bot_config()],
+        "agent": {
+            "type": "claude",
+            "command": "python3",
+            "args": ["--verbose"],
+            "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"},
+            "args_by_type": {"codex": ["--oss", "--local-provider", "ollama"]},
+            "env_by_type": {"codex": {"OPENAI_BASE_URL": "http://127.0.0.1:11434/v1"}},
+        },
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    result = bridge.load_config(str(cfg_file), "test")
+
+    assert result["agent"]["args_by_type"] == {
+        "claude": ["--verbose"],
+        "codex": ["--oss", "--local-provider", "ollama"],
+    }
+    assert result["agent"]["env_by_type"] == {
+        "claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"},
+        "codex": {"OPENAI_BASE_URL": "http://127.0.0.1:11434/v1"},
+    }
+
+
+def test_load_config_normalizes_provider_profiles(tmp_path):
+    """Provider profiles are normalized and active provider is preserved."""
+    config = {
+        "bots": [_base_bot_config()],
+        "agent": {
+            "type": "claude",
+            "command": "python3",
+            "provider": "ollama",
+            "providers": {
+                "ollama": {
+                    "env_by_type": {
+                        "claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"},
+                    },
+                    "models": {"claude": "qwen3.5"},
+                }
+            },
+        },
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    result = bridge.load_config(str(cfg_file), "test")
+
+    assert result["agent"]["provider"] == "ollama"
+    assert result["agent"]["providers"]["ollama"]["env_by_type"] == {
+        "claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"},
+    }
+    assert result["agent"]["providers"]["ollama"]["models"] == {
+        "claude": "qwen3.5",
+    }
+
+
 def test_load_config_missing_agent_type_exits(tmp_path):
     """agent config without 'type' causes sys.exit."""
     config = {
@@ -2206,22 +2310,42 @@ def test_create_runner_claude():
     """Factory creates ClaudeRunner for type=claude."""
     import shutil
     cmd = shutil.which("python3")
-    agent_cfg = {"type": "claude", "_resolved_command": cmd, "timeout_seconds": 30}
+    agent_cfg = {
+        "type": "claude",
+        "_resolved_command": cmd,
+        "timeout_seconds": 30,
+        "args_by_type": {"claude": ["--verbose"]},
+        "env_by_type": {"claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"}},
+    }
     bot_cfg = {"workspace": "/tmp", "model": "claude-sonnet-4-6"}
     runner = bridge.create_runner(agent_cfg, bot_cfg, [])
     assert isinstance(runner, bridge_runtime.ClaudeRunner)
     assert runner.model == "claude-sonnet-4-6"
+    assert runner.build_args("hi", None, False, False)[2:3] == ["--verbose"]
+    assert runner.get_extra_env()["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:11434"
 
 
 def test_create_runner_codex():
     """Factory creates CodexRunner for type=codex."""
     import shutil
     cmd = shutil.which("python3")
-    agent_cfg = {"type": "codex", "_resolved_command": cmd, "timeout_seconds": 30}
+    agent_cfg = {
+        "type": "codex",
+        "_resolved_command": cmd,
+        "timeout_seconds": 30,
+        "args_by_type": {"codex": ["--oss", "--local-provider", "ollama"]},
+        "env_by_type": {"codex": {"OPENAI_BASE_URL": "http://127.0.0.1:11434/v1"}},
+    }
     bot_cfg = {"workspace": "/tmp"}
     runner = bridge.create_runner(agent_cfg, bot_cfg, [])
     assert isinstance(runner, bridge_runtime.CodexRunner)
     assert runner.model == "gpt-5.2-codex"  # DEFAULT_MODEL fallback
+    args = runner.build_args("hi", None, False, True)
+    assert args[:6] == [
+        cmd, "exec", "--oss", "--local-provider", "ollama",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ]
+    assert runner.get_extra_env()["OPENAI_BASE_URL"] == "http://127.0.0.1:11434/v1"
 
 
 def test_create_runner_unknown_type_raises():
@@ -2240,7 +2364,17 @@ def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path)
     bot.agent_config = {
         "type": "claude",
         "command": "claude",
+        "provider": "default",
+        "providers": {"default": {}, "ollama": {}},
         "commands": {"claude": "claude"},
+        "args_by_type": {
+            "claude": ["--verbose"],
+            "codex": ["--oss", "--local-provider", "ollama"],
+        },
+        "env_by_type": {
+            "claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"},
+            "codex": {"OPENAI_BASE_URL": "http://127.0.0.1:11434/v1"},
+        },
         "_resolved_command": bridge.shutil.which("python3"),
         "timeout_seconds": 30,
     }
@@ -2248,7 +2382,10 @@ def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path)
         command="claude", model="claude-opus-4-6", workspace="/tmp", timeout=30
     )
     bot._extra_prompts = []
-    bot._agent_models = {"claude": "claude-opus-4-6", "codex": "gpt-5.1-codex-mini"}
+    bot._agent_models = {
+        "claude@default": "claude-opus-4-6",
+        "codex@default": "gpt-5.1-codex-mini",
+    }
     bot._session_cost = {"sid-old": {"usage": {}}}
     bot._session_map_path = tmp_path / "sessions.json"
     bot._session_map_path.write_text(json.dumps({
@@ -2271,6 +2408,10 @@ def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path)
     assert isinstance(bot.runner, bridge_runtime.CodexRunner)
     assert bot.runner.model == "gpt-5.1-codex-mini"
     assert bot.agent_config["type"] == "codex"
+    assert bot.runner.build_args("hi", None, False, True)[2:5] == [
+        "--oss", "--local-provider", "ollama"
+    ]
+    assert bot.runner.get_extra_env()["OPENAI_BASE_URL"] == "http://127.0.0.1:11434/v1"
     assert bot._session_cost == {}
     assert bot.session_map.get(("chat-key",)) is None
     data = json.loads(bot._session_map_path.read_text())
@@ -2285,6 +2426,8 @@ def test_switch_agent_remembers_current_model_before_switch(monkeypatch, tmp_pat
     bot.agent_config = {
         "type": "claude",
         "command": "claude",
+        "provider": "default",
+        "providers": {"default": {}},
         "commands": {"claude": "claude"},
         "_resolved_command": bridge.shutil.which("python3"),
         "timeout_seconds": 30,
@@ -2293,7 +2436,7 @@ def test_switch_agent_remembers_current_model_before_switch(monkeypatch, tmp_pat
         command="claude", model="claude-sonnet-4-6", workspace="/tmp", timeout=30
     )
     bot._extra_prompts = []
-    bot._agent_models = {"claude": "claude-opus-4-6", "codex": "gpt-5.2-codex"}
+    bot._agent_models = {"claude@default": "claude-opus-4-6", "codex@default": "gpt-5.2-codex"}
     bot._session_cost = {}
     bot._session_map_path = tmp_path / "sessions.json"
     bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
@@ -2306,7 +2449,98 @@ def test_switch_agent_remembers_current_model_before_switch(monkeypatch, tmp_pat
 
     bot.switch_agent("codex")
 
-    assert bot._agent_models["claude"] == "claude-sonnet-4-6"
+    assert bot._agent_models["claude@default"] == "claude-sonnet-4-6"
+
+
+def test_switch_provider_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path):
+    """Provider switch rebuilds runner and clears incompatible sessions."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.bot_id = "test-bot"
+    bot.bot_config = {"workspace": "/tmp", "model": "claude-opus-4-6"}
+    bot.agent_config = {
+        "type": "claude",
+        "provider": "default",
+        "command": "claude",
+        "commands": {"claude": "claude"},
+        "providers": {
+            "default": {},
+            "ollama": {
+                "env_by_type": {
+                    "claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"},
+                },
+                "models": {"claude": "qwen3.5"},
+            },
+        },
+        "args_by_type": {"claude": []},
+        "env_by_type": {"claude": {}},
+        "_resolved_command": bridge.shutil.which("python3"),
+        "timeout_seconds": 30,
+    }
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-opus-4-6", workspace="/tmp", timeout=30
+    )
+    bot._extra_prompts = []
+    bot._agent_models = {"claude@default": "claude-opus-4-6"}
+    bot._session_cost = {"sid-old": {"usage": {}}}
+    bot._session_map_path = tmp_path / "sessions.json"
+    bot._session_map_path.write_text(json.dumps({
+        "_agent_type": "claude",
+        "chat-key": "sid-old",
+    }))
+    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
+
+    monkeypatch.setattr(
+        bridge,
+        "resolve_effective_agent_command",
+        lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
+    )
+
+    ok, message = bot.switch_provider("ollama")
+
+    assert ok is True
+    assert "ollama" in message
+    assert bot.agent_config["provider"] == "ollama"
+    assert isinstance(bot.runner, bridge_runtime.ClaudeRunner)
+    assert bot.runner.model == "qwen3.5"
+    assert bot.runner.get_extra_env()["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:11434"
+    assert bot._session_cost == {}
+    assert bot.session_map.get(("chat-key",)) is None
+    data = json.loads(bot._session_map_path.read_text())
+    assert data["_agent_type"] == "claude:ollama"
+
+
+def test_switch_provider_remembers_current_model_before_switch(monkeypatch, tmp_path):
+    """Switching provider remembers the last model used for the current provider."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.bot_id = "test-bot"
+    bot.bot_config = {"workspace": "/tmp", "model": "claude-opus-4-6"}
+    bot.agent_config = {
+        "type": "claude",
+        "provider": "default",
+        "command": "claude",
+        "commands": {"claude": "claude"},
+        "providers": {"default": {}, "ollama": {}},
+        "_resolved_command": bridge.shutil.which("python3"),
+        "timeout_seconds": 30,
+    }
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-sonnet-4-6", workspace="/tmp", timeout=30
+    )
+    bot._extra_prompts = []
+    bot._agent_models = {}
+    bot._session_cost = {}
+    bot._session_map_path = tmp_path / "sessions.json"
+    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
+
+    monkeypatch.setattr(
+        bridge,
+        "resolve_effective_agent_command",
+        lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
+    )
+
+    bot.switch_provider("ollama")
+
+    assert bot._agent_models["claude@default"] == "claude-sonnet-4-6"
 
 
 def test_session_map_agent_type_reconcile_same(tmp_path):
@@ -2488,6 +2722,13 @@ def test_is_bridge_command_agent():
     assert bridge._is_bridge_command("/agency") is False
 
 
+def test_is_bridge_command_provider():
+    """Verify /provider is recognized as a bridge command."""
+    assert bridge._is_bridge_command("/provider ollama") is True
+    assert bridge._is_bridge_command("/provider") is True
+    assert bridge._is_bridge_command("/providers") is False
+
+
 def test_claude_runner_build_args_fork_session():
     """ClaudeRunner build_args with fork_session=True adds correct flags."""
     runner = bridge_runtime.ClaudeRunner(
@@ -2515,6 +2756,20 @@ def test_claude_runner_build_args_no_fork_by_default():
     assert "--disallowed-tools" not in args
 
 
+def test_claude_runner_build_args_include_extra_cli_args():
+    """ClaudeRunner prepends configured extra args before fixed flags."""
+    runner = bridge_runtime.ClaudeRunner(
+        command="claude",
+        model="sonnet",
+        workspace="/tmp",
+        timeout=30,
+        extra_cli_args=["--verbose"],
+    )
+    args = runner.build_args("hello", session_id=None, resume=False, streaming=False)
+    assert args[:3] == ["claude", "-p", "--verbose"]
+    assert "--model" in args
+
+
 def test_codex_runner_build_args_ignores_fork_session():
     """CodexRunner accepts fork_session but ignores it."""
     runner = _make_codex_runner()
@@ -2522,6 +2777,15 @@ def test_codex_runner_build_args_ignores_fork_session():
         "hello", session_id="sid-123", resume=True,
         streaming=False, fork_session=True)
     assert "--fork-session" not in args
+
+
+def test_codex_runner_build_args_include_extra_cli_args():
+    """CodexRunner inserts configured extra args after exec."""
+    runner = _make_codex_runner(extra_cli_args=["--oss", "--local-provider", "ollama"])
+    args = runner.build_args(
+        "hello", session_id="sid-123", resume=True,
+        streaming=False, fork_session=True)
+    assert args[:5] == ["codex", "exec", "--oss", "--local-provider", "ollama"]
 
 
 def test_btw_empty_arg_shows_usage():
@@ -2689,5 +2953,46 @@ def test_agent_switch_failure_is_error():
     handle = FakeHandle(None, "chat", None, "mid")
 
     handler._handle_agent("codex", handle)
+
+    assert handle.deliveries == [("切换失败", True, 0)]
+
+
+def test_provider_empty_arg_shows_current_provider():
+    """/provider with no argument returns current provider info."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.agent_config = {"provider": "default", "providers": {"default": {}, "ollama": {}}}
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+
+    handler._handle_provider("", handle)
+
+    assert len(handle.deliveries) == 1
+    assert "当前 Provider" in handle.deliveries[0][0]
+    assert "default" in handle.deliveries[0][0]
+    assert "ollama" in handle.deliveries[0][0]
+
+
+def test_provider_switch_success_reports_message():
+    """/provider reports success."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.agent_config = {"provider": "default", "providers": {"default": {}, "ollama": {}}}
+    bot.switch_provider = lambda target: (True, "Provider 已切换为 `ollama`。")
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+
+    handler._handle_provider("ollama", handle)
+
+    assert handle.deliveries == [("Provider 已切换为 `ollama`。", False, 0)]
+
+
+def test_provider_switch_failure_is_error():
+    """/provider surfaces switch errors to the user."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.agent_config = {"provider": "default", "providers": {"default": {}, "ollama": {}}}
+    bot.switch_provider = lambda target: (False, "切换失败")
+    handler = bridge_commands.BridgeCommandHandler(bot)
+    handle = FakeHandle(None, "chat", None, "mid")
+
+    handler._handle_provider("ollama", handle)
 
     assert handle.deliveries == [("切换失败", True, 0)]
