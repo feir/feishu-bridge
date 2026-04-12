@@ -2269,12 +2269,17 @@ def test_load_config_normalizes_provider_profiles(tmp_path):
             "type": "claude",
             "command": "python3",
             "provider": "ollama",
+            "prompt": {
+                "safety": "minimal",
+                "feishu_cli": False,
+            },
             "providers": {
                 "ollama": {
                     "env_by_type": {
                         "claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"},
                     },
                     "models": {"claude": "qwen3.5"},
+                    "prompt": {"cron_mgr": False},
                 }
             },
         },
@@ -2290,6 +2295,14 @@ def test_load_config_normalizes_provider_profiles(tmp_path):
     }
     assert result["agent"]["providers"]["ollama"]["models"] == {
         "claude": "qwen3.5",
+    }
+    assert result["agent"]["prompt"] == {
+        "safety": "minimal",
+        "feishu_cli": False,
+        "cron_mgr": True,
+    }
+    assert result["agent"]["providers"]["ollama"]["prompt"] == {
+        "cron_mgr": False,
     }
 
 
@@ -2323,6 +2336,32 @@ def test_create_runner_claude():
     assert runner.model == "claude-sonnet-4-6"
     assert runner.build_args("hi", None, False, False)[2:3] == ["--verbose"]
     assert runner.get_extra_env()["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:11434"
+
+
+def test_create_runner_claude_prompt_profile():
+    """Claude runner applies resolved safety prompt mode and optional prompt append."""
+    import shutil
+    cmd = shutil.which("python3")
+    agent_cfg = {
+        "type": "claude",
+        "_resolved_command": cmd,
+        "timeout_seconds": 30,
+        "prompt": {"safety": "off", "feishu_cli": False, "cron_mgr": False},
+        "providers": {"default": {}},
+    }
+    bot_cfg = {"workspace": "/tmp", "model": "claude-sonnet-4-6"}
+
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+
+    assert isinstance(runner, bridge_runtime.ClaudeRunner)
+    assert "--append-system-prompt" not in runner.build_args("hi", None, False, False)
+
+    agent_cfg["prompt"] = {"safety": "minimal", "feishu_cli": False, "cron_mgr": False}
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+    assert runner._build_system_prompt() == (
+        "CRITICAL: You are running as a subprocess of feishu-bridge. "
+        "NEVER restart, stop, or reload feishu-bridge itself."
+    )
 
 
 def test_create_runner_codex():
@@ -2399,6 +2438,7 @@ def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path)
         "resolve_agent_command",
         lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
     )
+    monkeypatch.setattr(bridge, "build_extra_prompts", lambda agent_cfg: [])
 
     ok, message, resolved = bot.switch_agent("codex")
 
@@ -2446,6 +2486,7 @@ def test_switch_agent_remembers_current_model_before_switch(monkeypatch, tmp_pat
         "resolve_agent_command",
         lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
     )
+    monkeypatch.setattr(bridge, "build_extra_prompts", lambda agent_cfg: [])
 
     bot.switch_agent("codex")
 
@@ -2494,6 +2535,15 @@ def test_switch_provider_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_pa
         "resolve_effective_agent_command",
         lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
     )
+    monkeypatch.setattr(
+        bridge,
+        "build_extra_prompts",
+        lambda agent_cfg: (
+            ["default tools"]
+            if bridge.resolve_provider_name(agent_cfg) == "default"
+            else ["ollama-lite"]
+        ),
+    )
 
     ok, message = bot.switch_provider("ollama")
 
@@ -2502,6 +2552,8 @@ def test_switch_provider_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_pa
     assert bot.agent_config["provider"] == "ollama"
     assert isinstance(bot.runner, bridge_runtime.ClaudeRunner)
     assert bot.runner.model == "qwen3.5"
+    assert bot._extra_prompts == ["ollama-lite"]
+    assert bot.runner._extra_system_prompts == ["ollama-lite"]
     assert bot.runner.get_extra_env()["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:11434"
     assert bot._session_cost == {}
     assert bot.session_map.get(("chat-key",)) is None
@@ -2537,6 +2589,7 @@ def test_switch_provider_remembers_current_model_before_switch(monkeypatch, tmp_
         "resolve_effective_agent_command",
         lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
     )
+    monkeypatch.setattr(bridge, "build_extra_prompts", lambda agent_cfg: [])
 
     bot.switch_provider("ollama")
 

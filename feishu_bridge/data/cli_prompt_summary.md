@@ -15,5 +15,6 @@ You have access to Feishu (飞书) APIs via `feishu-cli <command> [args]`.
 - **Tasks** — task/subtask CRUD, task lists, completion tracking
 - **Messaging** — send bot messages to chats
 
-Run `feishu-cli <command> --help` for detailed usage and arguments.
+Run `feishu-cli prompt` to load the **complete command reference** with all arguments, formats, and usage details.
+Run `feishu-cli <command> --help` for a single command's usage.
 All output is JSON. Delete commands require `--confirm <prefix>` safety guard.

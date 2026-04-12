@@ -30,28 +30,19 @@ MAX_PROMPT_CHARS = 50_000
 _DATA = files("feishu_bridge.data")
 _resource_stack = contextlib.ExitStack()
 _BRIDGE_SETTINGS_PATH: Optional[str] = None
-_CLI_PROMPT_PATH: Optional[str] = None
 
 
 def materialize_data_files():
     """Call once at startup. Extracts data files and holds them for process lifetime."""
-    global _BRIDGE_SETTINGS_PATH, _CLI_PROMPT_PATH
+    global _BRIDGE_SETTINGS_PATH
     _BRIDGE_SETTINGS_PATH = str(
         _resource_stack.enter_context(as_file(_DATA.joinpath("bridge-settings.json")))
-    )
-    _CLI_PROMPT_PATH = str(
-        _resource_stack.enter_context(as_file(_DATA.joinpath("cli_prompt.md")))
     )
 
 
 def get_bridge_settings_path() -> Optional[str]:
     """Return materialized bridge-settings.json path."""
     return _BRIDGE_SETTINGS_PATH
-
-
-def get_cli_prompt_path() -> Optional[str]:
-    """Return materialized cli_prompt.md path."""
-    return _CLI_PROMPT_PATH
 
 EMPTY_RESULT_MESSAGE = "Claude 本次未返回任何内容，请稍后重试。"
 SILENT_OK_MESSAGE = "✓ 操作已完成（无文本输出）"
@@ -318,12 +309,17 @@ class BaseRunner(ABC):
         "Do not output 'Status:' lines at the end of responses — "
         "status is tracked externally by the bridge."
     )
+    _MINIMAL_SAFETY_PROMPT = (
+        "CRITICAL: You are running as a subprocess of feishu-bridge. "
+        "NEVER restart, stop, or reload feishu-bridge itself."
+    )
 
     def __init__(self, command: str, model: str, workspace: str, timeout: int,
                  max_budget_usd: Optional[float] = None,
                  extra_system_prompts: Optional[list[str]] = None,
                  extra_cli_args: Optional[list[str]] = None,
-                 fixed_env: Optional[dict[str, str]] = None):
+                 fixed_env: Optional[dict[str, str]] = None,
+                 safety_prompt_mode: str = "full"):
         self.command = command
         self.model = model
         self.workspace = workspace
@@ -334,6 +330,8 @@ class BaseRunner(ABC):
         self._fixed_env = {
             str(key): str(value) for key, value in (fixed_env or {}).items()
         }
+        mode = str(safety_prompt_mode or "full").strip().lower()
+        self._safety_prompt_mode = mode if mode in {"full", "minimal", "off"} else "full"
         self._active: dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
@@ -394,7 +392,11 @@ class BaseRunner(ABC):
 
     def _build_system_prompt(self) -> str:
         """Merge safety guard + extra system prompts into one string."""
-        parts = [self._SAFETY_PROMPT]
+        parts = []
+        if self._safety_prompt_mode == "full":
+            parts.append(self._SAFETY_PROMPT)
+        elif self._safety_prompt_mode == "minimal":
+            parts.append(self._MINIMAL_SAFETY_PROMPT)
         parts.extend(self._extra_system_prompts)
         return "\n\n".join(parts)
 
@@ -782,9 +784,10 @@ class ClaudeRunner(BaseRunner):
             "--dangerously-skip-permissions",
             "--settings", get_bridge_settings_path(),
             "--model", self.model,
-            "--append-system-prompt",
-            self._build_system_prompt(),
         ])
+        system_prompt = self._build_system_prompt()
+        if system_prompt:
+            args.extend(["--append-system-prompt", system_prompt])
 
         if self.max_budget_usd is not None:
             args.extend(["--max-budget-usd", str(self.max_budget_usd)])
@@ -985,7 +988,8 @@ class CodexRunner(BaseRunner):
                  max_budget_usd: Optional[float] = None,
                  extra_system_prompts: Optional[list[str]] = None,
                  extra_cli_args: Optional[list[str]] = None,
-                 fixed_env: Optional[dict[str, str]] = None):
+                 fixed_env: Optional[dict[str, str]] = None,
+                 safety_prompt_mode: str = "full"):
         if max_budget_usd is not None:
             log.warning("Codex does not support budget tracking, max_budget_usd ignored")
         super().__init__(
@@ -994,6 +998,7 @@ class CodexRunner(BaseRunner):
             extra_system_prompts=extra_system_prompts,
             extra_cli_args=extra_cli_args,
             fixed_env=fixed_env,
+            safety_prompt_mode=safety_prompt_mode,
         )
         # Thread-local storage for per-invocation temp file path.
         # run() writes the path; build_args() reads it (same thread).

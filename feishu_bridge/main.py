@@ -53,7 +53,6 @@ from feishu_bridge.runtime import (
     QUEUE_MAX,
     SessionMap,
     SessionQueueFull,
-    get_cli_prompt_path,
     materialize_data_files,
     _resource_stack,
 )
@@ -136,6 +135,21 @@ _RUNNER_CLASSES: dict[str, type[BaseRunner]] = {
 }
 
 
+def _normalize_prompt_config(prompt_cfg: object, *, fill_defaults: bool) -> dict[str, object]:
+    """Normalize bridge-controlled prompt injection settings."""
+    raw = prompt_cfg if isinstance(prompt_cfg, dict) else {}
+    normalized: dict[str, object] = {}
+
+    if fill_defaults or "safety" in raw:
+        safety = str(raw.get("safety", "full")).strip().lower()
+        normalized["safety"] = safety if safety in {"full", "minimal", "off"} else "full"
+    if fill_defaults or "feishu_cli" in raw:
+        normalized["feishu_cli"] = bool(raw.get("feishu_cli", True))
+    if fill_defaults or "cron_mgr" in raw:
+        normalized["cron_mgr"] = bool(raw.get("cron_mgr", True))
+    return normalized
+
+
 def _normalize_provider_models(provider_cfg: dict) -> dict[str, str]:
     """Return optional per-agent default models for a provider profile."""
     raw = provider_cfg.get("models")
@@ -203,6 +217,7 @@ def _normalize_provider_profiles(agent_cfg: dict) -> dict[str, dict]:
             "args_by_type": _normalize_agent_args(cfg),
             "env_by_type": _normalize_agent_env(cfg),
             "models": _normalize_provider_models(cfg),
+            "prompt": _normalize_prompt_config(cfg.get("prompt"), fill_defaults=False),
         }
     return normalized
 
@@ -268,6 +283,48 @@ def resolve_agent_env(agent_cfg: dict, agent_type: str) -> dict[str, str]:
 def resolve_agent_model(agent_cfg: dict, agent_type: str) -> str | None:
     """Resolve provider-specific default model for an agent type."""
     return _provider_profile(agent_cfg).get("models", {}).get(agent_type)
+
+
+def resolve_prompt_config(agent_cfg: dict) -> dict[str, object]:
+    """Resolve bridge-controlled prompt injection settings."""
+    prompt_cfg = dict(_normalize_prompt_config(agent_cfg.get("prompt"), fill_defaults=True))
+    prompt_cfg.update(_provider_profile(agent_cfg).get("prompt", {}))
+    return _normalize_prompt_config(prompt_cfg, fill_defaults=True)
+
+
+def build_extra_prompts(agent_cfg: dict) -> list[str]:
+    """Build bridge-managed system prompt fragments for the active provider."""
+    prompt_cfg = resolve_prompt_config(agent_cfg)
+    extra_prompts: list[str] = []
+
+    if prompt_cfg.get("feishu_cli", True):
+        cli_abs = shutil.which("feishu-cli")
+        if cli_abs:
+            try:
+                cli_result = subprocess.run(
+                    [cli_abs, "prompt", "--summary"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if cli_result.returncode == 0 and cli_result.stdout.strip():
+                    extra_prompts.append(cli_result.stdout)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+    if prompt_cfg.get("cron_mgr", True):
+        cron_mgr_abs = shutil.which("cron-mgr")
+        if cron_mgr_abs:
+            try:
+                cron_result = subprocess.run(
+                    [cron_mgr_abs, "prompt"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if cron_result.returncode == 0 and cron_result.stdout.strip():
+                    cron_text = cron_result.stdout.replace("cron-mgr", cron_mgr_abs)
+                    extra_prompts.append(cron_text)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+    return extra_prompts
 
 
 def session_identity(agent_cfg: dict) -> str:
@@ -363,6 +420,7 @@ def load_config(config_path: str, bot_name: str) -> dict:
     agent_cfg["commands"] = _normalize_agent_commands(agent_cfg)
     agent_cfg["args_by_type"] = _normalize_agent_args(agent_cfg)
     agent_cfg["env_by_type"] = _normalize_agent_env(agent_cfg)
+    agent_cfg["prompt"] = _normalize_prompt_config(agent_cfg.get("prompt"), fill_defaults=True)
     agent_cfg["providers"] = _normalize_provider_profiles(agent_cfg)
     resolved_cmd, agent_cmd = resolve_effective_agent_command(agent_cfg, agent_type)
     if not resolved_cmd:
@@ -449,6 +507,7 @@ def create_runner(agent_cfg: dict, bot_cfg: dict,
         extra_system_prompts=extra_prompts,
         extra_cli_args=resolve_agent_args(agent_cfg, agent_type),
         fixed_env=resolve_agent_env(agent_cfg, agent_type),
+        safety_prompt_mode=str(resolve_prompt_config(agent_cfg).get("safety", "full")),
     )
 
 
@@ -529,32 +588,7 @@ class FeishuBot:
             self._session_map_path,
             agent_type=session_identity(self.agent_config),
         )
-        # Load CLI prompts for Feishu operations (materialized via importlib.resources)
-        _extra_prompts = []
-        _cli_abs = shutil.which("feishu-cli")
-
-        _cli_prompt = get_cli_prompt_path()
-        if _cli_prompt:
-            _cli_text = Path(_cli_prompt).read_text()
-            if _cli_abs:
-                _cli_text = _cli_text.replace("feishu-cli", _cli_abs)
-            _extra_prompts.append(_cli_text)
-
-        # Load cron-mgr prompt (self-describing: `cron-mgr prompt`)
-        _cron_mgr_abs = shutil.which("cron-mgr")
-        if _cron_mgr_abs:
-            try:
-                _cron_result = subprocess.run(
-                    [_cron_mgr_abs, "prompt"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if _cron_result.returncode == 0 and _cron_result.stdout.strip():
-                    _cron_text = _cron_result.stdout.replace("cron-mgr", _cron_mgr_abs)
-                    _extra_prompts.append(_cron_text)
-            except (subprocess.TimeoutExpired, OSError):
-                pass  # cron-mgr not functional, skip silently
-
-        self._extra_prompts = _extra_prompts
+        self._extra_prompts = build_extra_prompts(self.agent_config)
         self.runner = create_runner(
             self.agent_config, self.bot_config,
             self._extra_prompts,
@@ -654,9 +688,11 @@ class FeishuBot:
             resolve_agent_model(next_cfg, target_type) or self.runner.DEFAULT_MODEL,
         )
         next_bot_cfg = {**self.bot_config, "model": next_model}
-        next_runner = create_runner(next_cfg, next_bot_cfg, self._extra_prompts)
+        next_prompts = build_extra_prompts(next_cfg)
+        next_runner = create_runner(next_cfg, next_bot_cfg, next_prompts)
 
         self.agent_config = next_cfg
+        self._extra_prompts = next_prompts
         self.runner = next_runner
         self.session_map = SessionMap(self._session_map_path, agent_type=session_identity(next_cfg))
         self._session_cost.clear()
@@ -706,9 +742,11 @@ class FeishuBot:
             resolve_agent_model(next_cfg, target_type) or _RUNNER_CLASSES[target_type].DEFAULT_MODEL,
         )
         next_bot_cfg = {**self.bot_config, "model": next_model}
-        next_runner = create_runner(next_cfg, next_bot_cfg, self._extra_prompts)
+        next_prompts = build_extra_prompts(next_cfg)
+        next_runner = create_runner(next_cfg, next_bot_cfg, next_prompts)
 
         self.agent_config = next_cfg
+        self._extra_prompts = next_prompts
         self.runner = next_runner
         self.session_map = SessionMap(self._session_map_path, agent_type=session_identity(next_cfg))
         self._session_cost.clear()

@@ -683,6 +683,11 @@ def main():
     p.add_argument("--content",
                    help="Raw JSON content string (for non-text msg types)")
 
+    p = sub.add_parser("prompt",
+                       help="Output LLM system prompt for feishu-cli usage")
+    p.add_argument("--summary", action="store_true",
+                   help="Output short summary instead of full reference")
+
     p = sub.add_parser("send-audio",
                        help="Upload audio file and send as audio message")
     p.add_argument("--chat-id", required=True,
@@ -693,6 +698,19 @@ def main():
                    help="Audio duration in milliseconds (auto-detected if omitted)")
 
     args = parser.parse_args()
+
+    # --- No-auth commands ---
+    if args.command == "prompt":
+        filename = "cli_prompt_summary.md" if args.summary else "cli_prompt.md"
+        prompt_path = SCRIPT_DIR / "data" / filename
+        if not prompt_path.exists():
+            print(f"Error: {filename} not found", file=sys.stderr)
+            sys.exit(1)
+        text = prompt_path.read_text()
+        cli_abs = os.path.abspath(sys.argv[0])
+        text = text.replace("feishu-cli", cli_abs)
+        print(text, end="")
+        return
 
     # --- Bot-only commands (no user auth / FEISHU_AUTH_FILE needed) ---
     if args.command == "send-message":

@@ -192,6 +192,11 @@ $ feishu-bridge --bot my-bot
         "OPENAI_BASE_URL": "http://127.0.0.1:11434/v1"
       }
     },
+    "prompt": {                         // 可选：控制 bridge 固定注入的 prompt
+      "safety": "full",                 // full | minimal | off
+      "feishu_cli": true,
+      "cron_mgr": true
+    },
     "timeout_seconds": 300
   }
 }
@@ -225,6 +230,11 @@ $ feishu-bridge --bot my-bot
       "models": {
         "claude": "qwen3.5",
         "codex": "gpt-oss:120b"
+      },
+      "prompt": {
+        "safety": "minimal",
+        "feishu_cli": false,
+        "cron_mgr": false
       }
     }
   }
@@ -237,6 +247,8 @@ $ feishu-bridge --bot my-bot
 /provider ollama
 /provider default
 ```
+
+`agent.prompt` 用于控制 bridge 自己追加的 system prompt 片段；provider 下的 `prompt` 会覆盖全局设置。对本地 Ollama，通常建议关闭 `feishu_cli` / `cron_mgr`，并把 `safety` 降到 `minimal`，这样可以显著减少每次启动时固定注入的 token。
 
 切换 provider 会像 `/agent` 一样清空旧会话映射，避免复用不兼容的 session。
 
