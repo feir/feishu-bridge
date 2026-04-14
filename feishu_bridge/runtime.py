@@ -819,10 +819,21 @@ class ClaudeRunner(BaseRunner):
             msg_usage = msg.get("usage")
             if msg_usage:
                 state.last_call_usage = msg_usage
-                # Track peak context tokens (pre-compact high-water mark).
                 ctx_tokens = (msg_usage.get("input_tokens", 0)
                               + msg_usage.get("cache_read_input_tokens", 0)
                               + msg_usage.get("cache_creation_input_tokens", 0))
+                # Detect compact via token drop: if ctx_tokens drops >30%
+                # from peak, auto-compact happened.  The API-level
+                # context_management.applied_edits signal (checked in
+                # stream_event) is unreliable for Claude Code CLI compacts
+                # which produce <synthetic> records with context_management=None.
+                if (not state.compact_detected
+                        and state.peak_context_tokens > 0
+                        and ctx_tokens < state.peak_context_tokens * 0.7):
+                    state.compact_detected = True
+                    log.info(
+                        "Auto-compact detected via token drop: %d → %d",
+                        state.peak_context_tokens, ctx_tokens)
                 if ctx_tokens > state.peak_context_tokens:
                     state.peak_context_tokens = ctx_tokens
             # Extract tool-use names for progress feedback.

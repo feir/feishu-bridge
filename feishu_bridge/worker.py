@@ -289,7 +289,7 @@ def _context_health_alert(result: dict, quota_snapshot=None) -> str | None:
     # Build quota alert from both stream event and API snapshot
     rate_alert = _build_quota_alert(result, quota_snapshot)
 
-    if pct >= 85:
+    if pct >= 80:
         alert = f"🔴 Context {pct:.0f}% — 建议 `/new` 新会话或 `/compact` 压缩"
         return "\n".join(filter(None, [alert, rate_alert]))
     if pct >= 70:

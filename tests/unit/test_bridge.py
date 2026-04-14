@@ -691,8 +691,8 @@ def test_context_health_alert_yellow_at_70_pct():
     assert "/compact" in alert
 
 
-def test_context_health_alert_red_at_85_pct():
-    """Red alert when context usage reaches 85%."""
+def test_context_health_alert_red_at_80_pct():
+    """Red alert when context usage reaches 80%."""
     result = {
         "usage": {"input_tokens": 10_000, "cache_read_input_tokens": 170_000, "cache_creation_input_tokens": 0},
         "modelUsage": {"claude-opus-4-6": {"contextWindow": 200_000}},
@@ -705,7 +705,7 @@ def test_context_health_alert_red_at_85_pct():
 
 def test_context_health_alert_uses_model_context_window():
     """Alert uses contextWindow from modelUsage, not hardcoded default."""
-    # 50k tokens out of 60k window = 83% -> yellow
+    # 50k tokens out of 60k window = 83% -> red (>=80%)
     result = {
         "usage": {"input_tokens": 10_000, "cache_read_input_tokens": 40_000, "cache_creation_input_tokens": 0},
         "modelUsage": {"custom-model": {"contextWindow": 60_000}},
@@ -952,6 +952,65 @@ def test_context_health_alert_compact_detected_no_peak():
     alert = bridge_worker._context_health_alert(result)
     assert alert is not None
     assert "75%" in alert  # falls back to current usage (150k/200k)
+
+
+def test_compact_detected_via_token_drop():
+    """Auto-compact detected when ctx_tokens drops >30% from peak."""
+    runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-opus-4-6", timeout=60, workspace="/tmp",
+    )
+    state = bridge_runtime.StreamState()
+    # Simulate pre-compact: 110K tokens
+    runner.parse_streaming_line({
+        "type": "assistant",
+        "message": {"usage": {
+            "input_tokens": 10_000,
+            "cache_read_input_tokens": 90_000,
+            "cache_creation_input_tokens": 10_000,
+        }, "content": []},
+    }, state)
+    assert state.peak_context_tokens == 110_000
+    assert not state.compact_detected
+
+    # Simulate post-compact: drops to 45K (>30% drop)
+    runner.parse_streaming_line({
+        "type": "assistant",
+        "message": {"usage": {
+            "input_tokens": 5_000,
+            "cache_read_input_tokens": 10_000,
+            "cache_creation_input_tokens": 30_000,
+        }, "content": []},
+    }, state)
+    assert state.compact_detected
+    assert state.peak_context_tokens == 110_000  # peak preserved
+
+
+def test_compact_not_detected_on_small_drop():
+    """Normal token fluctuation (<30% drop) does not trigger compact detection."""
+    runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-opus-4-6", timeout=60, workspace="/tmp",
+    )
+    state = bridge_runtime.StreamState()
+    runner.parse_streaming_line({
+        "type": "assistant",
+        "message": {"usage": {
+            "input_tokens": 1_000,
+            "cache_read_input_tokens": 80_000,
+            "cache_creation_input_tokens": 19_000,
+        }, "content": []},
+    }, state)
+    assert state.peak_context_tokens == 100_000
+
+    # Small drop to 80K (20% — below threshold)
+    runner.parse_streaming_line({
+        "type": "assistant",
+        "message": {"usage": {
+            "input_tokens": 1_000,
+            "cache_read_input_tokens": 70_000,
+            "cache_creation_input_tokens": 9_000,
+        }, "content": []},
+    }, state)
+    assert not state.compact_detected
 
 
 def test_context_health_alert_no_compact_still_alerts():

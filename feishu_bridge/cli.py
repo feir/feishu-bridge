@@ -173,6 +173,19 @@ def _output(result):
     print(json.dumps(result, ensure_ascii=False, default=str))
 
 
+def _build_lark_client(config=None):
+    """Build a lark_oapi Client from config (loads config if not provided)."""
+    import lark_oapi as lark
+    if config is None:
+        config = _load_config()
+    return config, lark.Client.builder() \
+        .app_id(config["app_id"]) \
+        .app_secret(config["app_secret"]) \
+        .domain(lark.FEISHU_DOMAIN) \
+        .log_level(lark.LogLevel.WARNING) \
+        .build()
+
+
 def _confirm_guard(args, token_value: str, resource_name: str):
     """Verify --confirm matches token prefix for delete safety."""
     confirm = getattr(args, "confirm", None)
@@ -697,6 +710,13 @@ def main():
     p.add_argument("--duration", type=int,
                    help="Audio duration in milliseconds (auto-detected if omitted)")
 
+    p = sub.add_parser("send-image",
+                       help="Upload image file and send as image message")
+    p.add_argument("--chat-id", required=True,
+                   help="Feishu chat_id (e.g. oc_xxx)")
+    p.add_argument("--file", required=True,
+                   help="Path to image file (png, jpg, etc.)")
+
     args = parser.parse_args()
 
     # --- No-auth commands ---
@@ -722,18 +742,11 @@ def main():
             sys.exit(1)
 
         try:
-            import lark_oapi as lark
             from lark_oapi.api.im.v1 import (
                 CreateMessageRequest, CreateMessageRequestBody,
             )
 
-            config = _load_config()
-            client = lark.Client.builder() \
-                .app_id(config["app_id"]) \
-                .app_secret(config["app_secret"]) \
-                .domain(lark.FEISHU_DOMAIN) \
-                .log_level(lark.LogLevel.WARNING) \
-                .build()
+            config, client = _build_lark_client()
 
             if args.text:
                 content = json.dumps({"text": args.text})
@@ -768,7 +781,6 @@ def main():
 
     if args.command == "send-audio":
         try:
-            import lark_oapi as lark
             from lark_oapi.api.im.v1 import (
                 CreateFileRequest, CreateFileRequestBody,
                 CreateMessageRequest, CreateMessageRequestBody,
@@ -779,13 +791,7 @@ def main():
                 _output({"error": f"File not found: {args.file}"})
                 sys.exit(1)
 
-            config = _load_config()
-            client = lark.Client.builder() \
-                .app_id(config["app_id"]) \
-                .app_secret(config["app_secret"]) \
-                .domain(lark.FEISHU_DOMAIN) \
-                .log_level(lark.LogLevel.WARNING) \
-                .build()
+            config, client = _build_lark_client()
 
             suffix = file_path.suffix.lower()
             file_type = "opus" if suffix in (".opus", ".ogg") else "stream"
@@ -839,6 +845,63 @@ def main():
             sys.exit(1)
         return
 
+    if args.command == "send-image":
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateImageRequest, CreateImageRequestBody,
+                CreateMessageRequest, CreateMessageRequestBody,
+            )
+
+            file_path = Path(args.file)
+            if not file_path.exists():
+                _output({"error": f"File not found: {args.file}"})
+                sys.exit(1)
+
+            config, client = _build_lark_client()
+
+            with open(file_path, "rb") as f:
+                body = CreateImageRequestBody.builder() \
+                    .image_type("message") \
+                    .image(f) \
+                    .build()
+                upload_req = CreateImageRequest.builder() \
+                    .request_body(body) \
+                    .build()
+                upload_resp = client.im.v1.image.create(upload_req)
+
+            if not upload_resp.success():
+                _output({"error": f"Image upload failed: {upload_resp.msg}",
+                         "code": upload_resp.code})
+                sys.exit(1)
+
+            image_key = upload_resp.data.image_key
+            content = json.dumps({"image_key": image_key})
+
+            msg_body = CreateMessageRequestBody.builder() \
+                .receive_id(args.chat_id) \
+                .msg_type("image") \
+                .content(content) \
+                .build()
+            msg_req = CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(msg_body) \
+                .build()
+            msg_resp = client.im.v1.message.create(msg_req)
+
+            if msg_resp.success():
+                mid = msg_resp.data.message_id if msg_resp.data else None
+                _output({"message_id": mid, "image_key": image_key})
+            else:
+                _output({"error": f"Send failed: {msg_resp.msg}",
+                         "code": msg_resp.code})
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _output({"error": str(e)})
+            sys.exit(1)
+        return
+
     # Load auth and config
     auth = _load_auth()
     config = _load_config()
@@ -850,13 +913,7 @@ def main():
     # when the pre-authed token lacks required scopes.
     _lark_client = None
     try:
-        import lark_oapi as lark
-        _lark_client = lark.Client.builder() \
-            .app_id(config["app_id"]) \
-            .app_secret(config["app_secret"]) \
-            .domain(lark.FEISHU_DOMAIN) \
-            .log_level(lark.LogLevel.WARNING) \
-            .build()
+        _, _lark_client = _build_lark_client(config)
     except Exception:
         pass  # Graceful degradation — auth will fail with clear error
 

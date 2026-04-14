@@ -155,6 +155,7 @@ Call it with `feishu-cli <command> [args]`.
 ### Messaging (Bot)
 - `send-message --chat-id <id> --text <text>` — Send a bot text message to a chat (no user auth needed)
 - `send-message --chat-id <id> --msg-type interactive --content '<json>'` — Send a card/post message (raw JSON content)
+- `send-image --chat-id <id> --file <path>` — Upload and send an image (png, jpg, etc.)
 
 ## Important Notes
 - All output is JSON
