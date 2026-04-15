@@ -1550,6 +1550,72 @@ def _notify_restart_complete(bot):
 # Main
 # ============================================================
 
+def _start_ollama_proxies(config: dict) -> None:
+    """Start ollama think-proxy for any provider profiles that use it.
+
+    A provider profile opts in by default when ANTHROPIC_BASE_URL points to a
+    local Ollama instance (localhost / 127.0.0.1 / ::1).  Opt out by setting
+    think_proxy: false.  Customize with think_proxy_port (default 11435) and
+    ollama_url (default http://127.0.0.1:11434).
+    """
+    from urllib.parse import urlparse
+    from feishu_bridge.ollama_proxy import start_proxy
+
+    _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+    agent_cfg = config.get("agent", {})
+    # Use raw provider profiles so proxy config keys (think_proxy, think_proxy_port,
+    # ollama_url) are not stripped by _normalize_provider_profiles.
+    raw_profiles: dict = agent_cfg.get("providers") or {}
+
+    started: dict[int, str] = {}  # port → ollama_url, for collision detection
+
+    for profile_name, profile in raw_profiles.items():
+        if not isinstance(profile, dict):
+            continue
+
+        env_claude = (profile.get("env_by_type") or {}).get("claude") or {}
+        base_url = env_claude.get("ANTHROPIC_BASE_URL", "")
+        if not base_url:
+            continue
+
+        # Only proxy profiles that point Claude CLI at a local Ollama instance
+        try:
+            parsed = urlparse(base_url)
+            if parsed.hostname not in _LOCAL_HOSTS:
+                continue
+        except Exception:
+            continue
+
+        # Allow opt-out via think_proxy: false
+        if profile.get("think_proxy") is False:
+            continue
+
+        proxy_port = int(profile.get("think_proxy_port") or 11435)
+        ollama_url = profile.get("ollama_url") or "http://127.0.0.1:11434"
+
+        # Reuse existing proxy if same port+upstream; error on port conflict
+        if proxy_port in started:
+            if started[proxy_port] == ollama_url:
+                log.debug("ollama think-proxy port %d already started, reusing for '%s'",
+                          proxy_port, profile_name)
+            else:
+                log.error(
+                    "ollama think-proxy port %d already claimed by ollama_url=%s; "
+                    "provider '%s' wants %s — set think_proxy_port to a different value",
+                    proxy_port, started[proxy_port], profile_name, ollama_url,
+                )
+            continue
+
+        try:
+            start_proxy(port=proxy_port, ollama_url=ollama_url)
+            started[proxy_port] = ollama_url
+            log.info("ollama think-proxy started for provider '%s' on port %d → %s",
+                     profile_name, proxy_port, ollama_url)
+        except OSError as e:
+            log.warning("Could not start ollama think-proxy for '%s': %s "
+                        "(port %d may already be in use)", profile_name, e, proxy_port)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Feishu <-> Claude Code CLI bridge"
@@ -1624,6 +1690,9 @@ def main():
     from feishu_bridge.updater import init_updater
     _mode, _plat, _src_path = _get_install_info()
     init_updater(_mode, _src_path)
+
+    # Start ollama think-proxy if any provider profile needs it
+    _start_ollama_proxies(config)
 
     # Start (blocking)
     from feishu_bridge import __version__
