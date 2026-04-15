@@ -180,6 +180,9 @@ def _build_anthropic_response(ollama_resp: dict, model: str) -> dict:
         })
         stop_reason = "tool_use"
 
+    in_tok = ollama_resp.get("prompt_eval_count", 0)
+    out_tok = ollama_resp.get("eval_count", 0)
+    log.info("ollama tokens: model=%s prefill=%d gen=%d", model, in_tok, out_tok)
     return {
         "id": _make_message_id(),
         "type": "message",
@@ -189,8 +192,8 @@ def _build_anthropic_response(ollama_resp: dict, model: str) -> dict:
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": ollama_resp.get("prompt_eval_count", 0),
-            "output_tokens": ollama_resp.get("eval_count", 0),
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
         },
     }
 
@@ -251,6 +254,7 @@ def _stream_anthropic_events(ollama_resp_iter: Iterator[bytes], model: str):
         if chunk.get("done"):
             break
 
+    log.info("ollama tokens (stream): model=%s prefill=%d gen=%d", model, input_tokens, output_tokens)
     yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
 
     # Emit tool_use blocks if any

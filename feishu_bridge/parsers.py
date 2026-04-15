@@ -37,6 +37,8 @@ def parse_post_content(content: dict) -> str:
                 line_parts.append("[图片]")
             elif tag == "media":
                 line_parts.append(f"[文件: {seg.get('file_name', '附件')}]")
+            elif tag:
+                log.debug("parse_post_content: unhandled tag=%s seg=%s", tag, seg)
         line = "".join(line_parts).strip()
         if line:
             parts.append(line)
