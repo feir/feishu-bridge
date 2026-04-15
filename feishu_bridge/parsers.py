@@ -12,6 +12,26 @@ from lark_oapi.api.im.v1 import GetMessageResourceRequest
 log = logging.getLogger("feishu-bridge")
 
 
+def _extract_cell_text(cell) -> str:
+    """Extract plain text from a table cell (list of segments or plain string)."""
+    if isinstance(cell, str):
+        return cell
+    if isinstance(cell, list):
+        parts = []
+        for seg in cell:
+            if not isinstance(seg, dict):
+                continue
+            tag = seg.get("tag", "")
+            if tag in ("text", "a", "md", "code_block"):
+                parts.append(seg.get("text", seg.get("href", "")))
+            elif tag == "at":
+                parts.append(f"@{seg.get('user_name', seg.get('user_id', ''))}")
+        return "".join(parts)
+    if isinstance(cell, dict):
+        return cell.get("text", "") or cell.get("content", "")
+    return ""
+
+
 def parse_post_content(content: dict) -> str:
     """Parse Feishu post (rich-text) message content into plain text."""
     if "content" not in content and "title" not in content:
@@ -37,6 +57,28 @@ def parse_post_content(content: dict) -> str:
                 line_parts.append("[图片]")
             elif tag == "media":
                 line_parts.append(f"[文件: {seg.get('file_name', '附件')}]")
+            elif tag == "at":
+                line_parts.append(f"@{seg.get('user_name', seg.get('user_id', ''))}")
+            elif tag == "emotion":
+                line_parts.append(f"[{seg.get('emoji_type', '表情')}]")
+            elif tag in ("code_block", "md"):
+                line_parts.append(seg.get("text", ""))
+            elif tag == "hr":
+                line_parts.append("---")
+            elif tag == "table":
+                # Feishu GET API may return table as a non-standard tag.
+                # Best-effort: render rows as Markdown-style text lines.
+                rows = seg.get("rows") or seg.get("cells") or []
+                row_lines = []
+                for row in rows:
+                    if isinstance(row, list):
+                        cells = [_extract_cell_text(c) for c in row]
+                        row_lines.append(" | ".join(cells))
+                    elif isinstance(row, dict):
+                        cells = row.get("cells") or []
+                        row_lines.append(" | ".join(_extract_cell_text(c) for c in cells))
+                if row_lines:
+                    line_parts.append("\n".join(row_lines))
             elif tag:
                 log.debug("parse_post_content: unhandled tag=%s seg=%s", tag, seg)
         line = "".join(line_parts).strip()
