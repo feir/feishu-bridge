@@ -167,21 +167,22 @@ class BridgeCommandHandler:
             aliases = self.bot.runner.get_model_aliases()
             if not arg:
                 alias_list = " / ".join(f"`{a}`" for a in aliases)
+                model_display = self.bot.runner.model or "(CLI 默认)"
                 handle.deliver(
-                    f"当前模型: `{self.bot.runner.model}`\n可选: {alias_list}"
+                    f"当前模型: `{model_display}`\n可选: {alias_list}"
                 )
             elif arg in aliases:
                 self.bot.runner.model = aliases[arg]
-                self._remember_current_model()
+
                 handle.deliver(f"模型已切换为 `{aliases[arg]}`")
             elif arg in aliases.values():
                 self.bot.runner.model = arg
-                self._remember_current_model()
+
                 handle.deliver(f"模型已切换为 `{arg}`")
             else:
                 # Passthrough unknown model name (allows new models)
                 self.bot.runner.model = arg
-                self._remember_current_model()
+
                 handle.deliver(f"模型已设置为 `{arg}`（未识别的名称，将直接传递给 CLI）")
 
         elif cmd == "agent":
@@ -248,10 +249,7 @@ class BridgeCommandHandler:
                 self.bot.session_map.put(key, new_sid)
             log.info("Idle compact done: sid=%s", sid[:8])
 
-    def _remember_current_model(self):
-        remember = getattr(self.bot, "remember_current_model", None)
-        if callable(remember):
-            remember()
+
 
     def _handle_agent(self, arg: str, handle):
         """Handle /agent — switch backend runner for this bot process."""

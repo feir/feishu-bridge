@@ -2437,7 +2437,7 @@ def test_create_runner_codex():
     bot_cfg = {"workspace": "/tmp"}
     runner = bridge.create_runner(agent_cfg, bot_cfg, [])
     assert isinstance(runner, bridge_runtime.CodexRunner)
-    assert runner.model == "gpt-5.2-codex"  # DEFAULT_MODEL fallback
+    assert runner.model is None  # no explicit model → let CLI decide
     args = runner.build_args("hi", None, False, True)
     assert args[:6] == [
         cmd, "exec", "--oss", "--local-provider", "ollama",
@@ -2480,10 +2480,6 @@ def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path)
         command="claude", model="claude-opus-4-6", workspace="/tmp", timeout=30
     )
     bot._extra_prompts = []
-    bot._agent_models = {
-        "claude@default": "claude-opus-4-6",
-        "codex@default": "gpt-5.1-codex-mini",
-    }
     bot._session_cost = {"sid-old": {"usage": {}}}
     bot._session_map_path = tmp_path / "sessions.json"
     bot._session_map_path.write_text(json.dumps({
@@ -2505,7 +2501,7 @@ def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path)
     assert "codex" in message
     assert resolved == bridge.shutil.which("python3")
     assert isinstance(bot.runner, bridge_runtime.CodexRunner)
-    assert bot.runner.model == "gpt-5.1-codex-mini"
+    assert bot.runner.model == "claude-opus-4-6"  # from bot_config fallback
     assert bot.agent_config["type"] == "codex"
     assert bot.runner.build_args("hi", None, False, True)[2:5] == [
         "--oss", "--local-provider", "ollama"
@@ -2515,41 +2511,6 @@ def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path)
     assert bot.session_map.get(("chat-key",)) is None
     data = json.loads(bot._session_map_path.read_text())
     assert data["_agent_type"] == "codex"
-
-
-def test_switch_agent_remembers_current_model_before_switch(monkeypatch, tmp_path):
-    """Switching agents remembers the last model used by the current backend."""
-    bot = object.__new__(bridge.FeishuBot)
-    bot.bot_id = "test-bot"
-    bot.bot_config = {"workspace": "/tmp", "model": "claude-opus-4-6"}
-    bot.agent_config = {
-        "type": "claude",
-        "command": "claude",
-        "provider": "default",
-        "providers": {"default": {}},
-        "commands": {"claude": "claude"},
-        "_resolved_command": bridge.shutil.which("python3"),
-        "timeout_seconds": 30,
-    }
-    bot.runner = bridge_runtime.ClaudeRunner(
-        command="claude", model="claude-sonnet-4-6", workspace="/tmp", timeout=30
-    )
-    bot._extra_prompts = []
-    bot._agent_models = {"claude@default": "claude-opus-4-6", "codex@default": "gpt-5.2-codex"}
-    bot._session_cost = {}
-    bot._session_map_path = tmp_path / "sessions.json"
-    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
-
-    monkeypatch.setattr(
-        bridge,
-        "resolve_agent_command",
-        lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
-    )
-    monkeypatch.setattr(bridge, "build_extra_prompts", lambda agent_cfg: [])
-
-    bot.switch_agent("codex")
-
-    assert bot._agent_models["claude@default"] == "claude-sonnet-4-6"
 
 
 def test_switch_provider_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path):
@@ -2580,7 +2541,6 @@ def test_switch_provider_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_pa
         command="claude", model="claude-opus-4-6", workspace="/tmp", timeout=30
     )
     bot._extra_prompts = []
-    bot._agent_models = {"claude@default": "claude-opus-4-6"}
     bot._session_cost = {"sid-old": {"usage": {}}}
     bot._session_map_path = tmp_path / "sessions.json"
     bot._session_map_path.write_text(json.dumps({
@@ -2618,41 +2578,6 @@ def test_switch_provider_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_pa
     assert bot.session_map.get(("chat-key",)) is None
     data = json.loads(bot._session_map_path.read_text())
     assert data["_agent_type"] == "claude:ollama"
-
-
-def test_switch_provider_remembers_current_model_before_switch(monkeypatch, tmp_path):
-    """Switching provider remembers the last model used for the current provider."""
-    bot = object.__new__(bridge.FeishuBot)
-    bot.bot_id = "test-bot"
-    bot.bot_config = {"workspace": "/tmp", "model": "claude-opus-4-6"}
-    bot.agent_config = {
-        "type": "claude",
-        "provider": "default",
-        "command": "claude",
-        "commands": {"claude": "claude"},
-        "providers": {"default": {}, "ollama": {}},
-        "_resolved_command": bridge.shutil.which("python3"),
-        "timeout_seconds": 30,
-    }
-    bot.runner = bridge_runtime.ClaudeRunner(
-        command="claude", model="claude-sonnet-4-6", workspace="/tmp", timeout=30
-    )
-    bot._extra_prompts = []
-    bot._agent_models = {}
-    bot._session_cost = {}
-    bot._session_map_path = tmp_path / "sessions.json"
-    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
-
-    monkeypatch.setattr(
-        bridge,
-        "resolve_effective_agent_command",
-        lambda agent_cfg, agent_type: (bridge.shutil.which("python3"), "python3"),
-    )
-    monkeypatch.setattr(bridge, "build_extra_prompts", lambda agent_cfg: [])
-
-    bot.switch_provider("ollama")
-
-    assert bot._agent_models["claude@default"] == "claude-sonnet-4-6"
 
 
 def test_session_map_agent_type_reconcile_same(tmp_path):

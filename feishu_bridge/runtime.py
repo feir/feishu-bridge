@@ -314,12 +314,13 @@ class BaseRunner(ABC):
         "NEVER restart, stop, or reload feishu-bridge itself."
     )
 
-    def __init__(self, command: str, model: str, workspace: str, timeout: int,
+    def __init__(self, command: str, model: Optional[str], workspace: str, timeout: int,
                  max_budget_usd: Optional[float] = None,
                  extra_system_prompts: Optional[list[str]] = None,
                  extra_cli_args: Optional[list[str]] = None,
                  fixed_env: Optional[dict[str, str]] = None,
-                 safety_prompt_mode: str = "full"):
+                 safety_prompt_mode: str = "full",
+                 setting_sources: Optional[str] = None):
         self.command = command
         self.model = model
         self.workspace = workspace
@@ -332,6 +333,7 @@ class BaseRunner(ABC):
         }
         mode = str(safety_prompt_mode or "full").strip().lower()
         self._safety_prompt_mode = mode if mode in {"full", "minimal", "off"} else "full"
+        self._setting_sources = setting_sources
         self._active: dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
@@ -783,8 +785,11 @@ class ClaudeRunner(BaseRunner):
         args.extend([
             "--dangerously-skip-permissions",
             "--settings", get_bridge_settings_path(),
-            "--model", self.model,
         ])
+        if self.model:
+            args.extend(["--model", self.model])
+        if self._setting_sources is not None:
+            args.extend(["--setting-sources", self._setting_sources])
         system_prompt = self._build_system_prompt()
         if system_prompt:
             args.extend(["--append-system-prompt", system_prompt])
@@ -995,12 +1000,13 @@ class CodexRunner(BaseRunner):
     DEFAULT_MODEL = "gpt-5.2-codex"
     ALWAYS_STREAMING = True  # session_id comes from first event (thread.started)
 
-    def __init__(self, command: str, model: str, workspace: str, timeout: int,
+    def __init__(self, command: str, model: Optional[str], workspace: str, timeout: int,
                  max_budget_usd: Optional[float] = None,
                  extra_system_prompts: Optional[list[str]] = None,
                  extra_cli_args: Optional[list[str]] = None,
                  fixed_env: Optional[dict[str, str]] = None,
-                 safety_prompt_mode: str = "full"):
+                 safety_prompt_mode: str = "full",
+                 setting_sources: Optional[str] = None):
         if max_budget_usd is not None:
             log.warning("Codex does not support budget tracking, max_budget_usd ignored")
         super().__init__(
@@ -1010,6 +1016,7 @@ class CodexRunner(BaseRunner):
             extra_cli_args=extra_cli_args,
             fixed_env=fixed_env,
             safety_prompt_mode=safety_prompt_mode,
+            setting_sources=setting_sources,
         )
         # Thread-local storage for per-invocation temp file path.
         # run() writes the path; build_args() reads it (same thread).
@@ -1028,8 +1035,9 @@ class CodexRunner(BaseRunner):
             "--dangerously-bypass-approvals-and-sandbox",
             "--json",
             "-C", self.workspace,
-            "-m", self.model,
         ])
+        if self.model:
+            args.extend(["-m", self.model])
 
         # Inject system prompt via -c model_instructions_file (set by run())
         instructions_path = getattr(self._tls, "instructions_path", None)

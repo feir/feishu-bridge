@@ -147,6 +147,8 @@ def _normalize_prompt_config(prompt_cfg: object, *, fill_defaults: bool) -> dict
         normalized["feishu_cli"] = bool(raw.get("feishu_cli", True))
     if fill_defaults or "cron_mgr" in raw:
         normalized["cron_mgr"] = bool(raw.get("cron_mgr", True))
+    if "setting_sources" in raw:
+        normalized["setting_sources"] = str(raw["setting_sources"])
     return normalized
 
 
@@ -334,9 +336,6 @@ def session_identity(agent_cfg: dict) -> str:
     return agent_type if provider == "default" else f"{agent_type}:{provider}"
 
 
-def _model_memory_key(agent_type: str, provider: str) -> str:
-    return f"{agent_type}@{provider}"
-
 
 
 def load_config(config_path: str, bot_name: str) -> dict:
@@ -497,17 +496,19 @@ def create_runner(agent_cfg: dict, bot_cfg: dict,
     """Factory: create the appropriate Runner based on agent.type."""
     agent_type = agent_cfg["type"]
     runner_cls = _RUNNER_CLASSES[agent_type]  # validated in load_config()
-    default_model = resolve_agent_model(agent_cfg, agent_type) or runner_cls.DEFAULT_MODEL
+    model = resolve_agent_model(agent_cfg, agent_type) or bot_cfg.get("model")
+    prompt_cfg = resolve_prompt_config(agent_cfg)
     return runner_cls(
         command=agent_cfg["_resolved_command"],
-        model=bot_cfg.get("model", default_model),
+        model=model,
         workspace=bot_cfg["workspace"],
         timeout=agent_cfg.get("timeout_seconds", DEFAULT_TIMEOUT),
         max_budget_usd=agent_cfg.get("max_budget_usd"),
         extra_system_prompts=extra_prompts,
         extra_cli_args=resolve_agent_args(agent_cfg, agent_type),
         fixed_env=resolve_agent_env(agent_cfg, agent_type),
-        safety_prompt_mode=str(resolve_prompt_config(agent_cfg).get("safety", "full")),
+        safety_prompt_mode=str(prompt_cfg.get("safety", "full")),
+        setting_sources=prompt_cfg.get("setting_sources"),
     )
 
 
@@ -593,8 +594,6 @@ class FeishuBot:
             self.agent_config, self.bot_config,
             self._extra_prompts,
         )
-        self._agent_models = {}
-        self.remember_current_model()
         self.command_handler = BridgeCommandHandler(self)
 
         # Quota poller (claude.ai API, cookie-based auth)
@@ -645,14 +644,6 @@ class FeishuBot:
             self.feishu_search = None
             log.warning("Feishu API services unavailable (missing dependencies)")
 
-    def remember_current_model(self):
-        """Persist the last selected model for the active agent type."""
-        agent_type = self.agent_config.get("type")
-        provider = resolve_provider_name(self.agent_config)
-        runner = getattr(self, "runner", None)
-        if agent_type and runner is not None:
-            self._agent_models[_model_memory_key(agent_type, provider)] = runner.model
-
     def switch_provider(self, provider_name: str) -> tuple[bool, str]:
         """Hot-swap the active provider profile for the current agent."""
         target = (provider_name or "").strip().lower()
@@ -664,8 +655,6 @@ class FeishuBot:
         current = resolve_provider_name(self.agent_config)
         if current == target:
             return True, f"当前 Provider 已是 `{target}`。"
-
-        self.remember_current_model()
 
         next_cfg = dict(self.agent_config)
         next_cfg["provider"] = target
@@ -683,11 +672,7 @@ class FeishuBot:
         next_cfg["command"] = configured_cmd
         next_cfg["_resolved_command"] = resolved_cmd
 
-        next_model = self._agent_models.get(
-            _model_memory_key(target_type, target),
-            resolve_agent_model(next_cfg, target_type) or self.runner.DEFAULT_MODEL,
-        )
-        next_bot_cfg = {**self.bot_config, "model": next_model}
+        next_bot_cfg = dict(self.bot_config)
         next_prompts = build_extra_prompts(next_cfg)
         next_runner = create_runner(next_cfg, next_bot_cfg, next_prompts)
 
@@ -716,8 +701,6 @@ class FeishuBot:
                 self.agent_config.get("_resolved_command"),
             )
 
-        self.remember_current_model()
-
         next_cfg = dict(self.agent_config)
         next_cfg["type"] = target_type
         next_cfg["commands"] = _normalize_agent_commands(next_cfg)
@@ -736,12 +719,7 @@ class FeishuBot:
         next_cfg["command"] = configured_cmd
         next_cfg["_resolved_command"] = resolved_cmd
 
-        provider = resolve_provider_name(next_cfg)
-        next_model = self._agent_models.get(
-            _model_memory_key(target_type, provider),
-            resolve_agent_model(next_cfg, target_type) or _RUNNER_CLASSES[target_type].DEFAULT_MODEL,
-        )
-        next_bot_cfg = {**self.bot_config, "model": next_model}
+        next_bot_cfg = dict(self.bot_config)
         next_prompts = build_extra_prompts(next_cfg)
         next_runner = create_runner(next_cfg, next_bot_cfg, next_prompts)
 
