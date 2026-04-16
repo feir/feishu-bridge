@@ -1,3 +1,3 @@
 """Feishu Bridge — Feishu <-> Claude Code CLI bridge."""
 
-__version__ = "2026.04.16.1"
+__version__ = "2026.04.16.2"
