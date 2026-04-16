@@ -392,6 +392,24 @@ class BaseRunner(ABC):
         """是否支持 /compact 命令。"""
         return True
 
+    def has_session(self, session_id: str) -> bool:
+        """Whether this runner holds state for the given session_id.
+
+        Default True — CLI runners persist via side-files, so we assume
+        the state exists unless the runner explicitly tracks it in memory.
+        LocalHTTPRunner overrides to check its in-memory store so the
+        worker can auto-heal after a bridge restart.
+        """
+        return True
+
+    def wants_auth_file(self) -> bool:
+        """Whether the worker should create /tmp/feishu_auth_*.json for this runner.
+
+        Default True — CLI runners need the file for feishu-cli OAuth.
+        LocalHTTPRunner overrides to False (no subprocess, no env file).
+        """
+        return True
+
     def _build_system_prompt(self) -> str:
         """Merge safety guard + extra system prompts into one string."""
         parts = []

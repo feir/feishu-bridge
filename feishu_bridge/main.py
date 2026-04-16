@@ -56,6 +56,11 @@ from feishu_bridge.runtime import (
     materialize_data_files,
     _resource_stack,
 )
+from feishu_bridge.runtime_local import LocalHTTPRunner
+
+
+class ConfigError(ValueError):
+    """Raised by config normalization helpers for invalid user input."""
 from feishu_bridge.ui import (
     ResponseHandle,
     rebuild_card_with_selection,
@@ -132,24 +137,55 @@ def _reject_not_owner(client, chat_id, thread_id, message_id):
 _RUNNER_CLASSES: dict[str, type[BaseRunner]] = {
     "claude": ClaudeRunner,
     "codex": CodexRunner,
+    "local": LocalHTTPRunner,
 }
 
 
-def _normalize_prompt_config(prompt_cfg: object, *, fill_defaults: bool) -> dict[str, object]:
-    """Normalize bridge-controlled prompt injection settings."""
+_LOCAL_PROMPT_DEFAULTS = {"safety": "minimal", "feishu_cli": False, "cron_mgr": False}
+_GLOBAL_PROMPT_DEFAULTS = {"safety": "full", "feishu_cli": True, "cron_mgr": True}
+
+
+def _normalize_prompt_config(
+    prompt_cfg: object, *, fill_defaults: bool,
+    agent_type: str | None = None,
+) -> dict[str, object]:
+    """Normalize bridge-controlled prompt injection settings.
+
+    For ``agent_type=="local"`` the base defaults flip to ``safety=minimal``,
+    ``feishu_cli=False``, ``cron_mgr=False`` so local LLM endpoints do not
+    inherit the claude/codex CLI-oriented system prompts.
+    """
     raw = prompt_cfg if isinstance(prompt_cfg, dict) else {}
+    base = _LOCAL_PROMPT_DEFAULTS if agent_type == "local" else _GLOBAL_PROMPT_DEFAULTS
     normalized: dict[str, object] = {}
 
     if fill_defaults or "safety" in raw:
-        safety = str(raw.get("safety", "full")).strip().lower()
-        normalized["safety"] = safety if safety in {"full", "minimal", "off"} else "full"
+        safety = str(raw.get("safety", base["safety"])).strip().lower()
+        normalized["safety"] = safety if safety in {"full", "minimal", "off"} else base["safety"]
     if fill_defaults or "feishu_cli" in raw:
-        normalized["feishu_cli"] = bool(raw.get("feishu_cli", True))
+        normalized["feishu_cli"] = bool(raw.get("feishu_cli", base["feishu_cli"]))
     if fill_defaults or "cron_mgr" in raw:
-        normalized["cron_mgr"] = bool(raw.get("cron_mgr", True))
+        normalized["cron_mgr"] = bool(raw.get("cron_mgr", base["cron_mgr"]))
     if "setting_sources" in raw:
         normalized["setting_sources"] = str(raw["setting_sources"])
     return normalized
+
+
+def _normalize_endpoint_config(raw: object) -> dict:
+    """Normalize an endpoint sub-object for ``local`` agent provider profiles."""
+    if not isinstance(raw, dict):
+        return {}
+    base_url = str(raw.get("base_url", "")).strip().rstrip("/")
+    protocol = str(raw.get("protocol", "anthropic")).strip().lower()
+    if protocol not in ("anthropic", "openai"):
+        raise ConfigError(
+            f"endpoint.protocol must be 'anthropic' or 'openai', got {protocol!r}"
+        )
+    return {
+        "base_url": base_url,
+        "protocol": protocol,
+        "api_key": str(raw.get("api_key", "")),
+    }
 
 
 def _normalize_provider_models(provider_cfg: dict) -> dict[str, str]:
@@ -209,18 +245,31 @@ def _normalize_provider_profiles(agent_cfg: dict) -> dict[str, dict]:
     """Return normalized provider profiles keyed by profile name."""
     raw = agent_cfg.get("providers")
     profiles = raw.copy() if isinstance(raw, dict) else {}
+    outer_type = str(agent_cfg.get("type", "")).strip().lower() or None
     normalized: dict[str, dict] = {"default": {}}
     for name, cfg in profiles.items():
         key = str(name).strip().lower()
         if not key or not isinstance(cfg, dict):
             continue
-        normalized[key] = {
+        profile = {
             "commands": _normalize_agent_commands(cfg),
             "args_by_type": _normalize_agent_args(cfg),
             "env_by_type": _normalize_agent_env(cfg),
             "models": _normalize_provider_models(cfg),
-            "prompt": _normalize_prompt_config(cfg.get("prompt"), fill_defaults=False),
+            "prompt": _normalize_prompt_config(
+                cfg.get("prompt"), fill_defaults=False, agent_type=outer_type,
+            ),
         }
+        # Endpoint + local-only extras (ignored for non-local types but kept
+        # so /provider switches can carry them through):
+        endpoint = _normalize_endpoint_config(cfg.get("endpoint"))
+        if endpoint:
+            profile["endpoint"] = endpoint
+        for k in ("max_tokens", "context_window", "openai_include_usage",
+                  "model_aliases", "workspace"):
+            if k in cfg:
+                profile[k] = cfg[k]
+        normalized[key] = profile
     return normalized
 
 
@@ -261,6 +310,14 @@ def _provider_profile(agent_cfg: dict, provider_name: str | None = None) -> dict
 
 def resolve_effective_agent_command(agent_cfg: dict, agent_type: str) -> tuple[str | None, str]:
     """Resolve the CLI command for an agent type under the active provider."""
+    if agent_type == "local":
+        # Sentinel — never executed as a subprocess.
+        configured = (
+            _provider_profile(agent_cfg).get("commands", {}).get("local")
+            or _normalize_agent_commands(agent_cfg).get("local")
+            or "local"
+        )
+        return configured, configured
     configured = _provider_profile(agent_cfg).get("commands", {}).get(agent_type)
     if configured:
         return shutil.which(configured), configured
@@ -289,9 +346,14 @@ def resolve_agent_model(agent_cfg: dict, agent_type: str) -> str | None:
 
 def resolve_prompt_config(agent_cfg: dict) -> dict[str, object]:
     """Resolve bridge-controlled prompt injection settings."""
-    prompt_cfg = dict(_normalize_prompt_config(agent_cfg.get("prompt"), fill_defaults=True))
+    agent_type = str(agent_cfg.get("type", "")).strip().lower() or None
+    prompt_cfg = dict(_normalize_prompt_config(
+        agent_cfg.get("prompt"), fill_defaults=True, agent_type=agent_type,
+    ))
     prompt_cfg.update(_provider_profile(agent_cfg).get("prompt", {}))
-    return _normalize_prompt_config(prompt_cfg, fill_defaults=True)
+    return _normalize_prompt_config(
+        prompt_cfg, fill_defaults=True, agent_type=agent_type,
+    )
 
 
 def build_extra_prompts(agent_cfg: dict) -> list[str]:
@@ -413,23 +475,55 @@ def load_config(config_path: str, bot_name: str) -> dict:
         sys.exit(1)
 
     # Resolve agent CLI command
-    default_cmd = "claude" if agent_type == "claude" else agent_type
+    if agent_type == "claude":
+        default_cmd = "claude"
+    elif agent_type == "local":
+        default_cmd = "local"  # sentinel
+    else:
+        default_cmd = agent_type
     agent_cfg.setdefault("command", default_cmd)
     agent_cfg["provider"] = resolve_provider_name(agent_cfg)
     agent_cfg["commands"] = _normalize_agent_commands(agent_cfg)
     agent_cfg["args_by_type"] = _normalize_agent_args(agent_cfg)
     agent_cfg["env_by_type"] = _normalize_agent_env(agent_cfg)
-    agent_cfg["prompt"] = _normalize_prompt_config(agent_cfg.get("prompt"), fill_defaults=True)
-    agent_cfg["providers"] = _normalize_provider_profiles(agent_cfg)
+    # Stash the raw user-supplied prompt block *before* normalization so that
+    # switch_agent / switch_provider can re-normalize from the raw user intent
+    # rather than from a materialized defaults dict (which would otherwise
+    # leak agent-specific defaults across switches — e.g. claude→local would
+    # keep feishu_cli=True because it was materialized in for claude).
+    raw_agent = config.get("agent") if isinstance(config, dict) else None
+    raw_prompt = None
+    if isinstance(raw_agent, dict):
+        rp = raw_agent.get("prompt")
+        if isinstance(rp, dict):
+            raw_prompt = dict(rp)
+    agent_cfg["_prompt_raw"] = raw_prompt
+    # Stash per-provider raw prompt overlays so switch_provider can re-normalize
+    # cleanly rather than inheriting materialized defaults from a prior provider.
+    raw_provider_prompts: dict[str, dict] = {}
+    raw_providers = raw_agent.get("providers") if isinstance(raw_agent, dict) else None
+    if isinstance(raw_providers, dict):
+        for pname, pcfg in raw_providers.items():
+            if isinstance(pcfg, dict) and isinstance(pcfg.get("prompt"), dict):
+                raw_provider_prompts[str(pname).strip().lower()] = dict(pcfg["prompt"])
+    agent_cfg["_provider_prompts_raw"] = raw_provider_prompts
+    try:
+        agent_cfg["prompt"] = _normalize_prompt_config(
+            agent_cfg.get("prompt"), fill_defaults=True, agent_type=agent_type,
+        )
+        agent_cfg["providers"] = _normalize_provider_profiles(agent_cfg)
+    except ConfigError as e:
+        log.error("Invalid agent config: %s", e)
+        sys.exit(1)
     resolved_cmd, agent_cmd = resolve_effective_agent_command(agent_cfg, agent_type)
-    if not resolved_cmd:
+    if agent_type != "local" and not resolved_cmd:
         log.error(
             "Agent command '%s' not found in PATH. "
             "Set absolute path in config or update PATH.", agent_cmd
         )
         sys.exit(1)
-    agent_cfg["_resolved_command"] = resolved_cmd
-    log.info("Agent CLI (%s): %s", agent_type, resolved_cmd)
+    agent_cfg["_resolved_command"] = resolved_cmd or agent_cmd
+    log.info("Agent CLI (%s): %s", agent_type, resolved_cmd or "(local sentinel)")
 
     # ------------------------------------------------------------------
     # group_policy validation
@@ -498,10 +592,12 @@ def create_runner(agent_cfg: dict, bot_cfg: dict,
     runner_cls = _RUNNER_CLASSES[agent_type]  # validated in load_config()
     model = resolve_agent_model(agent_cfg, agent_type) or bot_cfg.get("model")
     prompt_cfg = resolve_prompt_config(agent_cfg)
-    return runner_cls(
+    profile = _provider_profile(agent_cfg)
+    workspace = profile.get("workspace") or bot_cfg["workspace"]
+    kwargs = dict(
         command=agent_cfg["_resolved_command"],
         model=model,
-        workspace=bot_cfg["workspace"],
+        workspace=workspace,
         timeout=agent_cfg.get("timeout_seconds", DEFAULT_TIMEOUT),
         max_budget_usd=agent_cfg.get("max_budget_usd"),
         extra_system_prompts=extra_prompts,
@@ -510,6 +606,18 @@ def create_runner(agent_cfg: dict, bot_cfg: dict,
         safety_prompt_mode=str(prompt_cfg.get("safety", "full")),
         setting_sources=prompt_cfg.get("setting_sources"),
     )
+    if agent_type == "local":
+        endpoint = profile.get("endpoint") or {}
+        kwargs.update(
+            base_url=endpoint.get("base_url", "http://127.0.0.1:8000"),
+            protocol=endpoint.get("protocol", "anthropic"),
+            api_key=endpoint.get("api_key", ""),
+            max_tokens=int(profile.get("max_tokens", 4096)),
+            context_window=int(profile.get("context_window", 8192)),
+            openai_include_usage=bool(profile.get("openai_include_usage", True)),
+            model_aliases=profile.get("model_aliases") or {},
+        )
+    return runner_cls(**kwargs)
 
 
 # ============================================================
@@ -661,17 +769,31 @@ class FeishuBot:
         next_cfg["commands"] = _normalize_agent_commands(next_cfg)
         next_cfg["args_by_type"] = _normalize_agent_args(next_cfg)
         next_cfg["env_by_type"] = _normalize_agent_env(next_cfg)
-        next_cfg["providers"] = _normalize_provider_profiles(next_cfg)
         target_type = next_cfg["type"]
+        try:
+            next_cfg["providers"] = _normalize_provider_profiles(next_cfg)
+        except ConfigError as e:
+            return False, f"Provider 切换失败: {e}"
         resolved_cmd, configured_cmd = resolve_effective_agent_command(next_cfg, target_type)
-        if not resolved_cmd:
+        if target_type != "local" and not resolved_cmd:
             return (
                 False,
                 f"Agent 命令 `{configured_cmd}` 未在 PATH 中找到，无法切换到 `{target}` provider。",
             )
         next_cfg["command"] = configured_cmd
-        next_cfg["_resolved_command"] = resolved_cmd
+        next_cfg["_resolved_command"] = resolved_cmd or configured_cmd
 
+        # Re-normalize prompt block from the *raw* user-supplied block rather
+        # than the currently materialized dict. Using the materialized dict
+        # would leak the previous agent_type's defaults (e.g. feishu_cli=True
+        # from claude) through a provider switch that crosses agent types.
+        raw_prompt = next_cfg.get("_prompt_raw") or {}
+        try:
+            next_cfg["prompt"] = _normalize_prompt_config(
+                raw_prompt, fill_defaults=True, agent_type=target_type,
+            )
+        except ConfigError as e:
+            return False, f"Provider 切换失败: {e}"
         next_bot_cfg = dict(self.bot_config)
         next_prompts = build_extra_prompts(next_cfg)
         next_runner = create_runner(next_cfg, next_bot_cfg, next_prompts)
@@ -706,10 +828,13 @@ class FeishuBot:
         next_cfg["commands"] = _normalize_agent_commands(next_cfg)
         next_cfg["args_by_type"] = _normalize_agent_args(next_cfg)
         next_cfg["env_by_type"] = _normalize_agent_env(next_cfg)
-        next_cfg["providers"] = _normalize_provider_profiles(next_cfg)
+        try:
+            next_cfg["providers"] = _normalize_provider_profiles(next_cfg)
+        except ConfigError as e:
+            return False, f"Agent 切换失败: {e}", None
 
         resolved_cmd, configured_cmd = resolve_effective_agent_command(next_cfg, target_type)
-        if not resolved_cmd:
+        if target_type != "local" and not resolved_cmd:
             return (
                 False,
                 f"Agent 命令 `{configured_cmd}` 未在 PATH 中找到，无法切换到 `{target_type}`。",
@@ -717,8 +842,19 @@ class FeishuBot:
             )
 
         next_cfg["command"] = configured_cmd
-        next_cfg["_resolved_command"] = resolved_cmd
+        next_cfg["_resolved_command"] = resolved_cmd or configured_cmd
 
+        # Agent type changed → re-normalize prompt block with new type,
+        # using the raw user-supplied prompt (not the materialized dict from
+        # the previous agent type, which would carry claude/codex defaults
+        # such as feishu_cli=True over to local).
+        raw_prompt = next_cfg.get("_prompt_raw") or {}
+        try:
+            next_cfg["prompt"] = _normalize_prompt_config(
+                raw_prompt, fill_defaults=True, agent_type=target_type,
+            )
+        except ConfigError as e:
+            return False, f"Agent 切换失败: {e}", None
         next_bot_cfg = dict(self.bot_config)
         next_prompts = build_extra_prompts(next_cfg)
         next_runner = create_runner(next_cfg, next_bot_cfg, next_prompts)
@@ -730,8 +866,8 @@ class FeishuBot:
         self._session_cost.clear()
 
         log.info("Switched agent for bot %s: %s -> %s (%s)",
-                 self.bot_id, current_type, target_type, resolved_cmd)
-        return True, f"Agent 已切换为 `{target_type}`。", resolved_cmd
+                 self.bot_id, current_type, target_type, resolved_cmd or configured_cmd)
+        return True, f"Agent 已切换为 `{target_type}`。", resolved_cmd or configured_cmd
 
     def _check_group_gate(self, chat_type, sender_id, mentions, chat_id) -> bool:
         """Group chat gate policy. Returns True to allow, False to reject."""

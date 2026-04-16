@@ -38,6 +38,12 @@ def _get_install_info() -> tuple[str, str, str | None]:
 log = logging.getLogger("feishu-bridge")
 
 
+def _agent_options_str() -> str:
+    """Return human-readable agent options derived from the runner registry."""
+    from feishu_bridge.main import _RUNNER_CLASSES  # local import: avoid cycle
+    return " / ".join(sorted(_RUNNER_CLASSES))
+
+
 def _context_window_for_model(model: str) -> int:
     """Infer context window size from model name."""
     m = model.lower()
@@ -99,7 +105,7 @@ class BridgeCommandHandler:
             lines.extend([
                 "`/btw <问题>` — 快速提问（不中断当前任务，基于当前上下文）",
                 "`/model [模型名]` — 查看或切换模型",
-                "`/agent [类型]` — 查看或切换后端（claude / codex）",
+                "`/agent [类型]` — 查看或切换后端（" + _agent_options_str() + "）",
                 "`/provider [名称]` — 查看或切换当前后端配置",
                 "`/status` — 查看会话状态（context / 费用 / 配额）",
                 "`/update` — 检查并拉取最新版本（不重启）",
@@ -166,11 +172,14 @@ class BridgeCommandHandler:
         elif cmd == "model":
             aliases = self.bot.runner.get_model_aliases()
             if not arg:
-                alias_list = " / ".join(f"`{a}`" for a in aliases)
                 model_display = self.bot.runner.model or "(CLI 默认)"
-                handle.deliver(
-                    f"当前模型: `{model_display}`\n可选: {alias_list}"
-                )
+                if aliases:
+                    alias_list = " / ".join(f"`{a}`" for a in aliases)
+                    handle.deliver(
+                        f"当前模型: `{model_display}`\n可选: {alias_list}"
+                    )
+                else:
+                    handle.deliver(f"当前模型: `{model_display}`")
             elif arg in aliases:
                 self.bot.runner.model = aliases[arg]
 
@@ -257,8 +266,10 @@ class BridgeCommandHandler:
         current_cmd = getattr(self.bot, "agent_config", {}).get("command", "")
         if not arg.strip():
             suffix = f" (`{current_cmd}`)" if current_cmd else ""
+            from feishu_bridge.main import _RUNNER_CLASSES
+            opts = " / ".join(f"`{n}`" for n in sorted(_RUNNER_CLASSES))
             handle.deliver(
-                f"当前 Agent: `{current_type}`{suffix}\n可选: `claude` / `codex`"
+                f"当前 Agent: `{current_type}`{suffix}\n可选: {opts}"
             )
             return
 
@@ -422,10 +433,10 @@ class BridgeCommandHandler:
                 lines.append("**费用** " + " · ".join(cost_parts))
                 lines.append(f"in: {inp + cache_read + cache_create:,} · out: {out_tokens:,}")
 
-        # --- Section 3: Claude quota ---
+        # --- Section 3: Claude quota (only for ClaudeRunner) ---
         import time as _time
 
-        if snap and snap.available and not snap.stale:
+        if isinstance(self.bot.runner, ClaudeRunner) and snap and snap.available and not snap.stale:
             lines.append("")
             any_exhausted = any(
                 w.utilization >= 100 for w in snap.windows.values()
@@ -440,7 +451,7 @@ class BridgeCommandHandler:
                 hours, mins = divmod(int(remaining) // 60, 60)
                 reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
                 lines.append(f"- {label}: {w.utilization:.0f}%{reset_str}")
-        else:
+        elif isinstance(self.bot.runner, ClaudeRunner):
             # Fallback: stream event rate_limit_info
             rli = cost_info.get("rate_limit_info")
             if rli:

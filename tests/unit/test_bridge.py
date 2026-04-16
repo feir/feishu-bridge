@@ -3033,3 +3033,369 @@ def test_provider_switch_failure_is_error():
     handler._handle_provider("ollama", handle)
 
     assert handle.deliveries == [("切换失败", True, 0)]
+
+
+# ---------------------------------------------------------------------------
+# local-http-runner integration (T6.6)
+# ---------------------------------------------------------------------------
+
+from feishu_bridge.runtime_local import LocalHTTPRunner  # noqa: E402
+
+
+def test_load_config_local_type(tmp_path):
+    """type=local is a valid agent type; PATH check is skipped."""
+    config = {
+        "bots": [_base_bot_config()],
+        "agent": {
+            "type": "local",
+            "endpoint": {
+                "base_url": "http://127.0.0.1:8000",
+                "protocol": "anthropic",
+            },
+        },
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+    result = bridge.load_config(str(cfg_file), "test")
+    assert result["agent"]["type"] == "local"
+    # No ${...} PATH-resolution required; resolved falls back to sentinel
+    assert result["agent"]["_resolved_command"] == "local"
+
+
+def test_load_config_local_prompt_defaults_are_minimal(tmp_path):
+    """type=local uses minimal prompt defaults (no feishu_cli / cron_mgr)."""
+    config = {
+        "bots": [_base_bot_config()],
+        "agent": {
+            "type": "local",
+            "endpoint": {"base_url": "http://127.0.0.1:8000", "protocol": "openai"},
+        },
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+    result = bridge.load_config(str(cfg_file), "test")
+    prompt = result["agent"].get("prompt", {})
+    assert prompt.get("feishu_cli") is False
+    assert prompt.get("cron_mgr") is False
+    assert prompt.get("safety") == "minimal"
+
+
+def test_create_runner_local_builds_http_runner():
+    """Factory builds LocalHTTPRunner from default provider endpoint."""
+    agent_cfg = {
+        "type": "local",
+        "_resolved_command": "local",
+        "timeout_seconds": 30,
+        "providers": {
+            "default": {
+                "endpoint": {
+                    "base_url": "http://127.0.0.1:8000",
+                    "protocol": "anthropic",
+                    "api_key": "KEY",
+                },
+            },
+        },
+    }
+    bot_cfg = {"workspace": "/tmp", "model": "gemma-4-26b"}
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+    assert isinstance(runner, LocalHTTPRunner)
+    assert runner._base_url == "http://127.0.0.1:8000"
+    assert runner._protocol == "anthropic"
+    assert runner._api_key == "KEY"
+    assert runner.model == "gemma-4-26b"
+
+
+def test_local_runner_wants_auth_file_is_false():
+    """LocalHTTPRunner opts out of /tmp/feishu_auth_*.json."""
+    agent_cfg = {
+        "type": "local",
+        "_resolved_command": "local",
+        "providers": {"default": {"endpoint": {
+            "base_url": "http://127.0.0.1:8000", "protocol": "openai",
+        }}},
+        "timeout_seconds": 30,
+    }
+    bot_cfg = {"workspace": "/tmp", "model": "gemma-4-26b"}
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+    assert runner.wants_auth_file() is False
+    assert runner.supports_compact() is False
+
+
+def test_local_build_extra_prompts_empty():
+    """With local defaults (feishu_cli/cron_mgr disabled), extra prompts are empty."""
+    agent_cfg = {
+        "type": "local",
+        "_resolved_command": "local",
+        "providers": {"default": {}},
+        "prompt": {"safety": "minimal", "feishu_cli": False, "cron_mgr": False},
+    }
+    prompts = bridge.build_extra_prompts(agent_cfg)
+    assert prompts == []
+
+
+def test_context_health_alert_local_runner_omits_compact_hint():
+    """Local runner (supports_compact=False) → alert uses /new, not /compact."""
+    agent_cfg = {
+        "type": "local",
+        "_resolved_command": "local",
+        "providers": {"default": {"endpoint": {
+            "base_url": "http://127.0.0.1:8000", "protocol": "openai",
+        }}},
+        "timeout_seconds": 30,
+    }
+    bot_cfg = {"workspace": "/tmp", "model": "gemma-4-26b"}
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+    result = {
+        "usage": {"input_tokens": 10_000, "cache_read_input_tokens": 130_000,
+                  "cache_creation_input_tokens": 0},
+        "modelUsage": {"gemma-4-26b": {"contextWindow": 200_000}},
+    }
+    alert = bridge_worker._context_health_alert(result, runner=runner)
+    assert alert is not None
+    assert "/compact" not in alert
+    assert "/new" in alert
+
+
+def test_switch_agent_claude_to_local_applies_local_defaults(monkeypatch, tmp_path):
+    """C1 regression: switching from claude → local must drop Claude's
+    materialized prompt defaults (feishu_cli=True, cron_mgr=True, safety=full)
+    and pick up Local's (False/False/minimal). Previous code re-normalized
+    from the *materialized* prompt dict, which treated the Claude defaults
+    as explicit user input and preserved them across the switch."""
+    config = {
+        "bots": [_base_bot_config()],
+        "agent": {"type": "claude"},  # No prompt block — user relies on defaults
+    }
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config))
+
+    # load_config will try to resolve `claude` on PATH; stub it away.
+    monkeypatch.setattr(
+        bridge, "resolve_effective_agent_command",
+        lambda agent_cfg, agent_type: (
+            ("claude-stub", "claude") if agent_type == "claude"
+            else ("local", "local")
+        ),
+    )
+    monkeypatch.setattr(bridge, "build_extra_prompts", lambda agent_cfg: [])
+
+    result = bridge.load_config(str(cfg_file), "test")
+    # Sanity: claude materialized to full defaults.
+    assert result["agent"]["prompt"]["feishu_cli"] is True
+    assert result["agent"]["prompt"]["cron_mgr"] is True
+    assert result["agent"]["prompt"]["safety"] == "full"
+    # Raw prompt must be stashed as None (user never supplied one).
+    assert result["agent"].get("_prompt_raw") is None
+
+    # Build a FeishuBot shell using load_config output, then switch to local.
+    bot = object.__new__(bridge.FeishuBot)
+    bot.bot_id = "test-bot"
+    bot.bot_config = {"workspace": "/tmp", "model": "gemma-4-26b"}
+    bot.agent_config = result["agent"]
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-opus-4-6", workspace="/tmp", timeout=30
+    )
+    bot._extra_prompts = []
+    bot._session_cost = {}
+    bot._session_map_path = tmp_path / "sessions.json"
+    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
+
+    ok, msg, _ = bot.switch_agent("local")
+    assert ok is True, msg
+    prompt = bot.agent_config["prompt"]
+    assert prompt["feishu_cli"] is False, prompt
+    assert prompt["cron_mgr"] is False, prompt
+    assert prompt["safety"] == "minimal", prompt
+
+
+def test_switch_agent_to_local(monkeypatch, tmp_path):
+    """Bot-level switch from claude to local rebuilds LocalHTTPRunner."""
+    bot = object.__new__(bridge.FeishuBot)
+    bot.bot_id = "test-bot"
+    bot.bot_config = {"workspace": "/tmp", "model": "gemma-4-26b"}
+    bot.agent_config = {
+        "type": "claude",
+        "command": "claude",
+        "commands": {"claude": "claude", "local": "local"},
+        "provider": "default",
+        "providers": {
+            "default": {},
+            "local_endpoint": {
+                "type": "local",
+                "endpoint": {"base_url": "http://127.0.0.1:8000", "protocol": "openai"},
+            },
+        },
+        "args_by_type": {"claude": []},
+        "env_by_type": {"claude": {}},
+        "endpoint": {"base_url": "http://127.0.0.1:8000", "protocol": "openai"},
+        "_resolved_command": bridge.shutil.which("python3"),
+        "timeout_seconds": 30,
+    }
+    bot.runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-opus-4-6", workspace="/tmp", timeout=30
+    )
+    bot._extra_prompts = []
+    bot._session_cost = {"sid-old": {"usage": {}}}
+    bot._session_map_path = tmp_path / "sessions.json"
+    bot._session_map_path.write_text(json.dumps({
+        "_agent_type": "claude",
+        "chat-key": "sid-old",
+    }))
+    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
+
+    monkeypatch.setattr(
+        bridge, "resolve_effective_agent_command",
+        lambda agent_cfg, agent_type: ("local", "local"),
+    )
+    monkeypatch.setattr(bridge, "build_extra_prompts", lambda agent_cfg: [])
+
+    ok, message, _resolved = bot.switch_agent("local")
+    assert ok is True
+    assert "local" in message
+    assert isinstance(bot.runner, LocalHTTPRunner)
+    assert bot.agent_config["type"] == "local"
+    # Prompt re-normalized to local defaults
+    assert bot.agent_config["prompt"]["feishu_cli"] is False
+    assert bot.agent_config["prompt"]["cron_mgr"] is False
+    # Session cleared because agent_type changed
+    assert bot._session_cost == {}
+    assert bot.session_map.get(("chat-key",)) is None
+
+
+
+class _RichHandle(FakeHandle):
+    """FakeHandle variant that accepts the worker's full deliver() kwargs."""
+
+    def deliver(self, content, is_error=False, **kwargs):
+        self.deliveries.append((content, is_error, kwargs))
+
+    def tool_status_update(self, *a, **k):
+        pass
+
+    def todo_list_update(self, *a, **k):
+        pass
+
+    def agent_list_update(self, *a, **k):
+        pass
+
+
+def test_process_message_stale_local_sid():
+    """Stale sid → runner.has_session False → demote resume=False + prepend rebuild notice."""
+
+    class StaleSessionMap:
+        def __init__(self):
+            self.saved = []
+
+        def get(self, key):
+            return "stale-sid-abc"
+
+        def put(self, key, session_id):
+            self.saved.append((key, session_id))
+
+        def delete(self, key):
+            pass
+
+    run_calls = []
+
+    class StaleLocalRunner:
+        workspace = "/tmp"
+
+        def has_session(self, sid):
+            return False
+
+        def wants_auth_file(self):
+            return False
+
+        def supports_compact(self):
+            return False
+
+        def get_session_not_found_signatures(self):
+            return []
+
+        def run(self, text, **kwargs):
+            run_calls.append(kwargs)
+            return {
+                "result": "canned reply",
+                "session_id": kwargs["session_id"],
+                "is_error": False,
+            }
+
+    runner = StaleLocalRunner()
+    handle = bridge_worker.process_message(
+        item={
+            "bot_id": "bot", "chat_id": "chat", "thread_id": None,
+            "message_id": "mid-1", "text": "hi",
+        },
+        bot_config={"workspace": "/tmp"},
+        lark_client=None,
+        session_map=StaleSessionMap(),
+        runner=runner,
+        response_handle_cls=_RichHandle,
+        download_image_fn=lambda *a, **k: None,
+        fetch_card_content_fn=lambda *a, **k: None,
+        fetch_forward_messages_fn=lambda *a, **k: None,
+        fetch_quoted_message_fn=lambda *a, **k: None,
+        remove_typing_indicator_fn=lambda *a, **k: None,
+    )
+
+    assert len(run_calls) == 1
+    # Stale sid detected → resume demoted to False
+    assert run_calls[0]["resume"] is False
+    # Reused existing sid rather than minting new one (worker reuses existing_sid)
+    assert run_calls[0]["session_id"] == "stale-sid-abc"
+    # Delivered text must be prefixed with rebuild notice
+    assert handle.deliveries, "expected a delivery"
+    delivered_text = handle.deliveries[0][0]
+    assert delivered_text.startswith("⚠️ 会话已重建"), delivered_text
+
+
+def test_cost_store_no_ops_for_local():
+    """Runner result without usage/total_cost_usd → cost_store untouched (no-op by design)."""
+
+    class LocalStyleRunner:
+        workspace = "/tmp"
+
+        def has_session(self, sid):
+            return True
+
+        def wants_auth_file(self):
+            return False
+
+        def supports_compact(self):
+            return False
+
+        def get_session_not_found_signatures(self):
+            return []
+
+        def run(self, text, **kwargs):
+            # Local runner: no usage, no total_cost_usd
+            return {
+                "result": "local reply",
+                "session_id": kwargs["session_id"],
+                "is_error": False,
+            }
+
+    cost_store = {}
+
+    # Exercise without exception
+    bridge_worker.process_message(
+        item={
+            "bot_id": "bot", "chat_id": "chat", "thread_id": None,
+            "message_id": "mid-1", "text": "hi",
+            "_cost_store": cost_store,
+        },
+        bot_config={"workspace": "/tmp"},
+        lark_client=None,
+        session_map=DummySessionMap(),
+        runner=LocalStyleRunner(),
+        response_handle_cls=_RichHandle,
+        download_image_fn=lambda *a, **k: None,
+        fetch_card_content_fn=lambda *a, **k: None,
+        fetch_forward_messages_fn=lambda *a, **k: None,
+        fetch_quoted_message_fn=lambda *a, **k: None,
+        remove_typing_indicator_fn=lambda *a, **k: None,
+    )
+
+    # Cost update guarded by `result.get("usage") or result.get("total_cost_usd")` —
+    # both absent means no entry is recorded (no-op by design).
+    assert cost_store == {}

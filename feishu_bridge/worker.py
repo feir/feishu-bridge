@@ -241,7 +241,7 @@ def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
     return "\n".join(parts)
 
 
-def _context_health_alert(result: dict, quota_snapshot=None) -> str | None:
+def _context_health_alert(result: dict, quota_snapshot=None, runner=None) -> str | None:
     """Check context utilization and return a plain alert string, or None.
 
     Returns clean text (no ``---`` divider or leading newlines) suitable
@@ -289,11 +289,15 @@ def _context_health_alert(result: dict, quota_snapshot=None) -> str | None:
     # Build quota alert from both stream event and API snapshot
     rate_alert = _build_quota_alert(result, quota_snapshot)
 
+    supports_compact = runner is None or runner.supports_compact()
+    tail_80 = "`/compact` 压缩" if supports_compact else "`/new` 开始新会话"
+    tail_70 = "`/compact` 压缩上下文" if supports_compact else "`/new` 开始新会话"
+
     if pct >= 80:
-        alert = f"🔴 Context {pct:.0f}% — 建议 `/new` 新会话或 `/compact` 压缩"
+        alert = f"🔴 Context {pct:.0f}% — 建议 `/new` 新会话或 {tail_80}"
         return "\n".join(filter(None, [alert, rate_alert]))
     if pct >= 70:
-        alert = f"🟡 Context {pct:.0f}% — 可考虑 `/compact` 压缩上下文"
+        alert = f"🟡 Context {pct:.0f}% — 可考虑 {tail_70}"
         return "\n".join(filter(None, [alert, rate_alert]))
     return rate_alert or None
 
@@ -772,7 +776,7 @@ def process_message(
         # on-demand when it actually needs the token (not pre-emptively).
         env_extra = None
         try:
-            if feishu_docs:
+            if feishu_docs and runner.wants_auth_file():
                 cli_token = feishu_docs.get_cached_token(sender_id)
                 auth_file_path = _write_auth_file(chat_id, sender_id, cli_token)
                 env_extra = {
@@ -783,7 +787,14 @@ def process_message(
             log.warning("Failed to create auth file for CLI", exc_info=True)
 
         existing_sid = session_map.get(key)
-        if existing_sid:
+        stale_notice = None
+        if existing_sid and not runner.has_session(existing_sid):
+            log.info(
+                "runner %s has no state for sid=%s — demoting resume=False",
+                type(runner).__name__, existing_sid[:8],
+            )
+            stale_notice = "⚠️ 会话已重建（本地会话在 bridge 重启后未持久化）"
+        if existing_sid and stale_notice is None:
             result = runner.run(
                 text, session_id=existing_sid, resume=True, tag=tag,
                 on_output=on_stream, on_tool_status=on_tool_status,
@@ -791,13 +802,15 @@ def process_message(
                 env_extra=env_extra,
             )
         else:
-            new_sid = str(uuid.uuid4())
+            new_sid = existing_sid or str(uuid.uuid4())
             result = runner.run(
                 text, session_id=new_sid, resume=False, tag=tag,
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
                 env_extra=env_extra,
             )
+            if stale_notice and isinstance(result, dict) and not result.get("is_error"):
+                result["result"] = stale_notice + "\n\n" + (result.get("result") or "")
 
         if result.get("cancelled"):
             handle.deliver(result["result"])
@@ -885,7 +898,7 @@ def process_message(
         if effective_sid and not result.get("is_error"):
             quota_poller = item.get("_quota_poller")
             quota_snap = quota_poller.snapshot if quota_poller else None
-            ctx_alert = _context_health_alert(result, quota_snap)
+            ctx_alert = _context_health_alert(result, quota_snap, runner=runner)
 
         if not handle._terminated:
             _last_usage = result.get("last_call_usage") or result.get("usage") or {}
