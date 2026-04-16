@@ -441,12 +441,25 @@ class BridgeCommandHandler:
 
         max_ctx = self.bot.runner.get_default_context_window()
         model_name = self.bot.runner.model or ""
-        for m, mu in model_usage.items():
+        if model_usage:
+            # Prefer the configured primary model when present in modelUsage;
+            # otherwise fall back to the model with the largest token footprint.
+            # Avoids /status showing haiku just because an internal call
+            # (title gen, autocompact probe) happened to land first in dict order.
+            def _tok(mu: dict) -> int:
+                return (mu.get("inputTokens", 0)
+                        + mu.get("outputTokens", 0)
+                        + mu.get("cacheReadInputTokens", 0)
+                        + mu.get("cacheCreationInputTokens", 0))
+
+            primary = self.bot.runner.model
+            if primary and primary in model_usage:
+                m, mu = primary, model_usage[primary]
+            else:
+                m, mu = max(model_usage.items(), key=lambda kv: _tok(kv[1]))
             model_name = m
-            # API value preferred, model inference as fallback
             cw = mu.get("contextWindow", 0)
             max_ctx = cw if cw > 0 else _context_window_for_model(m)
-            break
 
         pct = total_ctx / max_ctx * 100 if max_ctx else 0
         filled = int(pct / 5)
