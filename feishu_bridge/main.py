@@ -1324,6 +1324,7 @@ class FeishuBot:
                     "thread_id": thread_id,
                     "message_id": message_id,
                     "sender_id": sender_id,
+                    "chat_type": chat_type,
                     "_queued_reaction_id": None,
                 }
                 # Heavy commands (/compact, /new, /reset, /clear, /status)

@@ -4,8 +4,10 @@ import datetime
 import importlib.metadata
 import json
 import logging
+import os
 import platform as _platform
 import threading
+from pathlib import Path
 
 from feishu_bridge.api.client import FeishuAPIError
 from feishu_bridge.quota import WINDOW_LABELS, fetch_codex_quota
@@ -121,7 +123,7 @@ class BridgeCommandHandler:
                 "`/agent [类型]` — 查看或切换后端（" + _agent_options_str() + "）",
                 "`/provider [名称]` — 查看或切换当前后端配置",
                 "`/status` — 查看会话状态（context / 费用 / 配额）",
-                "`/update` — 检查并拉取最新版本（不重启）",
+                "`/update` — 拉取最新版本并重启（若已是最新则仅提示）",
                 "`/restart` — 重启当前 Bot 实例",
                 "`/restart-all` — 重启所有 Bot 实例",
                 "`/help` — 显示本帮助",
@@ -151,7 +153,7 @@ class BridgeCommandHandler:
             self._handle_btw(item, arg, handle)
 
         elif cmd == "update":
-            self._handle_update(handle)
+            self._handle_update(item, handle)
 
         elif cmd == "compact":
             if not self.bot.runner.supports_compact():
@@ -317,29 +319,69 @@ class BridgeCommandHandler:
         ok, message = switch(arg.strip())
         handle.deliver(message, is_error=not ok)
 
-    def _handle_update(self, handle):
-        """Handle /update — check for new version and pull if available."""
+    def _handle_update(self, item: dict, handle):
+        """Handle /update — pull latest version and restart if an update is available.
+
+        Owner-guarded in group chats because it triggers a process exit.
+        """
         from feishu_bridge import __version__
         from feishu_bridge.updater import check_and_update, get_pending_version
 
+        # Owner guard — same policy as /restart (destructive in groups).
+        sender_id = item.get("sender_id")
+        chat_type = item.get("chat_type")
+        group_mode = getattr(self.bot, "_group_default_mode", None)
+        group_owner = getattr(self.bot, "_group_owner", None)
+        if (group_mode is not None
+                and chat_type != "p2p"
+                and sender_id != group_owner):
+            log.info("Destructive cmd /update rejected: sender %s not owner",
+                     sender_id)
+            handle.deliver("仅群主可执行 `/update`（会触发重启）。", is_error=True)
+            return
+
         pv = get_pending_version()
         if pv:
-            handle.deliver(
-                f"v{pv} 已就绪（当前运行 v{__version__}），`/restart` 部署。")
+            self._deploy_and_restart(handle, pv, __version__, already_pulled=True)
             return
 
         handle.send_processing_indicator()
         result = check_and_update()
         status = result.get("status")
         if status == "updated":
-            handle.deliver(
-                f"已拉取新版本 v{result['version']}（当前运行 v{__version__}），"
-                f"`/restart` 部署。")
+            self._deploy_and_restart(
+                handle, result["version"], __version__, already_pulled=False)
         elif status == "up_to_date":
-            handle.deliver(f"已是最新版本 v{__version__}。")
+            handle.deliver(f"已是最新版本 v{__version__}，无需重启。")
         else:
             handle.deliver(
                 f"检查更新失败: {result.get('message', '未知错误')}", is_error=True)
+
+    def _deploy_and_restart(self, handle, new_version: str,
+                            cur_version: str, *, already_pulled: bool):
+        """Send restart card, persist message_id, trigger process exit."""
+        prefix = "使用已就绪" if already_pulled else "已拉取"
+        try:
+            from feishu_bridge.ui import build_restart_card
+            msg_id = handle._send_card(build_restart_card())
+            if msg_id:
+                state_dir = Path(self.bot.workspace) / "state" / "feishu-bridge"
+                state_dir.mkdir(parents=True, exist_ok=True)
+                restart_file = state_dir / f"restart-{self.bot.bot_id}.json"
+                restart_file.write_text(json.dumps({"message_id": msg_id}))
+            else:
+                handle.deliver(
+                    f"{prefix} v{new_version}（当前 v{cur_version}），正在重启……")
+        except Exception:
+            log.exception("/update: failed to send restart confirmation")
+            handle.deliver(
+                f"{prefix} v{new_version}（当前 v{cur_version}），正在重启……")
+
+        # Non-zero exit triggers supervisor restart (systemd / launchd).
+        def _deferred_exit():
+            logging.shutdown()
+            os._exit(1)
+        threading.Timer(0.3, _deferred_exit).start()
 
     def _handle_btw(self, item: dict, arg: str, handle):
         """Handle /btw — side question via fork-session, no tools."""
