@@ -220,7 +220,9 @@ def test_session_store_get_returns_copy():
 
 def test_httpcall_cancel_and_wallclock():
     call = _HTTPCall(socket_timeout=5.0, wall_clock_timeout=0.01)
-    assert call.socket_timeout <= 2.0  # capped
+    assert call.socket_timeout == 5.0  # under cap, passed through
+    capped = _HTTPCall(socket_timeout=120.0, wall_clock_timeout=0.01)
+    assert capped.socket_timeout == 60.0  # capped
     assert not call.is_cancelled()
     call.cancel()
     assert call.is_cancelled()

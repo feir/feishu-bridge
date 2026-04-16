@@ -89,7 +89,10 @@ class _HTTPCall:
     """Tracks a single in-flight HTTP request for cancel / timeout handling."""
 
     def __init__(self, socket_timeout: float, wall_clock_timeout: float):
-        self.socket_timeout = min(socket_timeout, 2.0) if socket_timeout else 2.0
+        # Cap bounds per-read block time so cancel checks stay responsive.
+        # 60s accommodates local LLM cold-start / first-token latency; wall_clock
+        # is the real safety net for runaway requests.
+        self.socket_timeout = min(socket_timeout, 60.0) if socket_timeout else 60.0
         self.wall_clock_timeout = wall_clock_timeout
         self._cancel_event = threading.Event()
         self._response: Optional[http.client.HTTPResponse] = None
@@ -467,7 +470,7 @@ class LocalHTTPRunner(BaseRunner):
             messages=messages, max_tokens=self._max_tokens,
             api_key=self._api_key, stream=stream,
         )
-        call = _HTTPCall(socket_timeout=2.0, wall_clock_timeout=float(self.timeout))
+        call = _HTTPCall(socket_timeout=60.0, wall_clock_timeout=float(self.timeout))
         if tag:
             with self._active_lock:
                 self._active_calls[tag] = call
@@ -519,7 +522,10 @@ class LocalHTTPRunner(BaseRunner):
                             break
                 except (socket.timeout, TimeoutError):
                     is_error = True
-                    err_text = f"Local LLM 响应超时（socket timeout, {int(self.timeout)}s wall clock）"
+                    err_text = (
+                        f"Local LLM 响应超时（socket read 阻塞 >{int(call.socket_timeout)}s, "
+                        f"wall clock {int(time.monotonic() - call._t0)}s / limit {int(self.timeout)}s）"
+                    )
                 except OSError as e:
                     # close()-from-cancel surfaces as OSError on the read side.
                     # Distinguish user-initiated cancel from real transport errors.
