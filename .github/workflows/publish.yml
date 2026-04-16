@@ -10,8 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for Trusted Publisher (OIDC)
+      contents: write  # Required for creating GitHub Release
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so release notes can diff tags
 
       - uses: actions/setup-python@v5
         with:
@@ -24,3 +27,20 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Extract annotated tag message
+        id: tag_msg
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          {
+            echo 'body<<EOF'
+            git tag -l --format='%(contents)' "$TAG"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.tag_msg.outputs.body }}
+          generate_release_notes: true  # auto-append PR/commit diff
+          fail_on_unmatched_files: false
