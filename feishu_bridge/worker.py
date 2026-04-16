@@ -19,7 +19,7 @@ from feishu_bridge.parsers import (
 from feishu_bridge.commands import _context_window_for_model
 from feishu_bridge.quota import WINDOW_LABELS
 from feishu_bridge.runtime import (
-    BaseRunner, SessionMap,
+    BaseRunner, SessionMap, pick_primary_model,
 )
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
 
@@ -952,9 +952,8 @@ def process_message(
 
         if not handle._terminated:
             _last_usage = result.get("last_call_usage") or result.get("usage") or {}
-            # First key only; multi-model sessions show the primary model
             model_usage = result.get("modelUsage") or {}
-            model_name = next(iter(model_usage), None)
+            model_name = pick_primary_model(model_usage, getattr(runner, "model", None))
             handle.deliver(result["result"], is_error=result["is_error"],
                            last_call_usage=_last_usage,
                            model_name=model_name,

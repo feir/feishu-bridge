@@ -12,7 +12,7 @@ from pathlib import Path
 from feishu_bridge.api.client import FeishuAPIError
 from feishu_bridge.quota import WINDOW_LABELS, fetch_codex_quota
 from feishu_bridge.ui import ResponseHandle, add_queued_reaction
-from feishu_bridge.runtime import ClaudeRunner, SessionMap
+from feishu_bridge.runtime import ClaudeRunner, SessionMap, pick_primary_model
 
 
 def _get_install_info() -> tuple[str, str, str | None]:
@@ -441,23 +441,10 @@ class BridgeCommandHandler:
 
         max_ctx = self.bot.runner.get_default_context_window()
         model_name = self.bot.runner.model or ""
-        if model_usage:
-            # Prefer the configured primary model when present in modelUsage;
-            # otherwise fall back to the model with the largest token footprint.
-            # Avoids /status showing haiku just because an internal call
-            # (title gen, autocompact probe) happened to land first in dict order.
-            def _tok(mu: dict) -> int:
-                return (mu.get("inputTokens", 0)
-                        + mu.get("outputTokens", 0)
-                        + mu.get("cacheReadInputTokens", 0)
-                        + mu.get("cacheCreationInputTokens", 0))
-
-            primary = self.bot.runner.model
-            if primary and primary in model_usage:
-                m, mu = primary, model_usage[primary]
-            else:
-                m, mu = max(model_usage.items(), key=lambda kv: _tok(kv[1]))
+        m = pick_primary_model(model_usage, self.bot.runner.model)
+        if m:
             model_name = m
+            mu = model_usage[m]
             cw = mu.get("contextWindow", 0)
             max_ctx = cw if cw > 0 else _context_window_for_model(m)
 

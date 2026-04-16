@@ -20,6 +20,27 @@ from typing import ClassVar, Optional
 
 log = logging.getLogger("feishu-bridge")
 
+def pick_primary_model(model_usage: dict, configured: str | None) -> str | None:
+    """从 modelUsage 中挑选主模型名。
+
+    配置的模型（runner.model）若出现在 modelUsage 中则直接采用；
+    否则回退到 token 用量最大的条目。避免 /new 后首个 turn 的 haiku
+    (title gen / autocompact probe) 因 dict 插入顺序被误识别为主模型。
+    """
+    if not model_usage:
+        return None
+    if configured and configured in model_usage:
+        return configured
+
+    def _tok(mu: dict) -> int:
+        return (mu.get("inputTokens", 0)
+                + mu.get("outputTokens", 0)
+                + mu.get("cacheReadInputTokens", 0)
+                + mu.get("cacheCreationInputTokens", 0))
+
+    return max(model_usage.items(), key=lambda kv: _tok(kv[1]))[0]
+
+
 DEFAULT_TIMEOUT = 300  # 5 minutes
 DEDUP_TTL = 43200  # 12 hours
 DEDUP_MAX = 5000

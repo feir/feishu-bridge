@@ -1699,6 +1699,30 @@ def test_autofetch_never_contains_auth_card_text():
 # BaseRunner ABC, RunResult, StreamState
 # ---------------------------------------------------------------------------
 
+def test_pick_primary_model_prefers_configured():
+    """Configured model wins even if it isn't the first key in dict order."""
+    # /new 后首 turn 场景：haiku (title gen) 先写入，opus (主 turn) 后写入
+    mu = {
+        "claude-haiku-4-5-20251001": {"inputTokens": 100, "outputTokens": 20},
+        "claude-opus-4-6": {"inputTokens": 5000, "outputTokens": 800},
+    }
+    assert bridge_runtime.pick_primary_model(mu, "claude-opus-4-6") == "claude-opus-4-6"
+
+
+def test_pick_primary_model_falls_back_to_max_tokens():
+    """When configured model absent, pick the one with largest token footprint."""
+    mu = {
+        "claude-haiku-4-5-20251001": {"inputTokens": 100, "outputTokens": 20},
+        "claude-sonnet-4-6": {"inputTokens": 5000, "cacheReadInputTokens": 8000},
+    }
+    assert bridge_runtime.pick_primary_model(mu, "claude-opus-4-6") == "claude-sonnet-4-6"
+
+
+def test_pick_primary_model_empty_returns_none():
+    assert bridge_runtime.pick_primary_model({}, "claude-opus-4-6") is None
+    assert bridge_runtime.pick_primary_model({}, None) is None
+
+
 def test_run_result_to_dict_filters_none_and_renames():
     """RunResult.to_dict() filters None values and renames model_usage → modelUsage."""
     r = bridge_runtime.RunResult(
