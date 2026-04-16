@@ -290,16 +290,44 @@ def _context_health_alert(result: dict, quota_snapshot=None, runner=None) -> str
     rate_alert = _build_quota_alert(result, quota_snapshot)
 
     supports_compact = runner is None or runner.supports_compact()
-    tail_80 = "`/compact` 压缩" if supports_compact else "`/new` 开始新会话"
-    tail_70 = "`/compact` 压缩上下文" if supports_compact else "`/new` 开始新会话"
+    tail_red = "`/compact` 压缩" if supports_compact else "`/new` 开始新会话"
+    tail_yellow = "`/compact` 压缩上下文" if supports_compact else "`/new` 开始新会话"
 
-    if pct >= 80:
-        alert = f"🔴 Context {pct:.0f}% — 建议 `/new` 新会话或 {tail_80}"
+    # Alert bands are relative to Claude Code's auto-compact threshold so
+    # the warning always fires *before* auto-compact kicks in, giving the
+    # user a window to run a directed /compact (which produces a better
+    # summary than auto-compact).  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is the
+    # user's configured threshold (default 92); red = threshold-7,
+    # yellow = threshold-22.  With default 92 → 70/85.  With override=85
+    # (common tightened setting) → 63/78.
+    red_pct, yellow_pct = _compact_alert_thresholds()
+
+    if pct >= red_pct:
+        alert = f"🔴 Context {pct:.0f}% — 建议 `/new` 新会话或 {tail_red}"
         return "\n".join(filter(None, [alert, rate_alert]))
-    if pct >= 70:
-        alert = f"🟡 Context {pct:.0f}% — 可考虑 {tail_70}"
+    if pct >= yellow_pct:
+        alert = f"🟡 Context {pct:.0f}% — 可考虑 {tail_yellow}"
         return "\n".join(filter(None, [alert, rate_alert]))
     return rate_alert or None
+
+
+def _compact_alert_thresholds() -> tuple[int, int]:
+    """Return (red_pct, yellow_pct) for context alerts.
+
+    Reads CLAUDE_AUTOCOMPACT_PCT_OVERRIDE env var (same name Claude CLI
+    uses) to stay in sync with the user's auto-compact trigger.  Invalid
+    values fall back to Claude Code's default of 92.
+    """
+    raw = os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+    threshold = 92
+    if raw:
+        try:
+            parsed = int(raw)
+            if 40 <= parsed <= 99:
+                threshold = parsed
+        except ValueError:
+            pass
+    return (threshold - 7, threshold - 22)
 
 
 def format_task_detail_bridge(task: dict) -> str:
@@ -787,6 +815,7 @@ def process_message(
             log.warning("Failed to create auth file for CLI", exc_info=True)
 
         existing_sid = session_map.get(key)
+        _turn_t0 = time.time()
         stale_notice = None
         if existing_sid and not runner.has_session(existing_sid):
             log.info(
@@ -853,12 +882,13 @@ def process_message(
         if effective_sid:
             session_map.put(key, effective_sid)
             cost_store = item.get("_cost_store")
+            prev_session_cost = 0
+            cur_session_cost = result.get("total_cost_usd") or 0
             if cost_store is not None and (
                 result.get("usage") or result.get("total_cost_usd")
             ):
                 existing = cost_store.get(effective_sid, {})
                 prev_session_cost = existing.get("session_cost_usd", 0)
-                cur_session_cost = result.get("total_cost_usd") or 0
                 cost_store[effective_sid] = {
                     "usage": result.get("usage", {}),
                     "last_call_usage": result.get("last_call_usage"),
@@ -868,6 +898,26 @@ def process_message(
                     "turn_cost_usd": max(0, cur_session_cost - prev_session_cost),
                     "rate_limit_info": result.get("rate_limit_info") or existing.get("rate_limit_info"),
                 }
+
+            ledger = item.get("_ledger")
+            if ledger is not None:
+                _last = result.get("last_call_usage") or result.get("usage") or {}
+                _mu = result.get("modelUsage") or {}
+                _model = getattr(runner, "model", None) or next(iter(_mu), None)
+                ledger.record_turn(
+                    session_id=effective_sid,
+                    bot_id=item["bot_id"],
+                    chat_id=chat_id,
+                    thread_id=item.get("thread_id"),
+                    model=_model,
+                    usage=_last,
+                    cost_usd=max(
+                        0,
+                        (result.get("total_cost_usd") or 0) - prev_session_cost,
+                    ),
+                    compact_event=bool(result.get("compact_detected")),
+                    duration_ms=int((time.time() - _turn_t0) * 1000),
+                )
 
             # --- Idle auto-compact timer ---
             if not result["is_error"] and runner.supports_compact():

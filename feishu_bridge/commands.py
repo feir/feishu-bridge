@@ -45,10 +45,23 @@ def _agent_options_str() -> str:
 
 
 def _context_window_for_model(model: str) -> int:
-    """Infer context window size from model name."""
+    """Infer context window size from model name.
+
+    Used as fallback when the API does not report modelUsage.contextWindow
+    (e.g. stream truncated, older CLI).  Keep this table aligned with
+    Anthropic's current model lineup — as of 2026 Q2: Opus 4.6, Sonnet 4.5+
+    ship with a 1M default context window; Haiku 4.5 and older models use
+    200K.  Unknown models log a warning so the mismatch is visible.
+    """
     m = model.lower()
-    if "opus" in m:
+    if "opus" in m or "sonnet" in m:
         return 1_000_000
+    if "haiku" in m:
+        return 200_000
+    log.warning(
+        "context_window fallback hit for unknown model %r; defaulting to 200K",
+        model,
+    )
     return 200_000
 
 
@@ -406,6 +419,16 @@ class BridgeCommandHandler:
         if cache_read and total_ctx:
             cache_pct = cache_read / total_ctx * 100
             lines.append(f"cache hit: {cache_read:,} ({cache_pct:.0f}%)")
+
+        ledger = getattr(self.bot, "_ledger", None)
+        if ledger is not None:
+            prev_ctx = ledger.prev_ctx_tokens(sid)
+            cur_ctx = inp + cache_read  # exclude cache_creation (warming inflates)
+            if prev_ctx and cur_ctx > prev_ctx:
+                lines.append(f"本次 +{cur_ctx - prev_ctx:,} tokens")
+            n_compact = ledger.compact_count(sid)
+            if n_compact > 0:
+                lines.append(f"本会话已 compact {n_compact} 次")
 
         # Context warning
         compact_hint = " 或 `/compact`" if self.bot.runner.supports_compact() else ""

@@ -955,12 +955,13 @@ def test_context_health_alert_compact_detected_no_peak():
 
 
 def test_compact_detected_via_token_drop():
-    """Auto-compact detected when ctx_tokens drops >30% from peak."""
+    """Auto-compact detected when ctx_tokens drops >50% from peak
+    (peak counts input + cache_read only, excluding cache_creation)."""
     runner = bridge_runtime.ClaudeRunner(
         command="claude", model="claude-opus-4-6", timeout=60, workspace="/tmp",
     )
     state = bridge_runtime.StreamState()
-    # Simulate pre-compact: 110K tokens
+    # Pre-compact: input + cache_read = 100K (>= 50K floor)
     runner.parse_streaming_line({
         "type": "assistant",
         "message": {"usage": {
@@ -969,10 +970,10 @@ def test_compact_detected_via_token_drop():
             "cache_creation_input_tokens": 10_000,
         }, "content": []},
     }, state)
-    assert state.peak_context_tokens == 110_000
+    assert state.peak_context_tokens == 100_000
     assert not state.compact_detected
 
-    # Simulate post-compact: drops to 45K (>30% drop)
+    # Post-compact drops to 15K (>50% drop); cache_creation ignored.
     runner.parse_streaming_line({
         "type": "assistant",
         "message": {"usage": {
@@ -982,7 +983,7 @@ def test_compact_detected_via_token_drop():
         }, "content": []},
     }, state)
     assert state.compact_detected
-    assert state.peak_context_tokens == 110_000  # peak preserved
+    assert state.peak_context_tokens == 100_000
 
 
 def test_compact_not_detected_on_small_drop():
@@ -999,9 +1000,9 @@ def test_compact_not_detected_on_small_drop():
             "cache_creation_input_tokens": 19_000,
         }, "content": []},
     }, state)
-    assert state.peak_context_tokens == 100_000
+    assert state.peak_context_tokens == 81_000  # 1K + 80K cache_read
 
-    # Small drop to 80K (20% — below threshold)
+    # Small drop — still > 50% of peak
     runner.parse_streaming_line({
         "type": "assistant",
         "message": {"usage": {
@@ -3399,3 +3400,110 @@ def test_cost_store_no_ops_for_local():
     # Cost update guarded by `result.get("usage") or result.get("total_cost_usd")` —
     # both absent means no entry is recorded (no-op by design).
     assert cost_store == {}
+
+
+# --- Context window / threshold / ledger tests ---
+
+def test_context_window_for_model_sonnet_is_1m():
+    assert bridge_commands._context_window_for_model("claude-sonnet-4-6") == 1_000_000
+    assert bridge_commands._context_window_for_model("claude-opus-4-6") == 1_000_000
+    assert bridge_commands._context_window_for_model("claude-haiku-4-5") == 200_000
+
+
+def test_context_window_for_model_unknown_defaults_200k():
+    assert bridge_commands._context_window_for_model("some-other-model") == 200_000
+
+
+def test_runner_default_context_window_sonnet():
+    runner = bridge_runtime.ClaudeRunner(
+        command="claude", model="claude-sonnet-4-6", timeout=60, workspace="/tmp",
+    )
+    assert runner.get_default_context_window() == 1_000_000
+
+
+def test_compact_alert_thresholds_default(monkeypatch):
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+    red, yellow = bridge_worker._compact_alert_thresholds()
+    assert red == 85 and yellow == 70
+
+
+def test_compact_alert_thresholds_override(monkeypatch):
+    monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "85")
+    red, yellow = bridge_worker._compact_alert_thresholds()
+    assert red == 78 and yellow == 63
+
+
+def test_compact_alert_thresholds_invalid_override(monkeypatch):
+    monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "not-an-int")
+    red, yellow = bridge_worker._compact_alert_thresholds()
+    assert red == 85 and yellow == 70
+
+
+def test_ledger_roundtrip(tmp_path):
+    from feishu_bridge.ledger import Ledger
+
+    db = Ledger.open(tmp_path / "t.db")
+    common = dict(
+        bot_id="b", chat_id="c", thread_id=None, model="m",
+        cost_usd=0.01, duration_ms=100,
+    )
+    db.record_turn(
+        session_id="s1",
+        usage={
+            "input_tokens": 1000, "cache_read_input_tokens": 9000,
+            "cache_creation_input_tokens": 5000, "output_tokens": 200,
+        },
+        compact_event=False, **common,
+    )
+    db.record_turn(
+        session_id="s1",
+        usage={
+            "input_tokens": 500, "cache_read_input_tokens": 2000,
+            "cache_creation_input_tokens": 0, "output_tokens": 50,
+        },
+        compact_event=True, **common,
+    )
+    # prev_ctx returns the turn BEFORE the latest -> 1000 + 9000
+    assert db.prev_ctx_tokens("s1") == 10_000
+    assert db.compact_count("s1") == 1
+    assert db.prev_ctx_tokens("missing") == 0
+
+
+def test_ledger_record_turn_never_raises(tmp_path):
+    """Malformed usage dict must be swallowed, not propagated."""
+    from feishu_bridge.ledger import Ledger
+
+    db = Ledger.open(tmp_path / "t.db")
+    # usage=None would raise AttributeError on .get() — must be contained.
+    db.record_turn(
+        session_id="s1", bot_id="b", chat_id="c", thread_id=None, model="m",
+        usage=None, cost_usd=0.0, compact_event=False, duration_ms=0,
+    )
+    # compact_count still works after the failed write.
+    assert db.compact_count("s1") == 0
+
+
+def test_ledger_prev_ctx_rowid_tiebreak(tmp_path):
+    """Rapid back-to-back writes with colliding ts must still return
+    the previous turn deterministically (rowid tiebreak)."""
+    from feishu_bridge.ledger import Ledger
+    import time as _time
+
+    db = Ledger.open(tmp_path / "t.db")
+    # Force identical ts by monkeypatching time.time
+    frozen = 1_700_000_000.0
+    orig = _time.time
+    try:
+        _time.time = lambda: frozen
+        for i, ctx in enumerate([1000, 2000, 3000]):
+            db.record_turn(
+                session_id="s1", bot_id="b", chat_id="c", thread_id=None,
+                model="m",
+                usage={"input_tokens": ctx, "cache_read_input_tokens": 0,
+                       "cache_creation_input_tokens": 0, "output_tokens": 0},
+                cost_usd=0.0, compact_event=False, duration_ms=0,
+            )
+    finally:
+        _time.time = orig
+    # Latest = 3000 (third insert), prev = 2000 (second insert).
+    assert db.prev_ctx_tokens("s1") == 2000

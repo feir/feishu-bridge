@@ -687,6 +687,14 @@ class FeishuBot:
         self._session_map_path = (
             Path(self.workspace) / "state" / "feishu-bridge" / f"sessions-{self.bot_id}.json"
         )
+        try:
+            from .ledger import Ledger
+            self._ledger = Ledger.open(
+                Path(self.workspace) / "state" / "feishu-bridge" / "ledger.db"
+            )
+        except Exception:
+            log.warning("ledger disabled (open failed)", exc_info=True)
+            self._ledger = None
 
         # Components
         self.dedup = MessageDedup(
@@ -1365,6 +1373,7 @@ class FeishuBot:
                 "_feishu_urls": _feishu_urls,
                 "_cost_store": self._session_cost,
                 "_quota_poller": getattr(self, "_quota_poller", None),
+                "_ledger": getattr(self, "_ledger", None),
             }
             msg_key = SessionMap._key_str(
                 (self.bot_id, chat_id, thread_id))
@@ -1451,6 +1460,7 @@ class FeishuBot:
                 "_feishu_urls": [],
                 "_cost_store": self._session_cost,
                 "_quota_poller": getattr(self, "_quota_poller", None),
+                "_ledger": getattr(self, "_ledger", None),
                 "_queue_key": msg_key,
             }
             try:

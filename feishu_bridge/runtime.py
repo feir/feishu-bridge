@@ -842,17 +842,24 @@ class ClaudeRunner(BaseRunner):
             msg_usage = msg.get("usage")
             if msg_usage:
                 state.last_call_usage = msg_usage
+                # Peak excludes cache_creation_input_tokens: those are tokens
+                # newly written to cache this turn, a transient cost that
+                # inflates peak on the first cache-warming turn and makes
+                # subsequent cache_read-only turns look like a drop.  Peak
+                # tracks the actual context the model has been carrying
+                # (new input + prior cache read).
                 ctx_tokens = (msg_usage.get("input_tokens", 0)
-                              + msg_usage.get("cache_read_input_tokens", 0)
-                              + msg_usage.get("cache_creation_input_tokens", 0))
-                # Detect compact via token drop: if ctx_tokens drops >30%
-                # from peak, auto-compact happened.  The API-level
-                # context_management.applied_edits signal (checked in
-                # stream_event) is unreliable for Claude Code CLI compacts
-                # which produce <synthetic> records with context_management=None.
+                              + msg_usage.get("cache_read_input_tokens", 0))
+                # Detect auto-compact via large token drop from peak.
+                # Tightened from the earlier 30% heuristic: drop must be
+                # >50%, and prior peak must be substantial (>=50K tokens)
+                # to avoid false positives on small sessions where an
+                # incremental tool-output trim can look proportionally
+                # large.  Full session compacts always shrink context by
+                # much more than 50%.
                 if (not state.compact_detected
-                        and state.peak_context_tokens > 0
-                        and ctx_tokens < state.peak_context_tokens * 0.7):
+                        and state.peak_context_tokens >= 50_000
+                        and ctx_tokens < state.peak_context_tokens * 0.5):
                     state.compact_detected = True
                     log.info(
                         "Auto-compact detected via token drop: %d → %d",
@@ -891,12 +898,14 @@ class ClaudeRunner(BaseRunner):
                 state.accumulated_text += inner["delta"].get("text", "")
                 state.pending_output.append(state.accumulated_text)
             elif inner.get("type") == "message_delta":
-                edits = (inner.get("delta", {})
-                         .get("context_management", {})
-                         .get("applied_edits"))
-                if edits:
-                    state.compact_detected = True
-                    log.info("Auto-compact detected: %d edit(s) applied", len(edits))
+                # NOTE: context_management.applied_edits is Anthropic's
+                # incremental context trimming (e.g. clear_tool_uses_*),
+                # which fires on large tool outputs and is NOT the same as
+                # a Claude Code session-level auto-compact.  We intentionally
+                # do NOT mark compact_detected here — relying solely on the
+                # token-drop heuristic above avoids false "上下文已自动压缩"
+                # alerts for incremental tool-result trims.
+                pass
 
     def parse_blocking_output(self, stdout, session_id):
         try:
@@ -996,8 +1005,10 @@ class ClaudeRunner(BaseRunner):
         }
 
     def get_default_context_window(self):
+        # Mirror commands._context_window_for_model — kept in sync manually,
+        # see that function for the source-of-truth table and rationale.
         m = (self.model or "").lower()
-        if "opus" in m:
+        if "opus" in m or "sonnet" in m:
             return 1_000_000
         return 200_000
 
