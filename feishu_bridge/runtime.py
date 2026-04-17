@@ -799,7 +799,7 @@ class BaseRunner(ABC):
 class ClaudeRunner(BaseRunner):
     """Claude Code CLI runner."""
 
-    DEFAULT_MODEL = "claude-opus-4-6"
+    DEFAULT_MODEL = "claude-opus-4-7"
 
     SESSION_NOT_FOUND_SIGNATURES = [
         "session not found",
@@ -1020,7 +1020,7 @@ class ClaudeRunner(BaseRunner):
 
     def get_model_aliases(self):
         return {
-            "opus": "claude-opus-4-6",
+            "opus": "claude-opus-4-7",
             "sonnet": "claude-sonnet-4-6",
             "haiku": "claude-haiku-4-5",
         }

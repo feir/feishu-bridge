@@ -51,7 +51,7 @@ def _context_window_for_model(model: str) -> int:
 
     Used as fallback when the API does not report modelUsage.contextWindow
     (e.g. stream truncated, older CLI).  Keep this table aligned with
-    Anthropic's current model lineup — as of 2026 Q2: Opus 4.6, Sonnet 4.5+
+    Anthropic's current model lineup — as of 2026 Q2: Opus 4.7, Sonnet 4.6
     ship with a 1M default context window; Haiku 4.5 and older models use
     200K.  Unknown models log a warning so the mismatch is visible.
     """
