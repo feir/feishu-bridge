@@ -12,7 +12,13 @@ from pathlib import Path
 from feishu_bridge.api.client import FeishuAPIError
 from feishu_bridge.quota import WINDOW_LABELS, fetch_codex_quota
 from feishu_bridge.ui import ResponseHandle, add_queued_reaction
-from feishu_bridge.runtime import ClaudeRunner, SessionMap, pick_primary_model
+from feishu_bridge.runtime import (
+    ClaudeRunner,
+    SessionMap,
+    infer_context_window as _context_window_for_model,
+    pick_primary_model,
+    resolve_context_window,
+)
 
 
 def _get_install_info() -> tuple[str, str, str | None]:
@@ -44,27 +50,6 @@ def _agent_options_str() -> str:
     """Return human-readable agent options derived from the runner registry."""
     from feishu_bridge.main import _RUNNER_CLASSES  # local import: avoid cycle
     return " / ".join(sorted(_RUNNER_CLASSES))
-
-
-def _context_window_for_model(model: str) -> int:
-    """Infer context window size from model name.
-
-    Used as fallback when the API does not report modelUsage.contextWindow
-    (e.g. stream truncated, older CLI).  Keep this table aligned with
-    Anthropic's current model lineup — as of 2026 Q2: Opus 4.7, Sonnet 4.6
-    ship with a 1M default context window; Haiku 4.5 and older models use
-    200K.  Unknown models log a warning so the mismatch is visible.
-    """
-    m = model.lower()
-    if "opus" in m or "sonnet" in m:
-        return 1_000_000
-    if "haiku" in m:
-        return 200_000
-    log.warning(
-        "context_window fallback hit for unknown model %r; defaulting to 200K",
-        model,
-    )
-    return 200_000
 
 
 class BridgeCommandHandler:
@@ -445,8 +430,7 @@ class BridgeCommandHandler:
         if m:
             model_name = m
             mu = model_usage[m]
-            cw = mu.get("contextWindow", 0)
-            max_ctx = cw if cw > 0 else _context_window_for_model(m)
+            max_ctx = resolve_context_window(m, mu.get("contextWindow", 0))
 
         pct = total_ctx / max_ctx * 100 if max_ctx else 0
         filled = int(pct / 5)

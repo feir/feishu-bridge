@@ -41,6 +41,49 @@ def pick_primary_model(model_usage: dict, configured: str | None) -> str | None:
     return max(model_usage.items(), key=lambda kv: _tok(kv[1]))[0]
 
 
+def infer_context_window(model: Optional[str]) -> int:
+    """Authoritative context window table by model family.
+
+    Claude Code CLI runs Opus 4.7 / Sonnet 4.6 with a 1M window by default
+    (verified via the CLI model picker: "Opus 4.7 (1M context) (default)").
+    Do NOT trust ``modelUsage[m].contextWindow`` from the stream event — it
+    reports a legacy 200K value regardless of the actual 1M mode, and using
+    it as the denominator inflates the usage percentage ~5x.
+
+    Haiku 4.5 and the Codex GPT-5.x line stay at 200K.
+    """
+    m = (model or "").lower()
+    if "opus" in m or "sonnet" in m:
+        return 1_000_000
+    if "haiku" in m or "gpt" in m:
+        return 200_000
+    if m:
+        log.warning(
+            "context_window fallback hit for unknown model %r; defaulting to 200K",
+            model,
+        )
+    return 200_000
+
+
+def resolve_context_window(model: Optional[str], stream_cw: int) -> int:
+    """Pick the denominator for context-usage percentages.
+
+    Claude Code CLI reports ``modelUsage[m].contextWindow`` as a legacy
+    200K for Opus/Sonnet even when running at 1M, so the stream value is
+    ignored for those families in favour of the inferred table. For
+    Haiku / Codex / local / custom models the stream value is either
+    authoritative (API-reported) or user-configured (local small-window
+    models), so we trust it when present and fall back to the inferred
+    table only when it is absent or zero.
+    """
+    fam = (model or "").lower()
+    if "opus" in fam or "sonnet" in fam:
+        return infer_context_window(model)
+    if stream_cw > 0:
+        return stream_cw
+    return infer_context_window(model)
+
+
 DEFAULT_TIMEOUT = 300  # 5 minutes
 DEDUP_TTL = 43200  # 12 hours
 DEDUP_MAX = 5000
@@ -1026,12 +1069,7 @@ class ClaudeRunner(BaseRunner):
         }
 
     def get_default_context_window(self):
-        # Mirror commands._context_window_for_model — kept in sync manually,
-        # see that function for the source-of-truth table and rationale.
-        m = (self.model or "").lower()
-        if "opus" in m or "sonnet" in m:
-            return 1_000_000
-        return 200_000
+        return infer_context_window(self.model)
 
     def get_session_not_found_signatures(self):
         return self.SESSION_NOT_FOUND_SIGNATURES

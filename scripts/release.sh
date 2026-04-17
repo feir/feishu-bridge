@@ -28,13 +28,14 @@ fi
 
 LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
 RANGE="${LAST_TAG:+${LAST_TAG}..}HEAD"
-COMMITS=$(git log --no-merges --format='%s' "$RANGE" \
-  | grep -vE '^chore: bump version to ' || true)
+ALL_COMMITS=$(git log --no-merges --format='%s' "$RANGE" || true)
 
-if [ -z "$COMMITS" ]; then
-  echo "release: no substantive commits since ${LAST_TAG:-repo-root}, skipping" >&2
+if [ -z "$ALL_COMMITS" ]; then
+  echo "release: no commits since ${LAST_TAG:-repo-root}, skipping" >&2
   exit 0
 fi
+
+COMMITS=$(echo "$ALL_COMMITS" | grep -vE '^chore: bump version to ' || true)
 
 NOTES_FILE=$(mktemp /tmp/release-notes-XXXXXX.md)
 trap 'rm -f "$NOTES_FILE"' EXIT
@@ -45,7 +46,10 @@ trap 'rm -f "$NOTES_FILE"' EXIT
   [ -n "$HEADLINE" ] && { echo "$HEADLINE"; echo; }
 } > "$NOTES_FILE"
 
-if [ "${RELEASE_NO_LLM:-0}" = "1" ] || ! command -v claude >/dev/null 2>&1; then
+if [ -z "$COMMITS" ]; then
+  echo "## Changes" >> "$NOTES_FILE"
+  echo "$ALL_COMMITS" | sed 's/^/- /' >> "$NOTES_FILE"
+elif [ "${RELEASE_NO_LLM:-0}" = "1" ] || ! command -v claude >/dev/null 2>&1; then
   echo "## Changes" >> "$NOTES_FILE"
   echo "$COMMITS" | sed 's/^/- /' >> "$NOTES_FILE"
 else

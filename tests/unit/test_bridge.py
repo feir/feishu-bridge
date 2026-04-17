@@ -695,7 +695,7 @@ def test_context_health_alert_red_at_80_pct():
     """Red alert when context usage reaches 80%."""
     result = {
         "usage": {"input_tokens": 10_000, "cache_read_input_tokens": 170_000, "cache_creation_input_tokens": 0},
-        "modelUsage": {"claude-opus-4-6": {"contextWindow": 200_000}},
+        "modelUsage": {"claude-haiku-4-5": {"contextWindow": 200_000}},
     }
     alert = bridge_worker._context_health_alert(result)
     assert alert is not None
@@ -713,6 +713,19 @@ def test_context_health_alert_uses_model_context_window():
     alert = bridge_worker._context_health_alert(result)
     assert alert is not None
     assert "83%" in alert
+
+
+def test_context_health_alert_opus_ignores_stale_200k_stream():
+    """Plan C: opus/sonnet with stream contextWindow=200_000 (legacy stale
+    value from Claude Code CLI) must resolve to the inferred 1M denominator.
+    180K / 1M = 18% → no alert, whereas 180K / 200K would produce a red alert."""
+    result = {
+        "usage": {"input_tokens": 10_000, "cache_read_input_tokens": 170_000, "cache_creation_input_tokens": 0},
+        "modelUsage": {"claude-opus-4-7": {"contextWindow": 200_000}},
+    }
+    alert = bridge_worker._context_health_alert(result)
+    # 180_000 / 1_000_000 = 18% — well below the 70% yellow threshold
+    assert alert is None
 
 
 def test_cost_accumulation_across_turns():
@@ -927,7 +940,7 @@ def test_context_health_alert_compact_detected_with_peak():
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
         },
-        "modelUsage": {"claude-opus-4-6": {"contextWindow": 200_000}},
+        "modelUsage": {"claude-haiku-4-5": {"contextWindow": 200_000}},
         "compact_detected": True,
         "peak_context_tokens": 170_000,  # pre-compact: 85%
     }
@@ -945,7 +958,7 @@ def test_context_health_alert_compact_detected_no_peak():
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
         },
-        "modelUsage": {"claude-opus-4-6": {"contextWindow": 200_000}},
+        "modelUsage": {"claude-haiku-4-5": {"contextWindow": 200_000}},
         "compact_detected": True,
         "peak_context_tokens": 0,
     }
@@ -1022,7 +1035,7 @@ def test_context_health_alert_no_compact_still_alerts():
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
         },
-        "modelUsage": {"claude-opus-4-6": {"contextWindow": 200_000}},
+        "modelUsage": {"claude-haiku-4-5": {"contextWindow": 200_000}},
         "compact_detected": False,
         "peak_context_tokens": 180_000,
     }
@@ -1807,7 +1820,7 @@ def test_claude_runner_get_model_aliases():
         workspace="/tmp", timeout=30,
     )
     aliases = runner.get_model_aliases()
-    assert aliases["opus"] == "claude-opus-4-6"
+    assert aliases["opus"] == "claude-opus-4-7"
     assert aliases["sonnet"] == "claude-sonnet-4-6"
     assert aliases["haiku"] == "claude-haiku-4-5"
 
@@ -3436,6 +3449,41 @@ def test_context_window_for_model_sonnet_is_1m():
 
 def test_context_window_for_model_unknown_defaults_200k():
     assert bridge_commands._context_window_for_model("some-other-model") == 200_000
+
+
+def test_infer_context_window_families():
+    assert bridge_runtime.infer_context_window("claude-opus-4-7") == 1_000_000
+    assert bridge_runtime.infer_context_window("claude-sonnet-4-6") == 1_000_000
+    assert bridge_runtime.infer_context_window("claude-haiku-4-5") == 200_000
+    assert bridge_runtime.infer_context_window("gpt-5.4") == 200_000
+    assert bridge_runtime.infer_context_window("some-other-model") == 200_000
+    assert bridge_runtime.infer_context_window(None) == 200_000
+    assert bridge_runtime.infer_context_window("") == 200_000
+
+
+def test_resolve_context_window_opus_sonnet_ignore_stream():
+    """Plan C core behavior: opus/sonnet ignore the stale 200K stream value
+    and use the inferred 1M table, because Claude Code CLI reports a legacy
+    200K contextWindow even when running in 1M mode."""
+    assert bridge_runtime.resolve_context_window("claude-opus-4-7", 200_000) == 1_000_000
+    assert bridge_runtime.resolve_context_window("claude-sonnet-4-6", 200_000) == 1_000_000
+    # Even a non-zero stream value is ignored for opus/sonnet.
+    assert bridge_runtime.resolve_context_window("claude-opus-4-7", 500_000) == 1_000_000
+
+
+def test_resolve_context_window_other_models_trust_stream():
+    """Non-opus/sonnet models trust the stream value when > 0, enabling
+    custom / local / Codex models to report their own window."""
+    assert bridge_runtime.resolve_context_window("claude-haiku-4-5", 200_000) == 200_000
+    assert bridge_runtime.resolve_context_window("custom-model", 60_000) == 60_000
+    assert bridge_runtime.resolve_context_window("gpt-5.4", 400_000) == 400_000
+
+
+def test_resolve_context_window_zero_stream_falls_back_to_inferred():
+    """Stream value <= 0 (absent / truncated) falls back to the inferred table."""
+    assert bridge_runtime.resolve_context_window("claude-haiku-4-5", 0) == 200_000
+    assert bridge_runtime.resolve_context_window("unknown-model", 0) == 200_000
+    assert bridge_runtime.resolve_context_window(None, 0) == 200_000
 
 
 def test_runner_default_context_window_sonnet():
