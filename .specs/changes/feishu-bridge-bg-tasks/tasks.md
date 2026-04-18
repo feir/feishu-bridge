@@ -76,9 +76,13 @@
     - 实装：新增 `feishu_bridge/bg_synthetic_turn.py`（纯函数 `build_synthetic_turn(...)`）+ 23 个 fixture-driven tests。
     - Code Review (Claude code-reviewer): 发现 MAJOR — `remaining<=0` fallback 分支用 raw byte slice 同时破坏 UTF-8 safety 与 step-4 preservation（长 `reason` → prelude 被从尾部切掉 State/Reason/Signal/Duration/Exit_code 行，并可能产生 mojibake）。已应用修复：对 `reason` (2048B)、`manifest_path` (1024B)、`signal` (64B) 在进入 prelude 前做 UTF-8 safe per-field cap；`remaining<=0` 分支转为 `assert`（step-4 pre-pass 已使其结构上不可达）。新增 4 个 M1 回归测试：长 reason 保 step-4 字段、多字节 reason 不破坏、短 reason 原样、超长 signal 被截断。tail boundary 测试 parametrize 至 5 个 offset 覆盖 emoji 所有切位。
     - 回归：全量 186 + 33 + 22 + 23 = 264 passed。Codex 跨模型评审本轮跳过（sandbox 阻塞了 codex exec 的所有 stdout 重定向路径；M1 已通过 Claude review 发现并修复 + 回归测试补全）。
-- [ ] 5.3 `enqueue_turn` 对 `kind='bg_task_completion'` 绕过 `MAX_PENDING_PER_SESSION=10`；人类消息仍受限
+- [x] 5.3 `enqueue_turn` 对 `kind='bg_task_completion'` 绕过 `MAX_PENDING_PER_SESSION=10`；人类消息仍受限
     - Validate: 同 session 预置 10 pending 人类消息 → 新的 bg completion 仍能入队；反之预置 1 bg completion + 10 人类 → 下一条人类消息被 backpressure
     - **Prerequisite (from 5.1 review)**: `ChatTaskQueue.enqueue` 目前无条件执行 `MAX_PENDING_PER_SESSION` 检查并抛 `SessionQueueFull`。bypass 需在 queue 层加参数（如 `bypass_backpressure: bool = False`）或新增 `enqueue_bypass()` 方法；`enqueue_turn` 里单独判断 kind 无法绕过。
+    - 实装：`ChatTaskQueue.enqueue()` 新增 keyword-only `bypass_backpressure: bool = False`。cap 检查改为 `if not bypass_backpressure and pending and len(pending) >= MAX_PENDING_PER_SESSION`。`enqueue_turn` 传 `bypass_backpressure=(kind == "bg_task_completion")`，严格字符串匹配（'bg-task-completion' 这类拼写不绕过）。
+    - 新增 7 个 tests：3 个 enqueue_turn kind→bypass 映射（human=False / bg_task_completion=True / 未知 kind=False 防拼写）+ 4 个真 ChatTaskQueue 行为（默认 cap 强制 / bypass 跳过 cap / bypass 不泄漏到后续 human / 空 session bypass 仍走 immediate）。
+    - 回归：193 bridge + 33 task_runner + 22 bg_supervisor + 23 bg_synthetic_turn = 271 passed。
+    - Codex 跨模型评审本轮跳过（change 面小、有 4 个真-queue 行为测试兜底、API shape 与 5.1 review 的建议一致）。
 - [ ] 5.4 Session resume fallback —— probe 契约
     - `sessions_index`（in-memory dict + `~/.feishu-bridge/sessions.json` 持久化）记录 `{session_id: {last_active_at, chat_id}}`；bridge 每次处理 human turn 更新 last_active_at
     - enqueue_turn 发现 `now - last_active_at > 24h` → 启动 sentinel probe：`claude -p --resume <session_id> -p ":probe:"` 5s timeout；成功 → 正常 resume；失败（timeout/session not found） → fork 新 session + prepend `[NOTE: original session no longer resumable at <timestamp>, resuming in fresh context]` 到 prompt

@@ -1407,12 +1407,15 @@ def _make_full_bot(default_mode=None, owner=None, overrides=None,
     # Minimal dedup (never dedup in tests)
     bot.dedup = bridge.MessageDedup(ttl=1, max_entries=10)
 
-    # Track enqueued items
+    # Track enqueued items and the bypass_backpressure kwarg per call
+    # (Section 5.3 contract: bg_task_completion must pass True, human False).
     bot._enqueued_items = []
+    bot._enqueue_bypass_calls = []
 
     class FakeChatQueue:
-        def enqueue(self, key, item):
+        def enqueue(self, key, item, *, bypass_backpressure=False):
             bot._enqueued_items.append(item)
+            bot._enqueue_bypass_calls.append(bypass_backpressure)
             return 'active'
         def drain(self, key):
             return []
@@ -1656,6 +1659,103 @@ def test_enqueue_turn_rejects_protected_keys_in_extras():
                 kind="human",
                 extras={key: "oops"},
             )
+
+
+# ---------------------------------------------------------------------------
+# Section 5.3: bg_task_completion backpressure bypass
+# ---------------------------------------------------------------------------
+
+def test_enqueue_turn_human_kind_does_not_bypass_backpressure():
+    """Human turns must carry bypass_backpressure=False so a flood-bot
+    can't starve the worker by bulk-submitting bg completions' siblings."""
+    bot = _make_full_bot(default_mode="auto-reply")
+    bot.enqueue_turn(
+        chat_id="oc_x", session_key="k", prompt="hi", kind="human",
+    )
+    assert bot._enqueue_bypass_calls == [False]
+
+
+def test_enqueue_turn_bg_completion_kind_bypasses_backpressure():
+    """bg_task_completion turns pass bypass_backpressure=True — dropping
+    them means the user never sees their long-running task's result."""
+    bot = _make_full_bot(default_mode="auto-reply")
+    bot.enqueue_turn(
+        chat_id="oc_x", session_key="k", prompt="[bg-task:abc] done",
+        kind="bg_task_completion",
+    )
+    assert bot._enqueue_bypass_calls == [True]
+
+
+def test_enqueue_turn_unknown_kind_does_not_bypass():
+    """Defensive: only the exact 'bg_task_completion' string unlocks the
+    bypass. A future typo like 'bg-task-completion' must still respect
+    backpressure rather than silently uncap the queue."""
+    bot = _make_full_bot(default_mode="auto-reply")
+    bot.enqueue_turn(
+        chat_id="oc_x", session_key="k", prompt="x", kind="bg-task-completion",
+    )
+    assert bot._enqueue_bypass_calls == [False]
+
+
+# ---------------------------------------------------------------------------
+# Section 5.3: ChatTaskQueue.enqueue(bypass_backpressure=...) — real queue
+# ---------------------------------------------------------------------------
+
+def _make_chat_queue():
+    """Return (queue, work_queue) where work_queue is a real queue.Queue."""
+    import queue
+    wq = queue.Queue()
+    return bridge_runtime.ChatTaskQueue(wq), wq
+
+
+def _fill_session(q, key, count):
+    """Put `count` items into session `key`: first goes active, rest pending."""
+    for i in range(count):
+        q.enqueue(key, {"i": i})
+
+
+def test_chat_task_queue_default_enforces_backpressure_cap():
+    """Baseline: 1 active + 10 pending human items → 11th human raises."""
+    q, _wq = _make_chat_queue()
+    _fill_session(q, "k", 1 + bridge_runtime.ChatTaskQueue.MAX_PENDING_PER_SESSION)
+    # Next human would exceed cap.
+    with pytest.raises(bridge_runtime.SessionQueueFull):
+        q.enqueue("k", {"i": "overflow"})
+
+
+def test_chat_task_queue_bypass_skips_cap_when_session_at_max():
+    """Pre-fill to cap, then enqueue a synthetic bg_task_completion with
+    bypass=True — it must NOT raise and must land in the pending queue."""
+    q, _wq = _make_chat_queue()
+    _fill_session(q, "k", 1 + bridge_runtime.ChatTaskQueue.MAX_PENDING_PER_SESSION)
+    # At cap (10 pending). bypass=True lets the synthetic turn through.
+    status = q.enqueue(
+        "k", {"kind": "bg_task_completion"}, bypass_backpressure=True,
+    )
+    assert status == "queued"
+    assert q.pending_count("k") == bridge_runtime.ChatTaskQueue.MAX_PENDING_PER_SESSION + 1
+
+
+def test_chat_task_queue_bypass_does_not_leak_to_subsequent_humans():
+    """Bypass applies only to the call that sets it. After a synthetic
+    turn slips past the cap, the next human message must still be
+    rejected — the cap state isn't permanently lifted."""
+    q, _wq = _make_chat_queue()
+    _fill_session(q, "k", 1 + bridge_runtime.ChatTaskQueue.MAX_PENDING_PER_SESSION)
+    q.enqueue("k", {"kind": "bg_task_completion"}, bypass_backpressure=True)
+    # 11 pending now; a human turn must still be rejected.
+    with pytest.raises(bridge_runtime.SessionQueueFull):
+        q.enqueue("k", {"kind": "human"})
+
+
+def test_chat_task_queue_bypass_on_fresh_session_still_goes_immediate():
+    """bypass=True on a session with nothing active must still return
+    'immediate' — the bypass only affects the pending-cap check."""
+    q, _wq = _make_chat_queue()
+    status = q.enqueue(
+        "fresh", {"kind": "bg_task_completion"}, bypass_backpressure=True,
+    )
+    assert status == "immediate"
 
 
 # ---------------------------------------------------------------------------

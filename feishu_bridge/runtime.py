@@ -309,11 +309,24 @@ class ChatTaskQueue:
         self._pending: dict[str, deque] = {}
         self._lock = threading.Lock()
 
-    def enqueue(self, key: str, item: dict) -> str:
+    def enqueue(
+        self, key: str, item: dict, *, bypass_backpressure: bool = False,
+    ) -> str:
+        """Enqueue `item` for session `key`.
+
+        bypass_backpressure: skip the MAX_PENDING_PER_SESSION check. Used
+        for synthetic bg-task completion turns where dropping the delivery
+        means the user never sees the result. Human messages keep the
+        backpressure so a session can't flood the worker.
+        """
         with self._lock:
             if key in self._active:
                 pending = self._pending.get(key)
-                if pending and len(pending) >= self.MAX_PENDING_PER_SESSION:
+                if (
+                    not bypass_backpressure
+                    and pending
+                    and len(pending) >= self.MAX_PENDING_PER_SESSION
+                ):
                     raise SessionQueueFull(
                         f"Session {key} has {self.MAX_PENDING_PER_SESSION} pending"
                     )

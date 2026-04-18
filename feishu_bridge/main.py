@@ -1016,10 +1016,11 @@ class FeishuBot:
         """Single entry point for queueing a turn into ChatTaskQueue.
 
         kind:
-            'human'              — user-originated message (from _on_message)
+            'human'              — user-originated message (from _on_message);
+                                   subject to MAX_PENDING_PER_SESSION backpressure
             'bg_task_completion' — synthetic turn from bg-task delivery watcher
-                                   (Section 4.5 / 5.3; backpressure bypass lands
-                                   in 5.3)
+                                   (Section 4.5); bypasses backpressure because
+                                   dropping it means the user never sees the result
 
         extras carries kind-specific fields merged on top of the base item
         (thread_id, parent_id, message_id, image_key, reactions, …).
@@ -1027,7 +1028,8 @@ class FeishuBot:
         Returns (status, item) where status is 'queued' or 'immediate' and
         item is the final dict handed to ChatTaskQueue — callers may mutate
         it (e.g. command_handler.add_queued_reaction_to_item writes back the
-        reaction id). Raises SessionQueueFull; callers handle per kind.
+        reaction id). Raises SessionQueueFull for human kind only; bg_task_completion
+        never raises because it bypasses the per-session cap.
         """
         item: dict = {
             "bot_id": self.bot_id,
@@ -1063,7 +1065,10 @@ class FeishuBot:
                 )
             item.update(extras)
         item["_queue_key"] = session_key
-        status = self._chat_queue.enqueue(session_key, item)
+        status = self._chat_queue.enqueue(
+            session_key, item,
+            bypass_backpressure=(kind == "bg_task_completion"),
+        )
         return status, item
 
     def _on_message(self, data):
