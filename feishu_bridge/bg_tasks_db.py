@@ -1029,6 +1029,70 @@ class BgTaskRepo:
                 )
         return True
 
+    def finalise_reaped(
+        self,
+        *,
+        task_id: str,
+        terminal_state: str,
+        reason: str,
+        signal: Optional[str] = None,
+    ) -> bool:
+        """§6.3 Commit B: close out a running task when the bridge itself
+        reaped the orphaned child (wrapper died before writing manifest).
+
+        Contract:
+            - bg_tasks: ``running → terminal_state`` (cancelled | timeout | orphan)
+            - bg_runs: ``finished_at``, ``signal``, ``completion_detected_at`` stamped
+            - ``delivery_state`` → ``'pending'`` when terminal_state is cancelled/
+              timeout (user still expects the completion notification)
+            - ``delivery_state`` → ``'not_ready'`` when terminal_state is orphan
+              (no useful output; bg status surfaces the state directly)
+
+        Raises ``_FinishRace`` if the task row is not in ``running`` state —
+        callers should treat that as "someone else already handled it" and
+        log, not retry.
+        """
+        reap_states = {
+            TaskState.CANCELLED.value,
+            TaskState.TIMEOUT.value,
+            TaskState.ORPHAN.value,
+        }
+        if terminal_state not in reap_states:
+            raise ValueError(
+                f"finalise_reaped requires cancelled|timeout|orphan, got {terminal_state!r}"
+            )
+        deliverable = terminal_state in {
+            TaskState.CANCELLED.value,
+            TaskState.TIMEOUT.value,
+        }
+        now = _now_ms()
+        with _tx(self.conn):
+            cur_task = self.conn.execute(
+                """UPDATE bg_tasks
+                     SET state=?, reason=COALESCE(?, reason),
+                         signal=COALESCE(?, signal), updated_at=?
+                   WHERE id=? AND state='running'""",
+                (terminal_state, reason, signal, now, task_id),
+            )
+            if cur_task.rowcount != 1:
+                raise _FinishRace(
+                    f"finalise_reaped: task {task_id} not running (state race)"
+                )
+            new_delivery = "pending" if deliverable else "not_ready"
+            # bg_runs row may be missing (post_spawn_pre_register — wrapper
+            # died before Phase S committed pid). In that case no row update
+            # happens; task row alone records the orphan outcome. For the
+            # normal path (wrapper died after Phase S), exactly one run row
+            # with finished_at IS NULL exists and we stamp it.
+            self.conn.execute(
+                """UPDATE bg_runs
+                     SET finished_at=?, signal=COALESCE(?, signal),
+                         delivery_state=?, completion_detected_at=?
+                   WHERE task_id=? AND finished_at IS NULL""",
+                (now, signal, new_delivery, now, task_id),
+            )
+        return True
+
     def mark_delivery_state(
         self,
         run_id: int,

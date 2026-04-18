@@ -1215,29 +1215,281 @@ def test_reconcile_preserves_stamped_enqueued_at_rows(short_env, repo):
     assert _delivery_state(repo.conn, run_id) == "enqueued"
 
 
-def test_reconcile_warns_on_running_rows_but_does_not_touch_state(
-    short_env, repo, caplog,
+def test_reconcile_triage_both_dead_no_manifest_marks_orphan(
+    short_env, repo,
 ):
-    """§6.3 deferred to Commit B — running rows must pass through unchanged."""
+    """§6.3 Commit B: wrapper + child both dead, no manifest on disk →
+    bg_tasks state becomes ``orphan`` with reason ``both_died``, bg_runs
+    ``finished_at`` stamped, ``delivery_state='not_ready'``.
+
+    Safety: fake pids 1000/2000 almost certainly don't exist; _verify_triple
+    fails-closed on missing pid, so the row is orphan-marked without any
+    signal being sent (the critical pid-reuse guard).
+    """
     tid = _make_running_task(repo)
 
     sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
-    with caplog.at_level("WARNING", logger="feishu-bridge.bg-supervisor"):
-        stats = sup.reconcile()
+    stats = sup.reconcile()
 
-    assert stats["running_rows_observed"] == 1
+    # Triage reports one orphan; no other branches counted.
+    assert stats["running_orphaned"] == 1
+    assert stats["running_reaped"] == 0
+    assert stats["running_pending_reap"] == 0
+    assert stats["running_attached"] == 0
+    assert stats["running_manifest_applied"] == 0
+
+    row = repo.conn.execute(
+        "SELECT state, reason FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "orphan"
+    assert row["reason"] == "wrapper_and_child_both_died"
+    run = repo.conn.execute(
+        "SELECT finished_at, delivery_state FROM bg_runs WHERE task_id=?",
+        (tid,),
+    ).fetchone()
+    assert run["finished_at"] is not None
+    assert run["delivery_state"] == "not_ready"
+
+
+def test_reconcile_triage_wrapper_alive_keeps_running(
+    short_env, repo, monkeypatch,
+):
+    """Branch A: wrapper verified alive → row stays ``running``, no commits.
+
+    Monkeypatch ``_verify_triple`` to return True the first time (wrapper
+    check) — the child check is never reached because the branch returns
+    early with ``attached``. This also exercises the safety property that
+    _triage_one doesn't call any signal helpers in the attached branch.
+    """
+    from feishu_bridge import bg_supervisor
+
+    tid = _make_running_task(repo)
+    calls = {"triple": 0, "kill": 0}
+
+    def fake_verify(pid, *, expected_start_us, expected_token):
+        calls["triple"] += 1
+        return calls["triple"] == 1  # first call = wrapper; True = alive
+
+    def fake_kill(pgid, **kw):
+        calls["kill"] += 1
+        return "SIGTERM"
+
+    monkeypatch.setattr(bg_supervisor, "_verify_triple", fake_verify)
+    monkeypatch.setattr(bg_supervisor, "_kill_pgid_with_grace", fake_kill)
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["running_attached"] == 1
+    assert calls["kill"] == 0, "must never signal when wrapper is alive"
     row = repo.conn.execute(
         "SELECT state FROM bg_tasks WHERE id=?", (tid,),
     ).fetchone()
-    assert row["state"] == "running", (
-        "§6.3 liveness triage lands in Commit B — until then reconcile must "
-        "leave running rows unchanged, never accidentally SIGKILL a pid-reused "
-        "victim"
+    assert row["state"] == "running"
+
+
+def test_reconcile_triage_reap_on_cancel_requested(
+    short_env, repo, monkeypatch,
+):
+    """Branch D: wrapper dead, child alive triple-verified, cancel_requested
+    set → SIGTERM/KILL sent to child's pgid, terminal state ``cancelled``.
+    """
+    from feishu_bridge import bg_supervisor
+
+    tid = _make_running_task(repo)
+    # Stamp cancel request.
+    repo.conn.execute(
+        "UPDATE bg_tasks SET cancel_requested_at=? WHERE id=?",
+        (int(time.time() * 1000), tid),
     )
-    assert any(
-        "Section 6.3" in rec.message or "liveness triage" in rec.message
-        for rec in caplog.records
-    ), "must WARN that §6.3 is deferred"
+
+    call_order: list[str] = []
+
+    def fake_verify(pid, *, expected_start_us, expected_token):
+        # Two calls per row: wrapper (dead), child (alive).
+        call_order.append(f"verify-{pid}")
+        return pid == 2000  # child alive, wrapper dead
+
+    kills: list[tuple[int, str]] = []
+
+    def fake_kill(pgid, **kw):
+        kills.append((pgid, "SIGTERM"))
+        return "SIGTERM"
+
+    monkeypatch.setattr(bg_supervisor, "_verify_triple", fake_verify)
+    monkeypatch.setattr(bg_supervisor, "_kill_pgid_with_grace", fake_kill)
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["running_reaped"] == 1
+    assert kills == [(2000, "SIGTERM")], (
+        "exactly one signal, targeting the verified child pgid"
+    )
+    row = repo.conn.execute(
+        "SELECT state, reason, signal FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "cancelled"
+    assert row["reason"] == "reaped_by_bridge_after_wrapper_death"
+    assert row["signal"] == "SIGTERM"
+    run = repo.conn.execute(
+        "SELECT delivery_state FROM bg_runs WHERE task_id=?", (tid,),
+    ).fetchone()
+    # Cancelled is user-visible; delivery must surface the outcome.
+    assert run["delivery_state"] == "pending"
+
+
+def test_reconcile_triage_pid_reuse_mismatch_sends_no_signal(
+    short_env, repo, monkeypatch,
+):
+    """Safety invariant: wrapper dead, child pid is live under a DIFFERENT
+    process (token mismatch simulates pid reuse) → NEVER signal. Row
+    orphan-marked with ``both_died``, ``_kill_pgid_with_grace`` not called.
+    """
+    from feishu_bridge import bg_supervisor
+
+    tid = _make_running_task(repo)
+    kills: list[int] = []
+
+    # Both verify_triple calls return False — mirrors "wrapper dead, pid
+    # 2000 belongs to someone else now" (triple checks all fail on reuse).
+    monkeypatch.setattr(
+        bg_supervisor, "_verify_triple",
+        lambda *a, **k: False,
+    )
+    monkeypatch.setattr(
+        bg_supervisor, "_kill_pgid_with_grace",
+        lambda pgid, **kw: kills.append(pgid) or "SIGTERM",
+    )
+    # Also spy on os.killpg directly — belt-and-suspenders.
+    direct_kills: list[int] = []
+    real_killpg = bg_supervisor.os.killpg
+    monkeypatch.setattr(
+        bg_supervisor.os, "killpg",
+        lambda p, s: direct_kills.append(p) or real_killpg(p, 0),
+    )
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert kills == [], "pid-reuse mismatch must never invoke pgid signal path"
+    assert direct_kills == [], "pid-reuse mismatch must never send any signal"
+    assert stats["running_orphaned"] == 1
+    row = repo.conn.execute(
+        "SELECT state, reason FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "orphan"
+    assert row["reason"] == "wrapper_and_child_both_died"
+
+
+def test_reconcile_triage_manifest_applied_on_both_dead(
+    short_env, repo, monkeypatch,
+):
+    """Branch C-ii: wrapper + child dead but wrapper's last-gasp manifest
+    sits on disk → finish_run replays it, row becomes ``completed`` (or
+    whichever terminal state the manifest records), delivery_state=pending.
+    """
+    from feishu_bridge import bg_supervisor
+    import json as _json
+
+    tid = _make_running_task(repo)
+
+    # Drop a completed manifest into active/<tid>/task.json.done.
+    active = Path(short_env["tasks_dir"]) / "active" / tid
+    active.mkdir(parents=True, exist_ok=True)
+    (active / "task.json.done").write_text(_json.dumps({
+        "task_id": tid,
+        "state": "completed",
+        "exit_code": 0,
+        "signal": None,
+        "started_at_ms": int(time.time() * 1000) - 1000,
+        "finished_at_ms": int(time.time() * 1000),
+        "reason": None,
+    }))
+
+    monkeypatch.setattr(
+        bg_supervisor, "_verify_triple", lambda *a, **k: False,
+    )
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["running_manifest_applied"] == 1
+    assert stats["running_orphaned"] == 0
+    row = repo.conn.execute(
+        "SELECT state FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "completed"
+    run = repo.conn.execute(
+        "SELECT finished_at, delivery_state, exit_code FROM bg_runs "
+        "WHERE task_id=?", (tid,),
+    ).fetchone()
+    assert run["finished_at"] is not None
+    assert run["delivery_state"] == "pending"
+    assert run["exit_code"] == 0
+
+
+def test_reconcile_triage_spawns_reaper_for_alive_orphan_child(
+    short_env, repo, monkeypatch,
+):
+    """Branch E: wrapper dead, child alive, no cancel/timeout → reaper
+    thread spawned; row stays ``running`` until the reaper commits later.
+    """
+    from feishu_bridge import bg_supervisor
+
+    tid = _make_running_task(repo)
+
+    # Wrapper dead, child verified alive. No cancel_requested and
+    # timeout_seconds default (1800) shouldn't elapse — started_at is just
+    # set by start_run() to _now_ms().
+    monkeypatch.setattr(
+        bg_supervisor, "_verify_triple",
+        lambda pid, **kw: pid == 2000,
+    )
+
+    spawned: list[int] = []
+
+    def fake_reaper_worker(self, row_dict):
+        # Don't actually run the polling loop — just record that we were
+        # invoked and exit immediately so the thread joins cleanly.
+        spawned.append(int(row_dict["pid"]))
+
+    monkeypatch.setattr(
+        bg_supervisor.BgSupervisor,
+        "_reaper_worker", fake_reaper_worker,
+    )
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    # Join the reaper dict entries so no daemon thread leaks into the next
+    # test. _spawn_reaper already put the thread into _reapers; give its
+    # no-op body a moment to unregister itself via the finally clause.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with sup._reapers_lock:
+            if not sup._reapers:
+                break
+        time.sleep(0.05)
+
+    assert stats["running_pending_reap"] == 1
+    assert spawned == [2000]
+    # Row must remain `running` — reaper hasn't committed yet.
+    row = repo.conn.execute(
+        "SELECT state FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "running"
+
+
+def test_reconcile_triage_handles_empty_table(short_env, repo):
+    """No running rows → all five triage counters zero; reconcile still OK."""
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+    for k in (
+        "running_attached", "running_reaped", "running_pending_reap",
+        "running_orphaned", "running_manifest_applied",
+    ):
+        assert stats[k] == 0
 
 
 def test_reconcile_backfills_manifest_only_active_dir(short_env, repo):
@@ -1413,7 +1665,13 @@ def test_reconcile_returns_stats_dict_with_all_keys(short_env, repo):
         "manifests_replayed",
         "manifest_orphans_created",
         "stale_launching_failed",
-        "running_rows_observed",
+        # §6.3 triage replaced the single `running_rows_observed` counter
+        # with one label per branch (Commit B).
+        "running_attached",
+        "running_reaped",
+        "running_pending_reap",
+        "running_orphaned",
+        "running_manifest_applied",
         "stranded_enqueued_reset",
         "queued_launched",
         "deliveries_handed_off",
@@ -1432,3 +1690,203 @@ def test_reconcile_before_start_is_safe_and_stat_invariants_hold(short_env):
         assert sup.is_running()
     finally:
         sup.stop()
+
+
+# ---------------------------------------------------------------------------
+# §6.3 real-subprocess barrier tests (§7.5 + §7.6)
+#
+# These need libproc (macOS) for μs-precision start_time and /bin/ps -E for
+# env inspection. Skip on non-darwin — those platforms don't have the
+# liveness anchors wired up yet.
+# ---------------------------------------------------------------------------
+
+
+pytestmark_darwin = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="§6.3 liveness triage relies on libproc + ps -E (macOS)",
+)
+
+
+def _spawn_sleep_with_token(token: str, *, seconds: int = 60):
+    """Spawn a Python sleeper with ``BG_TASK_TOKEN=<token>`` in env, in its
+    own process group. Returns the Popen handle — caller MUST terminate it.
+
+    Why not ``/bin/sleep``? On macOS, SIP-protected binaries (``/bin/*``,
+    ``/usr/bin/*``) block ``ps eww`` from reading their env even for the
+    parent process, so triple verification would silently fail. The Python
+    interpreter is user-installed (Homebrew) and therefore not SIP-protected.
+    """
+    env = dict(os.environ)
+    env["BG_TASK_TOKEN"] = token
+    # start_new_session creates a new pgid == pid for clean group signaling.
+    import subprocess as _sp
+    return _sp.Popen(
+        [sys.executable, "-c", f"import time; time.sleep({int(seconds)})"],
+        env=env,
+        start_new_session=True,
+        stdout=_sp.DEVNULL,
+        stderr=_sp.DEVNULL,
+    )
+
+
+def _read_real_start_us(pid: int) -> int:
+    """Shortcut for tests — raises on failure (no fail-closed needed here)."""
+    from feishu_bridge.task_runner import read_proc_start_time_us
+    return int(read_proc_start_time_us(pid))
+
+
+@pytestmark_darwin
+def test_reconcile_barrier_orphan_alive_bridge_reap_cancels_real_child(
+    short_env, repo,
+):
+    """§7.5 barrier ``orphan_alive_bridge_reap``: a real child is alive, its
+    wrapper pid is dead, cancel_requested_at is set → reconcile must reap
+    the child via SIGTERM to its pgid and record
+    ``reaped_by_bridge_after_wrapper_death``.
+
+    Uses the bridge's own pid/start_time as a placeholder "wrapper that was
+    alive but died" — then we ensure the triple-check fails for it by
+    using a token that isn't in our env (the bridge test process has no
+    BG_TASK_TOKEN, so verify_triple returns False on the wrapper).
+    """
+    token = uuid.uuid4().hex
+    child = _spawn_sleep_with_token(token)
+    try:
+        # Wait briefly for /bin/sleep to actually start so its env is
+        # visible to /bin/ps -E.
+        time.sleep(0.2)
+        child_start = _read_real_start_us(child.pid)
+
+        # Insert a running row: wrapper = current test process (no token in
+        # its env → triple fails → wrapper treated as "dead"); child = real
+        # sleep process (triple succeeds).
+        tid = repo.insert_task(
+            chat_id="oc_barrier", session_id="sess_barrier",
+            command_argv=["sleep", "60"], on_done_prompt="done",
+        )
+        assert repo.claim_queued_cas(tid, bridge_instance_id="b1")
+        run_id = repo.start_run(
+            task_id=tid, runner_token=token,
+            wrapper_pid=os.getpid(), wrapper_start_time_us=_read_real_start_us(
+                os.getpid(),
+            ),
+        )
+        repo.attach_child(
+            run_id=run_id, task_id=tid, pid=child.pid, pgid=child.pid,
+            process_start_time_us=child_start,
+        )
+        # Cancel request so triage picks the reap-now branch.
+        repo.conn.execute(
+            "UPDATE bg_tasks SET cancel_requested_at=? WHERE id=?",
+            (int(time.time() * 1000), tid),
+        )
+
+        sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+        stats = sup.reconcile()
+
+        assert stats["running_reaped"] == 1, stats
+        # Sleep should be dead; poll a bit to tolerate SIGTERM delivery latency.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and child.poll() is None:
+            time.sleep(0.05)
+        assert child.poll() is not None, "child survived reap"
+
+        row = repo.conn.execute(
+            "SELECT state, reason, signal FROM bg_tasks WHERE id=?", (tid,),
+        ).fetchone()
+        assert row["state"] == "cancelled"
+        assert row["reason"] == "reaped_by_bridge_after_wrapper_death"
+        assert row["signal"] in {"SIGTERM", "SIGKILL"}
+    finally:
+        if child.poll() is None:
+            try:
+                os.killpg(child.pid, 9)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=2.0)
+
+
+@pytestmark_darwin
+def test_reconcile_barrier_pid_reuse_sends_no_signal_to_victim(
+    short_env, repo,
+):
+    """§7.6 pid-reuse safety: DB row claims child pid=X with token=A, but
+    pid X currently runs a DIFFERENT process (no BG_TASK_TOKEN=A in its
+    env). Triple verification MUST fail → zero signals delivered → the
+    innocent victim process must survive untouched.
+    """
+    # Victim: real sleep 60 with token B (simulating pid reuse under a
+    # different identity). Our DB row will reference this pid but with
+    # token A — the mismatch triggers the pid-reuse guard.
+    victim_token = uuid.uuid4().hex
+    expected_token = uuid.uuid4().hex  # the token the row *thinks* it owns
+    victim = _spawn_sleep_with_token(victim_token)
+    try:
+        time.sleep(0.2)
+        victim_start = _read_real_start_us(victim.pid)
+
+        tid = repo.insert_task(
+            chat_id="oc_reuse", session_id="sess_reuse",
+            command_argv=["sleep", "60"], on_done_prompt="done",
+        )
+        assert repo.claim_queued_cas(tid, bridge_instance_id="b1")
+        run_id = repo.start_run(
+            task_id=tid, runner_token=expected_token,
+            wrapper_pid=1,  # init process — alive but our token isn't in its env
+            wrapper_start_time_us=1,  # guaranteed mismatch
+        )
+        repo.attach_child(
+            run_id=run_id, task_id=tid,
+            pid=victim.pid, pgid=victim.pid,
+            process_start_time_us=victim_start,  # correct start — only token mismatches
+        )
+        # Cancel requested → if the guard fails, the bridge would try to
+        # reap the victim. That's exactly the scenario we're defending.
+        repo.conn.execute(
+            "UPDATE bg_tasks SET cancel_requested_at=? WHERE id=?",
+            (int(time.time() * 1000), tid),
+        )
+
+        # Spy on killpg so we can prove zero signals were sent. Monkeypatch
+        # at the module level so BOTH our helper (`_kill_pgid_with_grace`)
+        # and any accidental direct caller are caught.
+        from feishu_bridge import bg_supervisor
+        kill_calls: list[tuple[int, int]] = []
+        real_killpg = bg_supervisor.os.killpg
+
+        def spy_killpg(pid, sig):
+            kill_calls.append((pid, int(sig)))
+            # Never actually signal — this test must not race the victim
+            # dying from a legitimately-issued signal.
+            return None
+
+        try:
+            bg_supervisor.os.killpg = spy_killpg  # type: ignore[assignment]
+
+            sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+            stats = sup.reconcile()
+        finally:
+            bg_supervisor.os.killpg = real_killpg  # type: ignore[assignment]
+
+        # The core safety assertion: absolutely no signals sent.
+        assert kill_calls == [], (
+            f"pid-reuse guard breached — killpg called {kill_calls}"
+        )
+        # Victim must still be running.
+        assert victim.poll() is None, "victim process should be untouched"
+        # DB should record orphan (no signal committed).
+        assert stats["running_orphaned"] == 1, stats
+        row = repo.conn.execute(
+            "SELECT state, signal FROM bg_tasks WHERE id=?", (tid,),
+        ).fetchone()
+        assert row["state"] == "orphan"
+        assert row["signal"] is None, (
+            "orphan row must not record a signal — none was sent"
+        )
+    finally:
+        if victim.poll() is None:
+            try:
+                os.killpg(victim.pid, 9)
+            except ProcessLookupError:
+                pass
+            victim.wait(timeout=2.0)

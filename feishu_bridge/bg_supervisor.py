@@ -16,9 +16,14 @@ See .specs/changes/feishu-bridge-bg-tasks/design.md §UDS Wake Protocol and
 
 from __future__ import annotations
 
+import base64
+import binascii
 import errno
+import json
 import logging
 import os
+import re
+import signal as _signal
 import socket
 import subprocess
 import sys
@@ -31,6 +36,8 @@ from typing import Any, Callable, Optional
 from feishu_bridge.bg_synthetic_turn import build_synthetic_turn
 from feishu_bridge.bg_tasks_db import (
     BgTaskRepo,
+    TaskState,
+    _FinishRace,
     connect,
     init_db,
     integrity_check_and_maybe_quarantine,
@@ -70,6 +77,282 @@ _STALE_LAUNCHING_MS = 30 * 1000
 # the "terminal" rows that will never be delivered without operator
 # intervention.
 _DELIVERY_ATTEMPT_CAP = 10
+
+# §6.3 reap tuning: grace between SIGTERM and SIGKILL mirrors wrapper Phase W.
+_REAP_SIGTERM_GRACE_S = 5.0
+_REAP_POLL_INTERVAL_S = 0.5
+# Reaper thread poll cadence when bridge takes over a still-running orphan.
+_REAPER_POLL_INTERVAL_S = 1.0
+# Max reaper threads a single reconcile() may spawn. A huge backlog of orphans
+# shouldn't flood the process with watcher threads; the rest are left in
+# running state and picked up on the next boot (or cancel/timeout trigger).
+_REAPER_MAX_THREADS = 32
+
+# uuid4 hex nonce injected as BG_TASK_TOKEN into the child env. Anchor the
+# regex tightly — any looser match risks a partial collision mis-identifying
+# an unrelated process under `ps -E` (which dumps the full environment block,
+# not just our token).
+_RUNNER_TOKEN_RE = re.compile(r"BG_TASK_TOKEN=([0-9a-f]{32})")
+
+# §6.3 reap reasons — keep string literals in one place so tests and reports
+# can assert on them without re-inventing the vocabulary.
+_REAP_REASON_WRAPPER_DIED_POST_REGISTER = "reaped_by_bridge_after_wrapper_death"
+_REAP_REASON_WRAPPER_DIED_PRE_REGISTER = "wrapper_died_pre_register"
+_REAP_REASON_BOTH_DIED = "wrapper_and_child_both_died"
+_REAP_REASON_TIMEOUT = "reaped_by_bridge_timeout_after_wrapper_death"
+
+
+# ---------------------------------------------------------------------------
+# §6.3 identity verification helpers
+# ---------------------------------------------------------------------------
+#
+# These are intentionally module-level pure-ish functions so the triage logic
+# can unit-test them via ``monkeypatch.setattr(bg_supervisor, "_fn", ...)``
+# without needing subprocess plumbing in every test.
+#
+# Contract, rigorously: every helper returns ``None`` / ``False`` on any
+# failure mode (pid gone, EPERM, parse failure, OS not supported). The
+# triage code treats "can't verify" identically to "mismatch" — ``mark
+# orphan, no signal``. This is the design's safety default: pid reuse MUST
+# NOT be able to sneak a SIGKILL onto an unrelated process, so helpers fail
+# closed and the caller's default branch is ``no signal``.
+
+
+def _proc_start_time_us(pid: int) -> Optional[int]:
+    """Return ``pid``'s μs-precision start time, or ``None`` on any failure.
+
+    Wraps ``task_runner.read_proc_start_time_us`` (libproc.proc_pidinfo on
+    macOS) with fail-closed semantics. The wrapper itself *raises* OSError
+    intentionally for its own pre-mortem self-check; the reconciler cannot
+    afford to abort, so this wrapper swallows every error into ``None``.
+
+    Linux / other platforms: returns ``None`` (no μs-precision API available,
+    triage will mark every running row as "can't verify" → orphan). That's
+    intentional: deploying background tasks on Linux requires a follow-up
+    design for ``/proc/<pid>/stat`` parsing.
+    """
+    try:
+        # Deferred import so non-darwin platforms (CI linters) don't choke at
+        # import time — task_runner only supports macOS libproc.
+        from feishu_bridge.task_runner import (
+            read_proc_start_time_us as _read_us,
+        )
+    except Exception:
+        return None
+    try:
+        return int(_read_us(int(pid)))
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+    except Exception:
+        # Defensive: libproc wrapper could surface unexpected ctypes errors.
+        # A reconciler that crashes here would leave every running task
+        # stranded — fail closed instead.
+        log.debug("bg reconcile: _proc_start_time_us(%r) unexpected error",
+                  pid, exc_info=True)
+        return None
+
+
+def _read_proc_env_token(pid: int, *, timeout_s: float = 2.0) -> Optional[str]:
+    """Extract ``BG_TASK_TOKEN`` from ``pid``'s environment via ``ps e``.
+
+    ``ps eww -p <pid>`` dumps the command line *followed by* the entire
+    environment block on macOS (BSD bundled syntax: e=env, ww=wide). We
+    regex-match the uuid-hex shape strictly so an attacker cannot smuggle
+    a shorter token that happens to share a prefix.
+
+    macOS SIP caveat: env of SIP-protected binaries (e.g. /bin/sleep,
+    /usr/bin/*) is unreadable even to the parent process. Production
+    runners exec ``claude`` (non-SIP) so env is visible; tests that spawn
+    /bin/sleep will fail this lookup.
+
+    Returns ``None`` if the pid is gone, ``ps`` fails, or the token is
+    absent. Never raises.
+    """
+    try:
+        proc = subprocess.run(
+            ["/bin/ps", "eww", "-p", str(int(pid))],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        # Non-zero usually means the pid vanished between the caller's
+        # liveness check and our ps call. That's a race, not an error.
+        return None
+    m = _RUNNER_TOKEN_RE.search(proc.stdout or "")
+    return m.group(1) if m else None
+
+
+def _verify_triple(
+    pid: Optional[int],
+    *,
+    expected_start_us: Optional[int],
+    expected_token: Optional[str],
+) -> bool:
+    """Return True iff all three identity anchors match the live process.
+
+    Any input being ``None`` / ``0`` / empty → False (spec bug or missing
+    column — we refuse to signal on incomplete data). Any anchor
+    disagreeing → False. Only three-way agreement returns True.
+    """
+    if not pid or pid <= 0:
+        return False
+    if not expected_start_us or expected_start_us <= 0:
+        return False
+    if not expected_token:
+        return False
+    # Liveness + ownership are implicit in proc_pidinfo: if the pid is gone
+    # or belongs to another uid, _proc_start_time_us returns None.
+    live_start = _proc_start_time_us(pid)
+    if live_start is None:
+        return False
+    if int(live_start) != int(expected_start_us):
+        return False
+    live_token = _read_proc_env_token(pid)
+    if live_token is None:
+        return False
+    return live_token == expected_token
+
+
+def _scan_ps_for_token(expected_token: str, *, timeout_s: float = 3.0) -> Optional[tuple[int, int]]:
+    """Full ``ps axeww -o pid=,pgid=,command=`` scan for the
+    post_spawn_pre_register window: wrapper died between ``Popen()`` and the
+    Phase S single-transaction that stamps pid/pgid on ``bg_runs``.
+
+    The child is alive (wrapper spawned it with ``start_new_session=True`` so it
+    has its own pgid) but the DB row carries no pid. The only anchor left is
+    the runner_token in env.
+
+    ``axeww`` (BSD bundled syntax): a=all users, x=processes without tty,
+    e=env, ww=wide. ``-o pid=,pgid=,command=`` still appends env to the
+    command column when ``e`` is in the flag cluster, but the ``a`` and ``x``
+    flags are required — a newly spawned child with start_new_session=True
+    has no controlling tty and would be skipped by default ps output.
+
+    Returns ``(pid, pgid)`` of the matching process, or ``None`` if no match.
+    Multiple matches would be a token-collision bug — we return the first and
+    log a warning (uuid4 collision probability is ~0; a repeat means the same
+    token was injected twice, which is a wrapper implementation bug).
+    """
+    if not expected_token or not _RUNNER_TOKEN_RE.fullmatch(
+        f"BG_TASK_TOKEN={expected_token}",
+    ):
+        return None
+    try:
+        proc = subprocess.run(
+            ["/bin/ps", "axeww", "-o", "pid=,pgid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    matches: list[tuple[int, int]] = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Rough split: first field is pid, second is pgid, rest is command+env.
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            pgid = int(parts[1])
+        except ValueError:
+            continue
+        if _RUNNER_TOKEN_RE.search(parts[2]):
+            m = _RUNNER_TOKEN_RE.search(parts[2])
+            if m and m.group(1) == expected_token:
+                matches.append((pid, pgid))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        log.warning(
+            "bg reconcile: runner_token %s matched %d processes — "
+            "using first; investigate token collision",
+            expected_token[:8], len(matches),
+        )
+    return matches[0]
+
+
+def _decode_b64_tail(
+    obj: Any, field: str, manifest_path: str,
+) -> Optional[bytes]:
+    """Strict base64 decode mirroring bg_tasks_db._replay_completed_manifest's
+    tail handling. Strict-mode b64 means a junk manifest surfaces as a WARN
+    with the field name, not a silent data-mangling.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, bytes):
+        return obj
+    if isinstance(obj, str):
+        try:
+            return base64.b64decode(obj, validate=True)
+        except (ValueError, TypeError, binascii.Error) as exc:
+            log.warning(
+                "bg triage: manifest %s has corrupt %s (base64): %s — "
+                "storing NULL", manifest_path, field, exc,
+            )
+            return None
+    log.warning(
+        "bg triage: manifest %s %s has unexpected type %s — storing NULL",
+        manifest_path, field, type(obj).__name__,
+    )
+    return None
+
+
+def _kill_pgid_with_grace(
+    pgid: int,
+    *,
+    grace_s: float = _REAP_SIGTERM_GRACE_S,
+    poll_s: float = _REAP_POLL_INTERVAL_S,
+) -> str:
+    """SIGTERM → wait → SIGKILL. Returns final signal name actually delivered.
+
+    ``pgid`` must have been verified via ``_verify_triple`` on the leader
+    before calling this. The function itself does no identity check; it
+    assumes the caller has already established that the pgid is safe to
+    signal.
+
+    Returns ``'SIGTERM'`` if the group ended during the grace window,
+    ``'SIGKILL'`` if the fallback escalation fired.
+    """
+    try:
+        os.killpg(pgid, _signal.SIGTERM)
+    except ProcessLookupError:
+        return "SIGTERM"  # already gone; treat as successful graceful reap
+    except PermissionError:
+        # EPERM on killpg with valid pgid on same uid shouldn't happen; log
+        # and skip escalation (we'd just get another EPERM).
+        log.warning("bg reconcile: EPERM on killpg(%d, SIGTERM)", pgid)
+        return "SIGTERM"
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return "SIGTERM"
+        except PermissionError:
+            # Group is gone to us (it may still exist under another owner,
+            # but that means pid reuse happened during grace — absolutely
+            # must not escalate). Treat as gone.
+            return "SIGTERM"
+        time.sleep(poll_s)
+    try:
+        os.killpg(pgid, _signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        log.warning("bg reconcile: EPERM on killpg(%d, SIGKILL) escalation", pgid)
+    return "SIGKILL"
 
 
 class BgSupervisor:
@@ -125,6 +408,13 @@ class BgSupervisor:
         self._listener_thread: Optional[threading.Thread] = None
         self._poller_thread: Optional[threading.Thread] = None
         self._start_lock = threading.Lock()
+
+        # §6.3 reaper threads — one per orphaned child whose wrapper died but
+        # whose child is still alive with no cancel/timeout trigger yet. Each
+        # polls ``os.kill(pid, 0)`` until the child exits, then commits the
+        # terminal row. Spawned from reconcile(); shut down via stop().
+        self._reapers: dict[int, threading.Thread] = {}
+        self._reapers_lock = threading.Lock()
         # Only True when *this* instance successfully bound the socket — used
         # to prevent stop() from unlinking a peer's live socket in fallback
         # poller-only mode (addresses review finding #2).
@@ -219,6 +509,16 @@ class BgSupervisor:
             self._listener_thread = None
             self._poller_thread = None
 
+            # §6.3: reaper threads check ``_stop_evt`` every poll tick.
+            # Snapshot under lock, join without lock to avoid deadlock if a
+            # reaper thread happens to call back into the supervisor.
+            with self._reapers_lock:
+                reapers = list(self._reapers.values())
+                self._reapers.clear()
+            for t in reapers:
+                if t.is_alive():
+                    t.join(timeout=timeout)
+
             # Only unlink the socket file if THIS instance bound it. In
             # poller-only fallback mode another bridge owns it; unlinking
             # would break that peer (review finding #2).
@@ -272,7 +572,13 @@ class BgSupervisor:
             "manifests_replayed": 0,
             "manifest_orphans_created": 0,
             "stale_launching_failed": 0,
-            "running_rows_observed": 0,
+            # §6.3 triage counters (all five branches tallied by
+            # _triage_running_rows; zeros kept for stable log shape).
+            "running_attached": 0,
+            "running_reaped": 0,
+            "running_pending_reap": 0,
+            "running_orphaned": 0,
+            "running_manifest_applied": 0,
             "stranded_enqueued_reset": 0,
             "queued_launched": 0,
             "deliveries_handed_off": 0,
@@ -331,11 +637,15 @@ class BgSupervisor:
             except Exception:
                 log.exception("bg reconcile: stale launching reap failed")
 
-            # Step 3: §6.3 running-liveness — WARN stub until Commit B.
+            # Step 3: §6.3 running-liveness triage (Commit B). Per-row
+            # isolation inside _triage_running_rows; an unexpected outer
+            # failure here means the query itself exploded.
             try:
-                stats["running_rows_observed"] = self._warn_running_rows(repo)
+                triage_stats = self._triage_running_rows(repo)
+                for k, v in triage_stats.items():
+                    stats[f"running_{k}"] = v
             except Exception:
-                log.exception("bg reconcile: running-row warn stub failed")
+                log.exception("bg reconcile: running-row triage failed")
 
             # Step 4: §6.6 manifest-only backfill (delta catch-up; idempotent
             # on a live DB because _replay_completed_manifest short-circuits
@@ -380,11 +690,17 @@ class BgSupervisor:
                 log.exception("bg reconcile: delivery outbox scan failed")
 
             log.info(
-                "bg reconcile done: launching→failed=%d running-warned=%d "
+                "bg reconcile done: launching→failed=%d "
+                "running[attached=%d reaped=%d pending_reap=%d "
+                "orphaned=%d manifest_applied=%d] "
                 "stranded-reset=%d manifests=%d orphans=%d queued=%d "
                 "deliveries=%d attempts-exhausted=%d",
                 stats["stale_launching_failed"],
-                stats["running_rows_observed"],
+                stats["running_attached"],
+                stats["running_reaped"],
+                stats["running_pending_reap"],
+                stats["running_orphaned"],
+                stats["running_manifest_applied"],
                 stats["stranded_enqueued_reset"],
                 stats["manifests_replayed"],
                 stats["manifest_orphans_created"],
@@ -421,25 +737,464 @@ class BgSupervisor:
         )
         return cur.rowcount or 0
 
-    def _warn_running_rows(self, repo: BgTaskRepo) -> int:
-        """§6.3 stub — Commit B ships the triple-verification triage.
+    # ---- §6.3 running-row triage (Commit B) ---------------------------------
 
-        Until then we log (at WARN) how many ``running`` rows survived across
-        the boot so operators can spot a stuck reconciler. Every row here is
-        a candidate for orphan-alive-bridge-reap; the current version leaves
-        them alone rather than risk SIGKILL to a reused pid.
+    def _triage_running_rows(self, repo: BgTaskRepo) -> dict[str, int]:
+        """§6.3 full triage: for every ``running`` bg_task joined with an open
+        ``bg_runs`` row, classify by wrapper/child liveness and act:
+
+        Returned dict keys (all populated, zero when unused — callers can
+        log a fixed shape):
+            attached         — wrapper alive (or reaper-cap exceeded); row
+                               left in ``running``.
+            reaped           — bridge issued SIGTERM/KILL and committed a
+                               terminal state this tick (cancel / timeout /
+                               pre-register orphan with alive child).
+            pending_reap     — reaper thread spawned to watch an alive child
+                               after wrapper death; terminal commit deferred.
+            orphaned         — both wrapper and child dead (or pre-register
+                               with no token match); row marked ``orphan``.
+            manifest_applied — wrapper + child dead, but wrapper's last-gasp
+                               manifest was on disk; ``finish_run`` replayed
+                               it instead of orphan-marking.
+
+        Safety invariant: every ``killpg`` is preceded by ``_verify_triple``
+        or ``_scan_ps_for_token`` — on any ambiguity these return fail-closed
+        (None/False), and the caller falls through to the no-signal orphan
+        branch. Pid reuse cannot cause a stray signal here.
         """
-        count = repo.conn.execute(
-            "SELECT COUNT(*) FROM bg_tasks WHERE state='running'",
-        ).fetchone()[0]
-        if count:
-            log.warning(
-                "bg reconcile: %d running row(s) carried across boot — "
-                "Section 6.3 liveness triage not yet active (Commit B scope); "
-                "rows remain untouched until timeout or explicit cancel",
-                count,
+        stats = {
+            "attached": 0,
+            "reaped": 0,
+            "pending_reap": 0,
+            "orphaned": 0,
+            "manifest_applied": 0,
+        }
+        rows = repo.conn.execute(
+            """SELECT t.id               AS task_id,
+                      t.cancel_requested_at,
+                      t.timeout_seconds,
+                      r.id               AS run_id,
+                      r.pid,
+                      r.pgid,
+                      r.process_start_time_us,
+                      r.wrapper_pid,
+                      r.wrapper_start_time_us,
+                      r.runner_token,
+                      r.started_at
+                 FROM bg_tasks t
+                 JOIN bg_runs  r ON r.task_id = t.id
+                WHERE t.state = 'running' AND r.finished_at IS NULL""",
+        ).fetchall()
+
+        for row in rows:
+            try:
+                label = self._triage_one(repo, row)
+            except Exception:
+                # Per-row isolation: one bad row must never strand the rest.
+                log.exception(
+                    "bg triage: task %s raised — leaving row in running",
+                    row["task_id"],
+                )
+                label = "attached"
+            stats[label] = stats.get(label, 0) + 1
+        return stats
+
+    def _triage_one(self, repo: BgTaskRepo, row: Any) -> str:
+        """Classify one running row and execute its branch. Returns the
+        stats label (``attached|reaped|pending_reap|orphaned|
+        manifest_applied``).
+
+        Branches map onto design.md §Startup Reconciler step 3:
+
+            wrapper_alive → attached (skip; wrapper still owns lifecycle)
+            wrapper_dead + pid IS NULL → post_spawn_pre_register:
+                ps -E scan for token:
+                    match      → reap pgid → orphan (reason=pre_register)
+                    no match   → orphan, no signal
+            wrapper_dead + child_dead:
+                manifest exists → finish_run from manifest
+                manifest absent → orphan (reason=both_died)
+            wrapper_dead + child_alive:
+                cancel_requested or timeout exceeded → reap now
+                else → spawn reaper thread (or "attached" if cap reached)
+        """
+        tid = row["task_id"]
+
+        # ---- wrapper liveness -------------------------------------------
+        wrapper_pid = row["wrapper_pid"]
+        wrapper_start_us = row["wrapper_start_time_us"]
+        token = row["runner_token"]
+
+        if _verify_triple(
+            wrapper_pid,
+            expected_start_us=wrapper_start_us,
+            expected_token=token,
+        ):
+            log.debug(
+                "bg triage: task=%s wrapper pid=%s alive — skip",
+                tid, wrapper_pid,
             )
-        return int(count)
+            return "attached"
+
+        # ---- wrapper is dead (or unverifiable); check child -------------
+        child_pid = row["pid"]
+
+        # Branch: post_spawn_pre_register — wrapper died between Popen and
+        # Phase S, so pid/pgid never made it to bg_runs. Only anchor left
+        # is the runner_token injected via BG_TASK_TOKEN env.
+        if not child_pid or int(child_pid) <= 0:
+            return self._triage_pre_register(repo, tid, token)
+
+        # Verify child identity; fail-closed on any mismatch.
+        child_alive = _verify_triple(
+            int(child_pid),
+            expected_start_us=row["process_start_time_us"],
+            expected_token=token,
+        )
+        if not child_alive:
+            return self._triage_both_dead(repo, row)
+
+        # ---- child is alive; evaluate triggers --------------------------
+        cancel_at = row["cancel_requested_at"]
+        started_at_ms = int(row["started_at"] or 0)
+        timeout_s = int(row["timeout_seconds"] or 0)
+        # wall-clock elapsed since wrapper's Phase S commit. started_at is
+        # ms-epoch (set by start_run); compare via wall time since we're
+        # across boots (monotonic doesn't survive).
+        now_ms = int(time.time() * 1000)
+        timed_out = (
+            timeout_s > 0
+            and started_at_ms > 0
+            and (now_ms - started_at_ms) >= timeout_s * 1000
+        )
+
+        if cancel_at is not None or timed_out:
+            terminal = (
+                TaskState.CANCELLED.value if cancel_at is not None
+                else TaskState.TIMEOUT.value
+            )
+            reason = (
+                _REAP_REASON_WRAPPER_DIED_POST_REGISTER if cancel_at is not None
+                else _REAP_REASON_TIMEOUT
+            )
+            return self._reap_now(
+                repo, tid, int(row["pgid"] or 0), terminal, reason,
+            )
+
+        # Child alive, no trigger — bridge takes over via reaper thread.
+        spawned = self._spawn_reaper(row)
+        if spawned:
+            log.info(
+                "bg triage: task=%s wrapper dead, child pid=%d alive — "
+                "reaper spawned (will commit on child exit)",
+                tid, int(child_pid),
+            )
+            return "pending_reap"
+        log.warning(
+            "bg triage: task=%s wrapper dead, child pid=%d alive — "
+            "reaper cap (%d) reached; row left in running, next boot retries",
+            tid, int(child_pid), _REAPER_MAX_THREADS,
+        )
+        return "attached"
+
+    def _triage_pre_register(
+        self, repo: BgTaskRepo, task_id: str, token: Optional[str],
+    ) -> str:
+        """Wrapper died before Phase S committed pid. Scan ps for token."""
+        if not token:
+            # No token means row predates Commit A's runner_token column or
+            # someone truncated it. Fail-closed → orphan, no signal.
+            self._mark_orphan(
+                repo, task_id, _REAP_REASON_WRAPPER_DIED_PRE_REGISTER,
+            )
+            return "orphaned"
+        scan = _scan_ps_for_token(token)
+        if scan is None:
+            log.info(
+                "bg triage: task=%s pre-register orphan, no live token match "
+                "— marking orphan (no signal)",
+                task_id,
+            )
+            self._mark_orphan(
+                repo, task_id, _REAP_REASON_WRAPPER_DIED_PRE_REGISTER,
+            )
+            return "orphaned"
+        found_pid, found_pgid = scan
+        log.warning(
+            "bg triage: task=%s pre-register orphan; ps matched pid=%d "
+            "pgid=%d — reaping and marking orphan",
+            task_id, found_pid, found_pgid,
+        )
+        sig = _kill_pgid_with_grace(found_pgid)
+        try:
+            repo.finalise_reaped(
+                task_id=task_id,
+                terminal_state=TaskState.ORPHAN.value,
+                reason=_REAP_REASON_WRAPPER_DIED_PRE_REGISTER,
+                signal=sig,
+            )
+        except _FinishRace as exc:
+            log.info("bg triage: task=%s pre-register race: %s", task_id, exc)
+            return "attached"
+        return "reaped"
+
+    def _triage_both_dead(self, repo: BgTaskRepo, row: Any) -> str:
+        """Wrapper + child both dead. Prefer manifest replay, else orphan."""
+        tid = row["task_id"]
+        manifest = self._load_task_manifest(tid)
+        if manifest is not None:
+            if self._apply_manifest_to_running(repo, row, manifest):
+                log.info(
+                    "bg triage: task=%s wrapper+child dead, applied "
+                    "terminal manifest", tid,
+                )
+                return "manifest_applied"
+        log.warning(
+            "bg triage: task=%s wrapper+child dead, no usable manifest "
+            "— marking orphan", tid,
+        )
+        self._mark_orphan(repo, tid, _REAP_REASON_BOTH_DIED)
+        return "orphaned"
+
+    def _reap_now(
+        self, repo: BgTaskRepo, task_id: str, pgid: int,
+        terminal: str, reason: str,
+    ) -> str:
+        """Send SIGTERM→SIGKILL to a verified pgid, commit terminal state."""
+        if pgid <= 0:
+            log.warning(
+                "bg triage: task=%s %s trigger but pgid=%d — orphan, no signal",
+                task_id, terminal, pgid,
+            )
+            self._mark_orphan(repo, task_id, reason)
+            return "orphaned"
+        sig = _kill_pgid_with_grace(pgid)
+        try:
+            repo.finalise_reaped(
+                task_id=task_id,
+                terminal_state=terminal,
+                reason=reason,
+                signal=sig,
+            )
+        except _FinishRace as exc:
+            log.info(
+                "bg triage: task=%s reap race (%s) — someone else committed",
+                task_id, exc,
+            )
+            return "attached"
+        log.warning(
+            "bg triage: task=%s reaped wrapper-dead child (pgid=%d, sig=%s, "
+            "terminal=%s)", task_id, pgid, sig, terminal,
+        )
+        return "reaped"
+
+    def _mark_orphan(
+        self, repo: BgTaskRepo, task_id: str, reason: str,
+    ) -> None:
+        """Best-effort orphan commit — swallow _FinishRace (someone else won)."""
+        try:
+            repo.finalise_reaped(
+                task_id=task_id,
+                terminal_state=TaskState.ORPHAN.value,
+                reason=reason,
+            )
+        except _FinishRace as exc:
+            log.info(
+                "bg triage: task=%s orphan commit race (%s)", task_id, exc,
+            )
+
+    # ---- §6.3 reaper thread (pending reap) ----------------------------------
+
+    def _spawn_reaper(self, row: Any) -> bool:
+        """Start a daemon thread that polls ``os.kill(pid, 0)`` until the
+        child exits, then commits the terminal row. Returns False if the
+        per-reconcile cap is already reached; callers then leave the row
+        in ``running`` for the next boot.
+
+        Idempotency: ``_reapers`` is keyed by pid so repeated ticks within
+        the same reconcile (or overlapping reconciles) won't double-watch
+        the same child. A pid-reuse between ticks would key the new child
+        under the same dict entry — but by that point the original child
+        is gone, the old reaper will observe ``ProcessLookupError`` and
+        exit, and the new reconcile tick's _verify_triple will fail, so
+        the stale dict entry is reaped at worst one interval later.
+        """
+        pid = int(row["pid"] or 0)
+        if pid <= 0:
+            return False
+        with self._reapers_lock:
+            if len(self._reapers) >= _REAPER_MAX_THREADS:
+                return False
+            if pid in self._reapers:
+                return True  # already watching — treat as success
+            t = threading.Thread(
+                target=self._reaper_worker,
+                args=(dict(row),),
+                name=f"bg-reaper-{str(row['task_id'])[:8]}",
+                daemon=True,
+            )
+            self._reapers[pid] = t
+        t.start()
+        return True
+
+    def _reaper_worker(self, row: dict) -> None:
+        """Thread body: poll the child's pid; on exit, commit terminal row.
+
+        - ``ProcessLookupError`` → child gone cleanly; read manifest and
+          commit (or orphan if missing).
+        - ``PermissionError`` (EPERM) → pid reuse under another uid; abort
+          without commit. The next reconcile cycle will re-triage.
+        - ``_stop_evt.is_set()`` → supervisor shutting down; leave row in
+          ``running`` so the next boot picks it up. Do NOT commit a
+          half-observed state.
+        """
+        pid = int(row["pid"])
+        task_id = row["task_id"]
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break  # child exited normally
+                except PermissionError:
+                    log.warning(
+                        "bg reaper[%s]: pid %d EPERM — pid reuse suspected; "
+                        "aborting without DB commit", task_id, pid,
+                    )
+                    return
+                if self._stop_evt.wait(_REAPER_POLL_INTERVAL_S):
+                    return
+            # Child exited. Commit terminal row on a private connection —
+            # the supervisor's main conn is owned by reconcile()'s thread.
+            conn = None
+            try:
+                conn = init_db(self._db_path)
+                repo = BgTaskRepo(conn)
+                manifest = self._load_task_manifest(task_id)
+                if manifest is not None:
+                    if self._apply_manifest_to_running(repo, row, manifest):
+                        log.info(
+                            "bg reaper[%s]: manifest applied post-exit",
+                            task_id,
+                        )
+                        return
+                # No manifest or apply refused: orphan.
+                try:
+                    repo.finalise_reaped(
+                        task_id=task_id,
+                        terminal_state=TaskState.ORPHAN.value,
+                        reason="wrapper_dead_child_died_no_manifest",
+                    )
+                    log.warning(
+                        "bg reaper[%s]: child exited, no manifest — "
+                        "marked orphan", task_id,
+                    )
+                except _FinishRace as exc:
+                    log.info(
+                        "bg reaper[%s]: orphan commit race (%s)",
+                        task_id, exc,
+                    )
+            except Exception:
+                log.exception(
+                    "bg reaper[%s]: unexpected error committing terminal",
+                    task_id,
+                )
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        finally:
+            with self._reapers_lock:
+                self._reapers.pop(pid, None)
+
+    # ---- §6.3 manifest helpers ---------------------------------------------
+
+    def _load_task_manifest(self, task_id: str) -> Optional[dict]:
+        """Try ``active/<tid>/task.json.done`` then ``completed/<tid>/...``.
+
+        Refuses symlinks (matches _is_trusted_task_dir semantics). Returns
+        parsed dict or None on missing/corrupt.
+        """
+        for subdir in ("active", "completed"):
+            p = self._tasks_dir / subdir / task_id / "task.json.done"
+            try:
+                if p.is_symlink() or not p.is_file():
+                    continue
+                return json.loads(p.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                log.warning(
+                    "bg triage: manifest %s unreadable: %s", p, exc,
+                )
+                return None
+        return None
+
+    def _apply_manifest_to_running(
+        self, repo: BgTaskRepo, row: Any, manifest: dict,
+    ) -> bool:
+        """Apply a wrapper-committed manifest to an existing running row via
+        ``finish_run``. Returns False on any refusal (state not terminal,
+        _FinishRace, ValueError) — caller falls back to orphan.
+        """
+        state = manifest.get("state")
+        if not isinstance(state, str) or not TaskState.is_terminal(state):
+            log.warning(
+                "bg triage: manifest state=%r not terminal — skipping apply",
+                state,
+            )
+            return False
+
+        # Find the manifest path we actually loaded (matches _load_task_manifest
+        # search order). This is what finish_run persists so future queries
+        # can locate the on-disk payload.
+        tid = row["task_id"]
+        manifest_path: Optional[str] = None
+        for subdir in ("active", "completed"):
+            cand = self._tasks_dir / subdir / tid / "task.json.done"
+            if cand.is_file() and not cand.is_symlink():
+                manifest_path = str(cand)
+                break
+        if manifest_path is None:
+            # Race: file existed at _load_task_manifest and is now gone.
+            return False
+
+        stdout_tail = _decode_b64_tail(
+            manifest.get("stdout_tail_b64")
+            if manifest.get("stdout_tail_b64") is not None
+            else manifest.get("stdout_tail"),
+            "stdout_tail", manifest_path,
+        )
+        stderr_tail = _decode_b64_tail(
+            manifest.get("stderr_tail_b64")
+            if manifest.get("stderr_tail_b64") is not None
+            else manifest.get("stderr_tail"),
+            "stderr_tail", manifest_path,
+        )
+        try:
+            repo.finish_run(
+                run_id=int(row["run_id"]),
+                task_id=tid,
+                terminal_state=state,
+                exit_code=manifest.get("exit_code"),
+                signal=manifest.get("signal"),
+                stdout_tail=stdout_tail,
+                stderr_tail=stderr_tail,
+                manifest_path=manifest_path,
+                reason=manifest.get("reason"),
+            )
+        except _FinishRace as exc:
+            log.info(
+                "bg triage: finish_run race on task=%s (%s)", tid, exc,
+            )
+            return False
+        except ValueError as exc:
+            log.warning(
+                "bg triage: finish_run refused task=%s: %s", tid, exc,
+            )
+            return False
+        return True
 
     def _reset_stranded_enqueued(self, repo: BgTaskRepo) -> int:
         """Reset ``enqueued_at IS NULL`` rows back to ``pending``.
