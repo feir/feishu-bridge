@@ -291,6 +291,29 @@ def test_build_quota_alert_stale_snapshot_ignored():
     assert alert == ""  # stale snapshot ignored
 
 
+def test_build_quota_alert_warning_and_snapshot_same_window_deduped():
+    """Stream allowed_warning + API snapshot for same window → single line (no dup)."""
+    result = {
+        "rate_limit_info": {
+            "status": "allowed_warning",
+            "rateLimitType": "five_hour",
+            "resetsAt": time.time() + 840,  # 14m
+            "utilization": 0.97,
+        }
+    }
+    snap = _make_snap({"five_hour": (98.0, 840), "seven_day": (30.0, 86400)})
+    alert = bridge_worker._build_quota_alert(result, snap)
+    # Branch 2 (stream warning, Chinese label) should fire
+    assert "⚠️" in alert
+    assert "5 小时配额 97%" in alert
+    # Branch 3 must skip five_hour since it is already covered
+    assert "5h:" not in alert
+    # 7d window below 50% threshold → not reported
+    assert "7d:" not in alert
+    # Exactly one line
+    assert alert.count("\n") == 0
+
+
 # ── _context_health_alert with quota ────────────────────────────────
 
 

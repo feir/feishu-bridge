@@ -182,6 +182,7 @@ def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
     import time as _time
 
     parts = []
+    covered_windows: set[str] = set()
 
     # 1. Stream event: rejected status (real-time, highest priority)
     rli = result.get("rate_limit_info")
@@ -204,7 +205,8 @@ def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
         util = rli.get("utilization", 0)
         if util >= 0.75:
             limit_type = rli.get("rateLimitType", "")
-            label = "7 天" if "seven_day" in limit_type else "5 小时"
+            win_key = "seven_day" if "seven_day" in limit_type else "five_hour"
+            label = "7 天" if win_key == "seven_day" else "5 小时"
             resets_at = rli.get("resetsAt", 0)
             reset_str = ""
             if resets_at:
@@ -213,10 +215,13 @@ def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
                 if remaining > 0:
                     reset_str = f"，约 {hours}h{mins:02d}m 后重置"
             parts.append(f"⚠️ {label}配额 {util:.0%}{reset_str}")
+            covered_windows.add(win_key)
 
     # 3. API snapshot: add utilization for all windows above threshold
     if quota_snapshot and quota_snapshot.available and not quota_snapshot.stale:
         for key, label in WINDOW_LABELS.items():
+            if key in covered_windows:
+                continue
             w = quota_snapshot.windows.get(key)
             if not w:
                 continue
@@ -226,10 +231,7 @@ def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
                 remaining = max(0, w.resets_at_epoch - _time.time())
                 hours, mins = divmod(int(remaining) // 60, 60)
                 reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
-                alert = f"{icon} {label}: {util_pct:.0f}%{reset_str}"
-                # Avoid duplicate if stream event already covered this window
-                if not any(label in p for p in parts):
-                    parts.append(alert)
+                parts.append(f"{icon} {label}: {util_pct:.0f}%{reset_str}")
 
     # 4. Cookie expiry warning (only in card alert, not every message)
     if quota_snapshot:
