@@ -382,6 +382,7 @@ def _run_bg_command(args) -> None:
             task_id = repo.insert_task(
                 chat_id=args.chat_id,
                 session_id=session_id,
+                thread_id=args.thread_id,
                 command_argv=argv,
                 on_done_prompt=args.on_done_prompt,
                 requester_open_id=args.requester_open_id,
@@ -1016,6 +1017,10 @@ def main():
     )
     p.add_argument("--chat-id", required=True,
                    help="Feishu chat_id (e.g. oc_xxx)")
+    p.add_argument("--thread-id",
+                   help="Feishu thread_id if launched inside a threaded reply; "
+                        "delivery watcher reuses this to land the synthetic "
+                        "completion turn in the originating thread")
     p.add_argument("--session-id",
                    help="Session identifier; defaults to chat_id")
     p.add_argument("--cwd", help="Working directory (absolute path)")

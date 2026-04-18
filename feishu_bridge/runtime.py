@@ -261,16 +261,21 @@ class SessionMap:
         os.replace(str(tmp), str(self._path))
 
     @staticmethod
-    def _key_str(key: tuple) -> str:
+    def format_key(key: tuple) -> str:
+        """Public key encoding for cross-module consumers (e.g. bg_supervisor).
+
+        Single source of truth for "bot:chat:thread" string form so consumers
+        don't have to re-implement (and silently drift from) the format.
+        """
         return ":".join(str(k or "") for k in key)
 
     def get(self, key: tuple) -> Optional[str]:
         with self._lock:
-            return self._data.get(self._key_str(key))
+            return self._data.get(self.format_key(key))
 
     def put(self, key: tuple, session_id: str):
         with self._lock:
-            ks = self._key_str(key)
+            ks = self.format_key(key)
             old = self._data.get(ks)
             self._data[ks] = session_id
             try:
@@ -284,7 +289,7 @@ class SessionMap:
 
     def delete(self, key: tuple):
         with self._lock:
-            ks = self._key_str(key)
+            ks = self.format_key(key)
             old = self._data.pop(ks, None)
             try:
                 self._save()

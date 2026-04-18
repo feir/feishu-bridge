@@ -193,6 +193,7 @@ def build_manifest_dict(
     on_done_prompt: str,
     chat_id: str,
     session_id: str,
+    thread_id: Optional[str] = None,
 ) -> dict:
     duration_s = max(0.0, (finished_at_ms - started_at_ms) / 1000.0)
     return {
@@ -218,6 +219,7 @@ def build_manifest_dict(
         "output_paths": output_paths,
         "on_done_prompt": on_done_prompt,
         "chat_id": chat_id,
+        "thread_id": thread_id,
         "session_id": session_id,
     }
 
@@ -595,6 +597,7 @@ def phase_c(
         output_paths=output_paths,
         on_done_prompt=state.task_row.on_done_prompt,
         chat_id=state.task_row.chat_id,
+        thread_id=state.task_row.thread_id,
         session_id=state.task_row.session_id,
     )
 

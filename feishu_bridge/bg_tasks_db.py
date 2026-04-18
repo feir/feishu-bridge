@@ -42,7 +42,7 @@ _MAX_MANIFEST_SCHEMA_VERSION = 2
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 PRAGMAS = [
     "PRAGMA journal_mode = WAL",
@@ -56,6 +56,7 @@ DDL = [
     CREATE TABLE IF NOT EXISTS bg_tasks (
         id                    TEXT PRIMARY KEY,
         chat_id               TEXT NOT NULL,
+        thread_id             TEXT,
         session_id            TEXT NOT NULL,
         requester_open_id     TEXT,
         kind                  TEXT NOT NULL DEFAULT 'adhoc',
@@ -258,18 +259,41 @@ def _schema_up_to_date(conn: sqlite3.Connection) -> bool:
 def migrate(conn: sqlite3.Connection) -> None:
     """Upgrade schema from older versions to SCHEMA_VERSION.
 
-    v1 is the initial version; there is nothing to migrate from. When a future
-    version ships, add an ALTER sequence keyed on the current `bg_schema.version`
-    row and bump the `SCHEMA_VERSION` constant.
+    Runs inside ``init_db``'s DDL transaction so schema and version bump are
+    atomic. When adding a new version, register a branch below keyed on the
+    current version and bump ``SCHEMA_VERSION``.
     """
-    current = conn.execute(
+    row = conn.execute(
         "SELECT value FROM bg_schema WHERE key='version'"
     ).fetchone()
-    if current and current[0] != str(SCHEMA_VERSION):
+    if row is None:
+        return  # fresh DB — DDL writes current SCHEMA_VERSION directly
+    try:
+        current = int(row[0])
+    except (TypeError, ValueError):
+        raise RuntimeError(f"bg_tasks_db schema version row is corrupt: {row[0]!r}")
+
+    if current == SCHEMA_VERSION:
+        return
+
+    # v1→v2: add bg_tasks.thread_id (nullable). Existing rows default to NULL
+    # which the watcher treats as "non-threaded" — same as before v2.
+    if current == 1 and SCHEMA_VERSION >= 2:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(bg_tasks)").fetchall()}
+        if "thread_id" not in cols:
+            conn.execute("ALTER TABLE bg_tasks ADD COLUMN thread_id TEXT")
+        current = 2
+
+    if current != SCHEMA_VERSION:
         raise RuntimeError(
-            f"bg_tasks_db v{current[0]} has no registered migration to "
+            f"bg_tasks_db v{row[0]} has no registered migration path to "
             f"v{SCHEMA_VERSION}; add it to migrate() before deploying."
         )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO bg_schema(key, value) VALUES('version', ?)",
+        (str(SCHEMA_VERSION),),
+    )
 
 
 def _verify_pragmas(conn: sqlite3.Connection) -> None:
@@ -497,18 +521,25 @@ def _replay_completed_manifest(
     if not isinstance(command_argv, list):
         command_argv = []
 
+    thread_id_val = data.get("thread_id")
+    if thread_id_val is not None and not isinstance(thread_id_val, str):
+        thread_id_val = None
+
     with _tx(conn):
         conn.execute(
             """INSERT INTO bg_tasks
-               (id, chat_id, session_id, requester_open_id, kind, command_argv,
-                cwd, env_overlay, timeout_seconds, on_done_prompt, output_paths,
-                state, reason, signal, error_message, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'adhoc', ?,
+               (id, chat_id, thread_id, session_id, requester_open_id, kind,
+                command_argv, cwd, env_overlay, timeout_seconds,
+                on_done_prompt, output_paths, state, reason, signal,
+                error_message, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'adhoc',
+                       ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?)""",
             (
                 tid,
                 data.get("chat_id", ""),
+                thread_id_val,
                 data.get("session_id", ""),
                 data.get("requester_open_id"),
                 json.dumps(command_argv),
@@ -558,6 +589,7 @@ def _replay_completed_manifest(
 class BgTaskRow:
     id: str
     chat_id: str
+    thread_id: Optional[str]
     session_id: str
     requester_open_id: Optional[str]
     kind: str
@@ -586,9 +618,18 @@ class BgTaskRow:
                 return json.loads(col)
             except json.JSONDecodeError:
                 return default
+        # thread_id is a v2 column; row_factory Row.keys() honors the column
+        # set of the query, so `SELECT *` on a v1-migrated DB includes it.
+        # Guard defensively so test fixtures that construct rows manually
+        # (without thread_id) don't KeyError.
+        try:
+            thread_id_val = r["thread_id"]
+        except (IndexError, KeyError):
+            thread_id_val = None
         return cls(
             id=r["id"],
             chat_id=r["chat_id"],
+            thread_id=thread_id_val,
             session_id=r["session_id"],
             requester_open_id=r["requester_open_id"],
             kind=r["kind"],
@@ -636,6 +677,7 @@ class BgTaskRepo:
         timeout_seconds: int = 1800,
         output_paths: Optional[list[str]] = None,
         task_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> str:
         """Insert a new queued task. Returns the task_id."""
         tid = task_id or uuid.uuid4().hex
@@ -643,14 +685,14 @@ class BgTaskRepo:
         with _tx(self.conn):
             self.conn.execute(
                 """INSERT INTO bg_tasks
-                   (id, chat_id, session_id, requester_open_id, kind, command_argv,
-                    cwd, env_overlay, timeout_seconds, on_done_prompt, output_paths,
-                    state, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 'adhoc', ?,
-                           ?, ?, ?, ?, ?,
-                           'queued', ?, ?)""",
+                   (id, chat_id, thread_id, session_id, requester_open_id, kind,
+                    command_argv, cwd, env_overlay, timeout_seconds,
+                    on_done_prompt, output_paths, state, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'adhoc',
+                           ?, ?, ?, ?,
+                           ?, ?, 'queued', ?, ?)""",
                 (
-                    tid, chat_id, session_id, requester_open_id,
+                    tid, chat_id, thread_id, session_id, requester_open_id,
                     json.dumps(command_argv),
                     cwd,
                     json.dumps(env_overlay or {}),
@@ -930,10 +972,35 @@ class BgTaskRepo:
         enqueued_at: Optional[int] = None,
         sent_at: Optional[int] = None,
         session_resume_status: Optional[str] = None,
+        expected_from: Optional[str] = None,
     ) -> bool:
+        """Update bg_runs delivery state, optionally as SQL-level CAS.
+
+        When ``expected_from`` is set, the UPDATE fires only if the current
+        row still has that delivery_state — closes the check-then-act window
+        between the watcher's SELECT and UPDATE, which is critical once the
+        poller and UDS listener both call the scanner.
+        """
         allowed = {"pending", "enqueued", "sent", "delivery_failed"}
         if new_delivery_state not in allowed:
             raise ValueError(f"bad delivery_state {new_delivery_state!r}")
+        if expected_from is not None and expected_from not in (
+            allowed | {"not_ready"}
+        ):
+            raise ValueError(f"bad expected_from {expected_from!r}")
+        params: list[Any] = [
+            new_delivery_state,
+            error,
+            1 if bump_attempt else 0,
+            enqueued_at,
+            sent_at,
+            session_resume_status,
+            run_id,
+        ]
+        where_extra = ""
+        if expected_from is not None:
+            where_extra = " AND delivery_state=?"
+            params.append(expected_from)
         cur = self.conn.execute(
             f"""UPDATE bg_runs
                 SET delivery_state=?,
@@ -942,9 +1009,8 @@ class BgTaskRepo:
                     enqueued_at = COALESCE(?, enqueued_at),
                     sent_at = COALESCE(?, sent_at),
                     session_resume_status = COALESCE(?, session_resume_status)
-                WHERE id=?""",
-            (new_delivery_state, error, 1 if bump_attempt else 0,
-             enqueued_at, sent_at, session_resume_status, run_id),
+                WHERE id=?{where_extra}""",
+            params,
         )
         return cur.rowcount == 1
 

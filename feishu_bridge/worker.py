@@ -386,6 +386,105 @@ def _cleanup_auth_card(feishu_mod, sender_id: str):
                     exc_info=True)
 
 
+def _bg_mark_dequeued(item: dict) -> None:
+    """Stamp bg_runs.enqueued_at at worker pickup time, not watcher CAS time.
+
+    Scopes the watcher's 5-min stuck-rollback (design.md:391) to "worker
+    picked up but never ack'd" — i.e. genuine bridge-crash recovery — rather
+    than bounding total queue-wait + turn-processing time. Without this,
+    long turns (backlog + Claude latency >5 min) race the rollback and cause
+    duplicate delivery.
+
+    Idempotent: the CAS guard requires delivery_state='enqueued' AND
+    enqueued_at IS NULL, so a re-fire on the same item (or a worker that
+    already stamped then failed to ack) is a silent no-op.
+    """
+    run_id = item.get("_bg_run_id")
+    db_path = item.get("_bg_db_path")
+    if run_id is None or not db_path:
+        return
+    try:
+        from feishu_bridge.bg_tasks_db import connect
+    except Exception:
+        log.warning("_bg_mark_dequeued: bg_tasks_db import failed", exc_info=True)
+        return
+    try:
+        conn = connect(str(db_path))
+    except Exception:
+        log.warning("_bg_mark_dequeued: DB connect failed for run=%s",
+                    run_id, exc_info=True)
+        return
+    try:
+        now_ms = int(time.time() * 1000)
+        conn.execute(
+            "UPDATE bg_runs SET enqueued_at=? "
+            "WHERE id=? AND delivery_state='enqueued' AND enqueued_at IS NULL",
+            (now_ms, run_id),
+        )
+    except Exception:
+        log.warning("_bg_mark_dequeued: UPDATE failed for run=%s",
+                    run_id, exc_info=True)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bg_mark_delivery_outcome(item: dict, delivered: bool,
+                              *, error: str | None = None) -> None:
+    """Mark the bg-task outbox row after worker hand-off to Feishu.
+
+    No-op when the item is not a bg_task_completion (``_bg_run_id`` missing)
+    or the bridge has no bg_tasks DB path wired yet. Failures are swallowed
+    with a warning — the stuck_enqueued rollback (5 min) reclaims orphaned
+    rows, so a crash here only delays retry, it doesn't strand the task.
+    """
+    run_id = item.get("_bg_run_id")
+    db_path = item.get("_bg_db_path")
+    if run_id is None or not db_path:
+        return
+    try:
+        from feishu_bridge.bg_tasks_db import BgTaskRepo, connect
+    except Exception:
+        log.warning("_bg_mark_delivery_outcome: bg_tasks_db import failed",
+                    exc_info=True)
+        return
+    new_state = "sent" if delivered else "delivery_failed"
+    err_msg = None if delivered else (error or "deliver_returned_false")
+    now_ms = int(time.time() * 1000)
+    try:
+        conn = connect(str(db_path))
+    except Exception:
+        log.warning("_bg_mark_delivery_outcome: DB connect failed for run=%s",
+                    run_id, exc_info=True)
+        return
+    try:
+        repo = BgTaskRepo(conn)
+        # CAS on 'enqueued' — the watcher flipped the row there before
+        # enqueuing us; a double-fire (e.g. duplicate queue item) on the
+        # same run_id finds delivery_state already 'sent' and no-ops.
+        ok = repo.mark_delivery_state(
+            run_id,
+            new_state,
+            error=err_msg,
+            bump_attempt=not delivered,
+            sent_at=now_ms if delivered else None,
+            expected_from="enqueued",
+        )
+        if not ok:
+            log.info("_bg_mark_delivery_outcome: CAS lost for run=%s "
+                     "(state not 'enqueued'); skipping", run_id)
+    except Exception:
+        log.warning("_bg_mark_delivery_outcome: mark_delivery_state failed "
+                    "for run=%s", run_id, exc_info=True)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def process_message(
     item: dict,
     bot_config: dict,
@@ -418,7 +517,7 @@ def process_message(
     message_id = item.get("message_id")
 
     key = (bot_id, chat_id, thread_id)
-    tag = SessionMap._key_str(key)
+    tag = SessionMap.format_key(key)
     handle = response_handle_cls(lark_client, chat_id, thread_id, message_id,
                                  bot_id=bot_id)
     image_path = None
@@ -815,7 +914,19 @@ def process_message(
         except Exception:
             log.warning("Failed to create auth file for CLI", exc_info=True)
 
-        existing_sid = session_map.get(key)
+        # bg_task_completion items carry the Claude UUID the watcher already
+        # resolved against the sessions_index; prefer it over session_map so
+        # a concurrent human turn on a different Claude session can't steer
+        # the synthetic turn into the wrong conversation. None here means the
+        # watcher decided fresh_fallback — leave existing_sid None so the
+        # worker spawns a new session instead of resuming the stale one.
+        if item.get("_bg_session_id") is not None or item.get("_bg_run_id") is not None:
+            existing_sid = item.get("_bg_session_id")
+            # Stamp enqueued_at on pickup so the watcher's stuck-rollback
+            # bounds worker-held time (crash recovery), not total queue wait.
+            _bg_mark_dequeued(item)
+        else:
+            existing_sid = session_map.get(key)
         _turn_t0 = time.time()
         stale_notice = None
         if existing_sid and not runner.has_session(existing_sid):
@@ -945,7 +1056,7 @@ def process_message(
                               + _usage.get("cache_creation_input_tokens", 0))
                 idle_compact_mgr.touch(
                     session_id=effective_sid,
-                    session_key=SessionMap._key_str(key),
+                    session_key=SessionMap.format_key(key),
                     total_ctx=_total_ctx,
                     bot_id=item["bot_id"],
                     chat_id=chat_id,
@@ -972,11 +1083,12 @@ def process_message(
             _last_usage = result.get("last_call_usage") or result.get("usage") or {}
             model_usage = result.get("modelUsage") or {}
             model_name = pick_primary_model(model_usage, getattr(runner, "model", None))
-            handle.deliver(result["result"], is_error=result["is_error"],
-                           last_call_usage=_last_usage,
-                           model_name=model_name,
-                           workspace=runner.workspace,
-                           context_alert=ctx_alert)
+            delivered = handle.deliver(result["result"], is_error=result["is_error"],
+                                       last_call_usage=_last_usage,
+                                       model_name=model_name,
+                                       workspace=runner.workspace,
+                                       context_alert=ctx_alert)
+            _bg_mark_delivery_outcome(item, delivered)
 
         return handle
 
@@ -987,6 +1099,9 @@ def process_message(
                 handle.deliver("内部错误，请稍后重试。如持续出现请联系管理员。", is_error=True)
             except Exception:
                 log.exception("Failed to deliver error message")
+        # Internal error path — don't claim the outbox row is delivered; let
+        # the stuck_enqueued rollback (5min) flip it back to pending for retry.
+        _bg_mark_delivery_outcome(item, False, error=f"worker_error: {type(e).__name__}")
 
     finally:
         if getattr(handle, "_card_fallback_timer", None):

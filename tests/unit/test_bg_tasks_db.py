@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from feishu_bridge.bg_tasks_db import (
+    SCHEMA_VERSION,
     BgTaskRepo,
     TaskState,
     _AttachRace,
@@ -62,7 +63,7 @@ def test_init_db_idempotent(tmp_path):
     # Second call must not raise and must keep schema row.
     conn = init_db(db)
     row = conn.execute("SELECT value FROM bg_schema WHERE key='version'").fetchone()
-    assert row[0] == "1"
+    assert row[0] == str(SCHEMA_VERSION)
 
 
 def test_schema_check_constraints_reject_bad_kind(tmp_path):

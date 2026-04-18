@@ -1040,13 +1040,20 @@ class ResponseHandle:
                 total_tokens: int = 0, model_name: str | None = None,
                 workspace: str | None = None,
                 context_alert: str | None = None,
-                last_call_usage: dict | None = None):
+                last_call_usage: dict | None = None) -> bool:
+        """Send the final content. Returns True iff a Feishu write succeeded.
+
+        bg-task completion delivery (worker post-turn hook) reads this return
+        to decide sent vs delivery_failed — a silent API failure must NOT
+        mark the outbox row as sent, else the user never sees the reply and
+        the watcher stops retrying.
+        """
         if self._card_fallback_timer:
             self._card_fallback_timer.cancel()
             self._card_fallback_timer = None
         if self._terminated:
             log.info("Deliver skipped: message unavailable (recalled/deleted)")
-            return
+            return False
         if self._typing_reaction_id and self.source_message_id:
             remove_typing_indicator(
                 self.client, self.source_message_id, self._typing_reaction_id)
@@ -1059,19 +1066,19 @@ class ResponseHandle:
                  len(content), is_error,
                  bool(self._use_cardkit and self._cardkit_card_id))
         if self._use_cardkit and self._cardkit_card_id:
-            self._deliver_cardkit(content, is_error,
-                                  last_call_usage=last_call_usage,
-                                  model_name=model_name, workspace=workspace,
-                                  context_alert=context_alert)
-        else:
-            self._deliver_im_patch(content, is_error,
-                                   context_alert=context_alert)
+            return self._deliver_cardkit(content, is_error,
+                                         last_call_usage=last_call_usage,
+                                         model_name=model_name,
+                                         workspace=workspace,
+                                         context_alert=context_alert)
+        return self._deliver_im_patch(content, is_error,
+                                      context_alert=context_alert)
 
     def _deliver_cardkit(self, content: str, is_error: bool,
                          last_call_usage: dict | None = None,
                          model_name: str | None = None,
                          workspace: str | None = None,
-                         context_alert: str | None = None):
+                         context_alert: str | None = None) -> bool:
         card_id = self._cardkit_card_id
         seq = self._next_seq()
         settings_json = json.dumps({"config": {"streaming_mode": False}})
@@ -1097,9 +1104,8 @@ class ResponseHandle:
         if not settings_ok:
             log.warning("CardKit settings failed, falling back to IM patch")
             self.card_message_id = None
-            self._deliver_im_patch(content, is_error,
-                                   context_alert=context_alert)
-            return
+            return self._deliver_im_patch(content, is_error,
+                                          context_alert=context_alert)
 
         elapsed_s = time.time() - self._handle_start_time
         seq = self._next_seq()
@@ -1127,29 +1133,30 @@ class ResponseHandle:
                 .request_body(body) \
                 .build()
             resp = self.client.cardkit.v1.card.update(req)
-            if not resp.success():
-                log.error("CardKit card.update failed: code=%s msg=%s", resp.code, resp.msg)
-                self.card_message_id = None
-                self._deliver_im_patch(content, is_error,
-                                       context_alert=context_alert)
+            if resp.success():
+                return True
+            log.error("CardKit card.update failed: code=%s msg=%s", resp.code, resp.msg)
+            self.card_message_id = None
+            return self._deliver_im_patch(content, is_error,
+                                          context_alert=context_alert)
         except Exception:
             log.exception("CardKit card.update error")
             self.card_message_id = None
-            self._deliver_im_patch(content, is_error,
-                                   context_alert=context_alert)
+            return self._deliver_im_patch(content, is_error,
+                                          context_alert=context_alert)
 
     def _deliver_im_patch(self, content: str, is_error: bool,
-                          context_alert: str | None = None):
+                          context_alert: str | None = None) -> bool:
         # IM patch has no structured footer; append alerts to content body
         if context_alert:
             content = content + "\n\n---\n" + context_alert
         card = build_card(content, is_error)
         if self.card_message_id:
             if self._try_patch(self.card_message_id, card):
-                return
+                return True
             self._try_patch(self.card_message_id, build_card("回复已发送到新消息", compact=True))
             card = build_card(content, is_error, compact=True)
-        self._send_card(card)
+        return bool(self._send_card(card))
 
     # Tool name → user-friendly status for CardKit summary.
     _TOOL_STATUS_MAP = {

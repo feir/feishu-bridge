@@ -78,7 +78,7 @@ class BridgeCommandHandler:
             old_sid = self.bot.session_map.get(key)
             if old_sid:
                 from feishu_bridge.worker import idle_compact_mgr
-                idle_compact_mgr.cancel(SessionMap._key_str(key))
+                idle_compact_mgr.cancel(SessionMap.format_key(key))
                 self.bot.session_map.delete(key)
                 log.info("Session cleared: %s", old_sid[:8])
             handle.deliver("会话已重置，下一条消息将开始新对话。")
@@ -145,7 +145,7 @@ class BridgeCommandHandler:
                 handle.deliver("此 Agent 不支持 /compact 命令。")
                 return
             key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
-            tag = SessionMap._key_str(key)
+            tag = SessionMap.format_key(key)
             prompt = f"/compact {arg}" if arg else "/compact"
             sid = self.bot.session_map.get(key)
             if not sid:
@@ -245,7 +245,7 @@ class BridgeCommandHandler:
         if current_sid != sid:
             log.info("Idle compact skipped: session changed sid=%s", sid[:8])
             return
-        tag = SessionMap._key_str(key)
+        tag = SessionMap.format_key(key)
         result = self.bot.runner.run(
             "/compact", session_id=sid, resume=True, tag=tag,
         )

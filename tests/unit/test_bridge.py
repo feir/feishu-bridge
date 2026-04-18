@@ -1764,6 +1764,7 @@ HUMAN_TURN_GOLDEN = {
     "_quota_poller": None,
     "_ledger": None,
     "_sessions_index": None,
+    "_bg_db_path": None,
     "_queue_key": "test-bot:oc_group1:",
     "_bg_session_id": None,
 }
@@ -1796,7 +1797,7 @@ def test_enqueue_turn_rejects_protected_keys_in_extras():
     bot = _make_full_bot(default_mode="auto-reply")
     for key in (
         "bot_id", "_cost_store", "_quota_poller", "_ledger", "_queue_key",
-        "_bg_session_id", "_sessions_index",
+        "_bg_session_id", "_sessions_index", "_bg_db_path",
     ):
         with pytest.raises(ValueError, match="protected keys"):
             bot.enqueue_turn(

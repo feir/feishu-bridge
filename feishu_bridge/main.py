@@ -996,14 +996,18 @@ class FeishuBot:
 
         # Boot background-task supervisor before the WS loop blocks.
         # Paths mirror feishu_bridge.cli (_bg_home / bg_tasks.db / wake.sock).
+        bg_home = Path.home() / ".feishu-bridge"
+        self._bg_db_path = bg_home / "bg_tasks.db"
         self._bg_supervisor = None
         try:
             from feishu_bridge.bg_supervisor import BgSupervisor
-            bg_home = Path.home() / ".feishu-bridge"
             self._bg_supervisor = BgSupervisor(
-                db_path=bg_home / "bg_tasks.db",
+                db_path=self._bg_db_path,
                 tasks_dir=bg_home / "bg_tasks",
                 sock_path=bg_home / "wake.sock",
+                enqueue_fn=self.enqueue_turn,
+                bot_id=self.bot_id,
+                sessions_index=self._sessions_index,
             )
             self._bg_supervisor.start()
         except Exception:
@@ -1069,6 +1073,7 @@ class FeishuBot:
             "_quota_poller": getattr(self, "_quota_poller", None),
             "_ledger": getattr(self, "_ledger", None),
             "_sessions_index": getattr(self, "_sessions_index", None),
+            "_bg_db_path": getattr(self, "_bg_db_path", None),
         }
         if extras:
             # Infrastructure fields are self-derived; extras must never
@@ -1076,7 +1081,7 @@ class FeishuBot:
             # could silently lose bot_id / cost store / ledger wiring.
             _protected = {
                 "bot_id", "_cost_store", "_quota_poller", "_ledger", "_queue_key",
-                "_bg_session_id", "_sessions_index",
+                "_bg_session_id", "_sessions_index", "_bg_db_path",
             }
             bad = _protected & extras.keys()
             if bad:
@@ -1364,7 +1369,7 @@ class FeishuBot:
                 bridge_cmd = "new"
                 # Also cancel any running task for this chat
                 key = (self.bot_id, chat_id, thread_id)
-                tag = SessionMap._key_str(key)
+                tag = SessionMap.format_key(key)
                 self.runner.cancel(tag)
                 # Session delete deferred to worker under chat lock
             elif cmd in ("/stop", "/cancel"):
@@ -1381,7 +1386,7 @@ class FeishuBot:
                     return
                 # Kill active process immediately (non-blocking, safe here)
                 key = (self.bot_id, chat_id, thread_id)
-                tag = SessionMap._key_str(key)
+                tag = SessionMap.format_key(key)
                 cancelled = self.runner.cancel(tag)
                 # /stop all: also drain pending queue and cleanup ⏳ reactions
                 stop_all = cmd_arg.strip().lower() == "all"
@@ -1443,7 +1448,7 @@ class FeishuBot:
                 # go directly to work queue.
                 _heavy_cmds = {"new", "compact", "status"}
                 if bridge_cmd in _heavy_cmds:
-                    bc_key = SessionMap._key_str(
+                    bc_key = SessionMap.format_key(
                         (self.bot_id, chat_id, thread_id))
                     bc_item["_queue_key"] = bc_key
                     try:
@@ -1466,7 +1471,7 @@ class FeishuBot:
                 return
 
             # Enqueue via ChatTaskQueue (zero I/O, non-blocking)
-            msg_key = SessionMap._key_str(
+            msg_key = SessionMap.format_key(
                 (self.bot_id, chat_id, thread_id))
             try:
                 status, item = self.enqueue_turn(
@@ -1554,7 +1559,7 @@ class FeishuBot:
             # in sync with the _on_message path. Hand-rolling an item dict
             # here caused bg-task sessions_index drift (Codex cross-review,
             # Section 5.4b).
-            msg_key = SessionMap._key_str((bot_id, chat_id, None))
+            msg_key = SessionMap.format_key((bot_id, chat_id, None))
             try:
                 self.enqueue_turn(
                     chat_id=chat_id,

@@ -617,3 +617,484 @@ def test_listener_db_fail_closes_socket(short_env, monkeypatch):
             "listener didn't close socket after DB connect failure"
     finally:
         sup.stop()
+
+
+# ---------------------------------------------------------------------------
+# 4.5 — delivery watcher body (_scan_delivery_outbox)
+# ---------------------------------------------------------------------------
+
+def _make_pending_run(
+    repo: BgTaskRepo,
+    *,
+    chat_id: str = "oc_test",
+    session_id: str = "sess_abc",
+    thread_id: str | None = None,
+    on_done_prompt: str = "Summarize what the task produced.",
+    stdout_tail: bytes = b"ok\n",
+    stderr_tail: bytes = b"",
+    manifest_path: str = "/tmp/bg/manifest.json",
+) -> tuple[str, int]:
+    """Create a bg_tasks + bg_runs row pair in (completed, pending) state."""
+    tid = repo.insert_task(
+        chat_id=chat_id,
+        session_id=session_id,
+        thread_id=thread_id,
+        command_argv=["echo", "hi"],
+        on_done_prompt=on_done_prompt,
+        output_paths=["/tmp/bg/out.txt"],
+    )
+    assert repo.claim_queued_cas(tid, bridge_instance_id="b1")
+    run_id = repo.start_run(
+        task_id=tid, runner_token="t",
+        wrapper_pid=1000, wrapper_start_time_us=9000,
+    )
+    repo.attach_child(
+        run_id=run_id, task_id=tid, pid=2000, pgid=2000,
+        process_start_time_us=9100,
+    )
+    repo.finish_run(
+        run_id=run_id, task_id=tid, terminal_state="completed",
+        exit_code=0, signal=None,
+        stdout_tail=stdout_tail, stderr_tail=stderr_tail,
+        manifest_path=manifest_path,
+    )
+    return tid, run_id
+
+
+def _delivery_state(conn, run_id: int) -> str:
+    return conn.execute(
+        "SELECT delivery_state FROM bg_runs WHERE id=?", (run_id,),
+    ).fetchone()[0]
+
+
+def _make_delivery_supervisor(
+    short_env,
+    *,
+    enqueue_fn=None,
+    sessions_index=None,
+    bot_id: str = "bot-xyz",
+):
+    """Build a supervisor wired for the delivery watcher path (no threads)."""
+    return BgSupervisor(
+        db_path=short_env["db_path"],
+        tasks_dir=short_env["tasks_dir"],
+        sock_path=short_env["sock_path"],
+        runner_cmd=["/bin/true"],
+        poll_interval=9999.0,
+        enqueue_fn=enqueue_fn,
+        bot_id=bot_id,
+        sessions_index=sessions_index,
+    )
+
+
+def test_scan_delivery_noop_when_enqueue_fn_is_none(short_env, repo):
+    """Tests that don't wire enqueue_fn must not crash — delivery watcher
+    still runs stuck-rollback (pure DB) but early-returns before enqueue."""
+    _make_pending_run(repo)
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    assert sup._scan_delivery_outbox(repo) == 0
+
+
+def test_scan_delivery_delivers_pending_run(short_env, repo):
+    """Happy path: pending run → CAS to enqueued → enqueue_fn called once."""
+    from feishu_bridge.session_resume import SessionsIndex
+
+    tid, run_id = _make_pending_run(
+        repo, session_id="sess_recent", chat_id="oc_A",
+    )
+    idx = SessionsIndex(Path(short_env["db_path"]).parent / "sessions.json")
+    idx.touch("sess_recent", "oc_A", int(time.time() * 1000))
+
+    calls: list[dict] = []
+    def _fake_enqueue(**kwargs):
+        calls.append(kwargs)
+        return ("queued", {})
+
+    sup = _make_delivery_supervisor(
+        short_env, enqueue_fn=_fake_enqueue, sessions_index=idx, bot_id="bot-xyz",
+    )
+    delivered = sup._scan_delivery_outbox(repo)
+    assert delivered == 1
+    assert len(calls) == 1
+    # State must have moved pending → enqueued (will advance to sent when
+    # worker later calls _bg_mark_delivery_outcome; that path is separate).
+    assert _delivery_state(repo.conn, run_id) == "enqueued"
+
+    call = calls[0]
+    assert call["chat_id"] == "oc_A"
+    assert call["kind"] == "bg_task_completion"
+    # session resumable (recent_activity) → effective_sid preserved.
+    assert call["session_id"] == "sess_recent"
+    # Session key shape: bot:chat:thread — thread_id=None becomes "".
+    assert call["session_key"] == "bot-xyz:oc_A:"
+    # Synthetic turn body should include the task_id header and manifest path.
+    assert f"[bg-task:{tid}]" in call["prompt"]
+    # Not a fresh-fallback → no NOTE prefix on the prompt.
+    assert not call["prompt"].startswith("[NOTE:")
+    # Extras must carry run_id so worker can mark sent via CAS later.
+    assert call["extras"]["_bg_run_id"] == run_id
+
+
+def test_scan_delivery_fresh_fallback_prefix_when_unseen(short_env, repo):
+    """session not in index → fresh_fallback prefix + effective_sid=None."""
+    from feishu_bridge.session_resume import SessionsIndex
+
+    tid, run_id = _make_pending_run(repo, session_id="sess_unknown")
+    idx = SessionsIndex(Path(short_env["db_path"]).parent / "sessions.json")
+    # Deliberately do NOT touch() — session is unseen.
+
+    calls: list[dict] = []
+    def _fake_enqueue(**kwargs):
+        calls.append(kwargs)
+        return ("queued", {})
+
+    sup = _make_delivery_supervisor(
+        short_env, enqueue_fn=_fake_enqueue, sessions_index=idx,
+    )
+    assert sup._scan_delivery_outbox(repo) == 1
+    call = calls[0]
+    assert call["prompt"].startswith("[NOTE:")
+    assert "not_in_index" in call["prompt"]
+    assert call["session_id"] is None, "fresh fallback must drop the sid"
+    # Body still present below the NOTE.
+    assert f"[bg-task:{tid}]" in call["prompt"]
+    # Persisted status annotation for audit/debugging.
+    row = repo.conn.execute(
+        "SELECT session_resume_status FROM bg_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    assert row[0] == "fresh_fallback:not_in_index"
+
+
+def test_scan_delivery_resume_failed_also_uses_fresh_branch(
+    short_env, repo, monkeypatch,
+):
+    """design.md:517 — `resume_failed` must also prepend NOTE + drop sid.
+
+    Guards concern #2: an earlier impl routed `resume_failed` through the
+    resume path, defeating the probe. Retrying a session we already know
+    is unresumable wastes the 5s probe AND re-surfaces as `resume_failed`
+    forever.
+    """
+    from feishu_bridge import bg_supervisor as mod
+    from feishu_bridge.session_resume import SessionsIndex
+
+    tid, run_id = _make_pending_run(repo, session_id="sess_probe_error")
+    idx = SessionsIndex(Path(short_env["db_path"]).parent / "sessions.json")
+
+    # Bypass the real resolve_resume_status — we're unit-testing the
+    # supervisor branch, not the policy function (which has its own tests).
+    monkeypatch.setattr(
+        mod, "resolve_resume_status",
+        lambda sid, index, now_ms: ("resume_failed", "probe_error"),
+    )
+
+    calls: list[dict] = []
+    def _fake_enqueue(**kwargs):
+        calls.append(kwargs)
+        return ("queued", {})
+
+    sup = _make_delivery_supervisor(
+        short_env, enqueue_fn=_fake_enqueue, sessions_index=idx,
+    )
+    assert sup._scan_delivery_outbox(repo) == 1
+    call = calls[0]
+    assert call["prompt"].startswith("[NOTE:"), \
+        "resume_failed must also prepend the NOTE prefix"
+    assert "probe_error" in call["prompt"], \
+        "NOTE reason should carry the probe error tag"
+    assert call["session_id"] is None, \
+        "resume_failed must drop the sid — resume is known-broken"
+    assert f"[bg-task:{tid}]" in call["prompt"]
+    row = repo.conn.execute(
+        "SELECT session_resume_status FROM bg_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    assert row[0] == "resume_failed:probe_error"
+
+
+def test_scan_delivery_cas_race_exactly_one_enqueue(short_env, repo):
+    """Two concurrent scanners on the same row: exactly one wins the CAS."""
+    from feishu_bridge.session_resume import SessionsIndex
+
+    _make_pending_run(repo, session_id="sess_race")
+    idx = SessionsIndex(Path(short_env["db_path"]).parent / "sessions.json")
+    idx.touch("sess_race", "oc_test", int(time.time() * 1000))
+
+    enqueue_count = [0]
+    def _fake_enqueue(**_kwargs):
+        enqueue_count[0] += 1
+        return ("queued", {})
+
+    # Two supervisors sharing the same DB — each opens its own connection.
+    sup_a = _make_delivery_supervisor(
+        short_env, enqueue_fn=_fake_enqueue, sessions_index=idx,
+    )
+    sup_b = _make_delivery_supervisor(
+        short_env, enqueue_fn=_fake_enqueue, sessions_index=idx,
+    )
+    conn_a = connect(short_env["db_path"])
+    conn_b = connect(short_env["db_path"])
+    try:
+        repo_a = BgTaskRepo(conn_a)
+        repo_b = BgTaskRepo(conn_b)
+        # Back-to-back scans: the second should find the row already in
+        # 'enqueued' and its CAS attempt must lose silently.
+        sup_a._scan_delivery_outbox(repo_a)
+        sup_b._scan_delivery_outbox(repo_b)
+        assert enqueue_count[0] == 1, \
+            f"expected exactly one enqueue under CAS race, got {enqueue_count[0]}"
+    finally:
+        conn_a.close()
+        conn_b.close()
+
+
+def test_scan_delivery_enqueue_exception_rolls_back_to_delivery_failed(short_env, repo):
+    """If enqueue_fn raises, state moves enqueued → delivery_failed w/ bump."""
+    from feishu_bridge.session_resume import SessionsIndex
+
+    _tid, run_id = _make_pending_run(repo, session_id="sess_boom")
+    idx = SessionsIndex(Path(short_env["db_path"]).parent / "sessions.json")
+    idx.touch("sess_boom", "oc_test", int(time.time() * 1000))
+
+    def _raising_enqueue(**_kwargs):
+        raise RuntimeError("queue blew up")
+
+    sup = _make_delivery_supervisor(
+        short_env, enqueue_fn=_raising_enqueue, sessions_index=idx,
+    )
+    # delivered count is 0 because the enqueue failed before incrementing it.
+    assert sup._scan_delivery_outbox(repo) == 0
+    row = repo.conn.execute(
+        "SELECT delivery_state, delivery_attempt_count, delivery_error "
+        "FROM bg_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    assert row["delivery_state"] == "delivery_failed"
+    assert row["delivery_attempt_count"] == 1
+    assert "enqueue_failed: RuntimeError: queue blew up" in row["delivery_error"]
+
+
+def test_scan_delivery_stuck_enqueued_rollback_after_5_min(short_env, repo):
+    """enqueued rows older than 5 min roll back to pending WITHOUT bump."""
+    from feishu_bridge.bg_supervisor import _STUCK_ENQUEUED_MS
+
+    _tid, run_id = _make_pending_run(repo, session_id="sess_stuck")
+    # Force into 'enqueued' with an enqueued_at stamp 6 min in the past.
+    stale = int(time.time() * 1000) - _STUCK_ENQUEUED_MS - 60_000
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='enqueued', enqueued_at=? WHERE id=?",
+        (stale, run_id),
+    )
+    repo.conn.commit()
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    # enqueue_fn=None early-returns before iteration, but stuck-rollback
+    # runs first — row should flip back to pending.
+    sup._scan_delivery_outbox(repo)
+    row = repo.conn.execute(
+        "SELECT delivery_state, enqueued_at, delivery_attempt_count "
+        "FROM bg_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    assert row["delivery_state"] == "pending"
+    assert row["enqueued_at"] is None, "rollback must clear stale enqueued_at"
+    # Crash recovery doesn't consume the retry budget.
+    assert row["delivery_attempt_count"] == 0
+
+
+def test_scan_delivery_recent_enqueued_not_rolled_back(short_env, repo):
+    """Rows enqueued within the stuck threshold are left alone."""
+    _tid, run_id = _make_pending_run(repo, session_id="sess_live")
+    fresh = int(time.time() * 1000) - 1000  # 1s ago
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='enqueued', enqueued_at=? WHERE id=?",
+        (fresh, run_id),
+    )
+    repo.conn.commit()
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    sup._scan_delivery_outbox(repo)
+    assert _delivery_state(repo.conn, run_id) == "enqueued"
+
+
+def test_scan_delivery_thread_id_flows_into_session_key(short_env, repo):
+    """thread_id on task row appears in the session_key tuple as its 3rd slot."""
+    from feishu_bridge.session_resume import SessionsIndex
+
+    _make_pending_run(
+        repo, session_id="sess_thr", chat_id="oc_B", thread_id="omt_abc",
+    )
+    idx = SessionsIndex(Path(short_env["db_path"]).parent / "sessions.json")
+    idx.touch("sess_thr", "oc_B", int(time.time() * 1000))
+
+    calls: list[dict] = []
+    sup = _make_delivery_supervisor(
+        short_env,
+        enqueue_fn=lambda **kw: (calls.append(kw), ("queued", {}))[1],
+        sessions_index=idx,
+        bot_id="bot-xyz",
+    )
+    sup._scan_delivery_outbox(repo)
+    assert calls[0]["session_key"] == "bot-xyz:oc_B:omt_abc"
+    assert calls[0]["extras"]["thread_id"] == "omt_abc"
+
+
+def test_scan_delivery_does_not_stamp_enqueued_at_at_cas(short_env, repo):
+    """Post-review fix: enqueued_at is stamped by worker, not watcher.
+
+    Regression guard: a prior impl wrote `enqueued_at=now_ms` at CAS time,
+    which caused the 5-min stuck-rollback to misfire on long turns (backlog
+    + Claude call >5min) and trigger duplicate delivery. design.md:391
+    scopes the rollback to bridge-crash recovery; pinning enqueued_at to
+    worker pickup preserves that intent.
+    """
+    from feishu_bridge.session_resume import SessionsIndex
+
+    _tid, run_id = _make_pending_run(repo, session_id="sess_stamp")
+    idx = SessionsIndex(Path(short_env["db_path"]).parent / "sessions.json")
+    idx.touch("sess_stamp", "oc_test", int(time.time() * 1000))
+
+    sup = _make_delivery_supervisor(
+        short_env, enqueue_fn=lambda **_: ("queued", {}), sessions_index=idx,
+    )
+    assert sup._scan_delivery_outbox(repo) == 1
+
+    row = repo.conn.execute(
+        "SELECT delivery_state, enqueued_at FROM bg_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    assert row["delivery_state"] == "enqueued"
+    assert row["enqueued_at"] is None, \
+        "watcher must NOT stamp enqueued_at — worker stamps on pickup"
+
+
+def test_scan_delivery_retries_delivery_failed_rows(short_env, repo):
+    """list_pending_deliveries returns both `pending` and `delivery_failed`
+    rows with attempt_count<10; the watcher must retry both."""
+    from feishu_bridge.session_resume import SessionsIndex
+
+    _tid, run_id = _make_pending_run(repo, session_id="sess_retry")
+    # Simulate a prior failed delivery: state=delivery_failed, attempt=2.
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='delivery_failed', "
+        "delivery_attempt_count=2 WHERE id=?", (run_id,),
+    )
+    repo.conn.commit()
+
+    idx = SessionsIndex(Path(short_env["db_path"]).parent / "sessions.json")
+    idx.touch("sess_retry", "oc_test", int(time.time() * 1000))
+
+    calls: list[dict] = []
+    sup = _make_delivery_supervisor(
+        short_env,
+        enqueue_fn=lambda **kw: (calls.append(kw), ("queued", {}))[1],
+        sessions_index=idx,
+    )
+    assert sup._scan_delivery_outbox(repo) == 1, \
+        "delivery_failed rows with attempt<10 must be retriable"
+    assert len(calls) == 1
+    assert _delivery_state(repo.conn, run_id) == "enqueued"
+
+
+def test_scan_delivery_orphan_run_marked_delivery_failed(short_env, repo):
+    """Orphan run (bg_tasks row gone) must move to delivery_failed + bump,
+    not loop forever. Guards the FK/corruption edge case."""
+    _tid, run_id = _make_pending_run(repo, session_id="sess_orphan")
+    # Forcibly delete the parent task row (bypass FK CASCADE to simulate
+    # the orphan scenario we're defending against).
+    repo.conn.execute("PRAGMA foreign_keys=OFF")
+    repo.conn.execute("DELETE FROM bg_tasks WHERE id=?", (_tid,))
+    repo.conn.execute("PRAGMA foreign_keys=ON")
+    repo.conn.commit()
+
+    sup = _make_delivery_supervisor(
+        short_env, enqueue_fn=lambda **_: ("queued", {}),
+    )
+    # No rows delivered — orphan path continues after marking delivery_failed.
+    assert sup._scan_delivery_outbox(repo) == 0
+    row = repo.conn.execute(
+        "SELECT delivery_state, delivery_attempt_count, delivery_error "
+        "FROM bg_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    assert row["delivery_state"] == "delivery_failed"
+    assert row["delivery_attempt_count"] == 1, \
+        "orphan marking must bump_attempt so the <10 retry cap eventually fires"
+    assert row["delivery_error"] is not None and "missing_task" in row["delivery_error"]
+
+
+def test_scan_delivery_null_enqueued_at_not_rolled_back(short_env, repo):
+    """Rollback query's `enqueued_at IS NOT NULL` guard protects rows that
+    were CAS-claimed but not yet picked up by worker (post-review design).
+
+    Without this guard, a row sitting in `enqueued`+`enqueued_at=NULL` for
+    longer than 5 min would be spuriously rolled back, breaking the very
+    fix that moves stamping to worker pickup.
+    """
+    _tid, run_id = _make_pending_run(repo, session_id="sess_null_ts")
+    # Simulate CAS-claimed but worker has not stamped yet.
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='enqueued', enqueued_at=NULL "
+        "WHERE id=?", (run_id,),
+    )
+    repo.conn.commit()
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    sup._scan_delivery_outbox(repo)
+    assert _delivery_state(repo.conn, run_id) == "enqueued", \
+        "NULL enqueued_at must be immune to rollback (worker may still pick up)"
+
+
+# ---------------------------------------------------------------------------
+# Worker-side contract for the dequeue-time enqueued_at stamp.
+# These live here (not test_worker.py) because the stamp + rollback form
+# one semantic contract with the watcher; keeping them adjacent prevents
+# future refactors from drifting the two sides apart.
+# ---------------------------------------------------------------------------
+
+def test_bg_mark_dequeued_stamps_enqueued_at_when_null(short_env, repo):
+    """Happy path: worker pickup on an `enqueued`+NULL row stamps now."""
+    from feishu_bridge.worker import _bg_mark_dequeued
+
+    _tid, run_id = _make_pending_run(repo, session_id="sess_worker_stamp")
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='enqueued', enqueued_at=NULL "
+        "WHERE id=?", (run_id,),
+    )
+    repo.conn.commit()
+
+    before = int(time.time() * 1000)
+    _bg_mark_dequeued({"_bg_run_id": run_id, "_bg_db_path": short_env["db_path"]})
+    after = int(time.time() * 1000)
+
+    row = repo.conn.execute(
+        "SELECT enqueued_at FROM bg_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    assert row["enqueued_at"] is not None, "dequeue must stamp enqueued_at"
+    assert before <= row["enqueued_at"] <= after
+
+
+def test_bg_mark_dequeued_idempotent_noop_when_already_stamped(short_env, repo):
+    """Re-fire on the same run (e.g. CAS lost then retry) is a silent no-op:
+    the UPDATE's `enqueued_at IS NULL` guard prevents stamp drift."""
+    from feishu_bridge.worker import _bg_mark_dequeued
+
+    _tid, run_id = _make_pending_run(repo, session_id="sess_stamp_idem")
+    original_stamp = int(time.time() * 1000) - 10_000  # 10s ago
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='enqueued', enqueued_at=? WHERE id=?",
+        (original_stamp, run_id),
+    )
+    repo.conn.commit()
+
+    _bg_mark_dequeued({"_bg_run_id": run_id, "_bg_db_path": short_env["db_path"]})
+    row = repo.conn.execute(
+        "SELECT enqueued_at FROM bg_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    assert row["enqueued_at"] == original_stamp, \
+        "second stamp attempt must not overwrite the first"
+
+
+def test_bg_mark_dequeued_noop_for_non_bg_items(short_env):
+    """Human turn items (no _bg_run_id) must be silently ignored."""
+    from feishu_bridge.worker import _bg_mark_dequeued
+
+    # Should not raise nor touch any DB.
+    _bg_mark_dequeued({})
+    _bg_mark_dequeued({"_bg_run_id": None, "_bg_db_path": short_env["db_path"]})
+    _bg_mark_dequeued({"_bg_run_id": 42, "_bg_db_path": None})

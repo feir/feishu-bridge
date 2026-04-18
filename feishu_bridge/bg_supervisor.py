@@ -23,11 +23,19 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from feishu_bridge.bg_synthetic_turn import build_synthetic_turn
 from feishu_bridge.bg_tasks_db import BgTaskRepo, connect, init_db
+from feishu_bridge.runtime import SessionMap
+from feishu_bridge.session_resume import (
+    SessionsIndex,
+    build_fresh_fallback_prefix,
+    resolve_resume_status,
+)
 
 log = logging.getLogger("feishu-bridge.bg-supervisor")
 
@@ -37,6 +45,14 @@ _ACCEPT_TIMEOUT_S = 0.5
 _RECV_TIMEOUT_S = 0.5
 _PROBE_TIMEOUT_S = 0.2
 _LISTEN_BACKLOG = 8
+
+# 5 min: max time an `enqueued` row may sit before we assume the enqueueing
+# bridge crashed between CAS and handing the item to worker. Rollback is
+# bridge-crash recovery, so it does NOT bump_attempt (the retry budget is
+# reserved for genuine delivery failures). Value is spec-pinned at
+# design.md:391/470/509 — changing it requires a spec revision.
+_STUCK_ENQUEUED_MS = 5 * 60 * 1000
+_DELIVERY_BATCH_LIMIT = 32
 
 
 class BgSupervisor:
@@ -63,6 +79,9 @@ class BgSupervisor:
         runner_cmd: Optional[list[str]] = None,
         poll_interval: float = 1.0,
         spawner: Callable[..., Any] = subprocess.Popen,
+        enqueue_fn: Optional[Callable[..., Any]] = None,
+        bot_id: Optional[str] = None,
+        sessions_index: Optional[SessionsIndex] = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._tasks_dir = Path(tasks_dir)
@@ -75,6 +94,13 @@ class BgSupervisor:
         ]
         self._poll_interval = float(poll_interval)
         self._spawner = spawner
+        # 4.5 delivery watcher wiring. None when tests instantiate the
+        # supervisor in isolation — `_scan_delivery_outbox` still runs
+        # stuck-rollback (pure DB) and then no-ops before touching the
+        # queue so unit tests without a full bridge stay stable.
+        self._enqueue_fn = enqueue_fn
+        self._bot_id = bot_id
+        self._sessions_index = sessions_index
 
         self._stop_evt = threading.Event()
         self._started = False
@@ -467,12 +493,183 @@ class BgSupervisor:
                 pass
         return flipped
 
-    # ---- delivery seam (Section 4.5 fills) -----------------------------------
+    # ---- delivery watcher (Section 4.5) --------------------------------------
 
     def _scan_delivery_outbox(self, repo: BgTaskRepo) -> int:
-        """Hook for the delivery watcher (Section 4.5).
+        """Drain pending bg-run deliveries into the chat queue.
 
-        The poller and every wake kind already route here so 4.5 only has to
-        fill the body; the wiring is done.
+        Steps, in order:
+          1. Rollback runs stuck in ``enqueued`` > 5 min (bridge crashed
+             between CAS and the worker consuming the item). NO attempt
+             bump — crash recovery isn't a genuine delivery failure.
+          2. Early-return if the supervisor was constructed without
+             ``enqueue_fn`` (unit tests exercise the DB-only paths).
+          3. For each pending/delivery_failed run: resolve session resume
+             status, build the synthetic turn, CAS-claim the row into
+             ``enqueued``, and hand to ``enqueue_fn``. An enqueue exception
+             drops the row back to ``delivery_failed`` with ``bump_attempt``.
+
+        Returns the number of rows successfully handed to ``enqueue_fn``.
+
+        Depends on ``connect()`` running in autocommit mode
+        (``isolation_level=None`` per bg_tasks_db.py:210). The stuck-enqueued
+        UPDATE and the CAS below must be visible cross-connection immediately,
+        otherwise concurrent supervisors would double-deliver.
         """
-        return 0
+        now_ms = int(time.time() * 1000)
+
+        # Step 1: stuck-enqueued rollback. Race with worker's own
+        # `expected_from='enqueued'` CAS is resolved by whichever UPDATE
+        # wins; loser is a silent no-op.
+        try:
+            repo.conn.execute(
+                """UPDATE bg_runs
+                   SET delivery_state='pending', enqueued_at=NULL
+                   WHERE delivery_state='enqueued'
+                     AND enqueued_at IS NOT NULL
+                     AND enqueued_at < ?""",
+                (now_ms - _STUCK_ENQUEUED_MS,),
+            )
+        except Exception:
+            log.exception("bg-supervisor: stuck-enqueued rollback failed")
+
+        if self._enqueue_fn is None:
+            return 0
+
+        try:
+            pending = repo.list_pending_deliveries(limit=_DELIVERY_BATCH_LIMIT)
+        except Exception:
+            log.exception("bg-supervisor: list_pending_deliveries failed")
+            return 0
+
+        delivered = 0
+        for run_row in pending:
+            run_id = run_row["id"]
+            task_id = run_row["task_id"]
+            try:
+                task_row = repo.get(task_id)
+            except Exception:
+                log.exception("bg-supervisor: repo.get(%s) failed", task_id)
+                continue
+            if task_row is None:
+                # Orphan run (bg_tasks row deleted but bg_runs row survived —
+                # FK CASCADE should prevent this, but DB corruption or
+                # reconciler bugs could produce it). Mark terminal so the
+                # attempt_count<10 retry cap eventually retires the row
+                # instead of looping forever on every poll tick.
+                log.warning(
+                    "bg-supervisor: run %s references missing task %s — "
+                    "marking delivery_failed", run_id, task_id,
+                )
+                try:
+                    repo.mark_delivery_state(
+                        run_id, "delivery_failed",
+                        expected_from=run_row["delivery_state"],
+                        bump_attempt=True,
+                        error=f"missing_task:{task_id}",
+                    )
+                except Exception:
+                    log.exception(
+                        "bg-supervisor: mark orphan run %s failed", run_id,
+                    )
+                continue
+
+            try:
+                status, reason = resolve_resume_status(
+                    task_row.session_id, self._sessions_index, now_ms,
+                )
+            except Exception:
+                log.exception(
+                    "bg-supervisor: resolve_resume_status crashed for run %s",
+                    run_id,
+                )
+                status, reason = ("resume_failed", "resolve_exception")
+
+            # Build synthetic turn from run_row + task_row. Wrapper writes
+            # tails as BLOB; build_synthetic_turn expects bytes, so pass
+            # through untouched (None → b"" via `or b""`).
+            duration_s = 0
+            finished = run_row["finished_at"]
+            started = run_row["started_at"]
+            if isinstance(finished, int) and isinstance(started, int):
+                duration_s = max(0, (finished - started) // 1000)
+            synthetic = build_synthetic_turn(
+                task_id=task_id,
+                manifest_path=run_row["manifest_path"] or "",
+                state=task_row.state,
+                reason=task_row.reason,
+                duration_seconds=duration_s,
+                exit_code=run_row["exit_code"],
+                signal=run_row["signal"],
+                output_paths=task_row.output_paths or [],
+                stdout_tail=run_row["stdout_tail"] or b"",
+                stderr_tail=run_row["stderr_tail"] or b"",
+                on_done_prompt=task_row.on_done_prompt or "",
+            )
+
+            # design.md:517 — both `fresh_fallback` and `resume_failed` go
+            # through the new-session + NOTE branch. Only `resumed` keeps the
+            # stored sid. Routing `resume_failed` back into resume would defeat
+            # the whole point of the probe: we already know resume won't work.
+            if status in ("fresh_fallback", "resume_failed"):
+                prompt = build_fresh_fallback_prefix(reason) + "\n\n" + synthetic
+                effective_sid: Optional[str] = None
+            else:
+                prompt = synthetic
+                effective_sid = task_row.session_id
+
+            # CAS: pending → enqueued. If we lose (another scheduler won
+            # this row, or it was cancelled), skip silently.
+            # enqueued_at is intentionally NOT stamped here — worker.py stamps
+            # it at dequeue time via `_bg_mark_dequeued`. This scopes the
+            # stuck-rollback's 5 min to "worker picked up but never ack'd"
+            # (i.e. bridge-crash recovery, per design.md:391), matching the
+            # spec's crash-only intent rather than bounding total queue-wait +
+            # turn time, which would cause duplicate delivery on long turns.
+            try:
+                claimed = repo.mark_delivery_state(
+                    run_id, "enqueued",
+                    expected_from=run_row["delivery_state"],
+                    session_resume_status=f"{status}:{reason}",
+                )
+            except Exception:
+                log.exception(
+                    "bg-supervisor: CAS to enqueued failed for run %s", run_id,
+                )
+                continue
+            if not claimed:
+                continue
+
+            session_key = SessionMap.format_key(
+                (self._bot_id, task_row.chat_id, task_row.thread_id),
+            )
+            try:
+                self._enqueue_fn(
+                    chat_id=task_row.chat_id,
+                    session_key=session_key,
+                    prompt=prompt,
+                    kind="bg_task_completion",
+                    session_id=effective_sid,
+                    extras={
+                        "_bg_run_id": run_id,
+                        "thread_id": task_row.thread_id,
+                    },
+                )
+                delivered += 1
+            except Exception as e:
+                log.exception(
+                    "bg-supervisor: enqueue_fn raised for run %s", run_id,
+                )
+                try:
+                    repo.mark_delivery_state(
+                        run_id, "delivery_failed",
+                        expected_from="enqueued",
+                        bump_attempt=True,
+                        error=f"enqueue_failed: {type(e).__name__}: {e}",
+                    )
+                except Exception:
+                    log.exception(
+                        "bg-supervisor: rollback to delivery_failed also failed "
+                        "for run %s", run_id,
+                    )
+        return delivered
