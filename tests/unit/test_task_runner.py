@@ -375,15 +375,23 @@ def test_nudge_sends_frame_when_sock_present(tmp_path: Path):
     short_dir.mkdir()
     try:
         sock_path = short_dir / "wake.sock"
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        # Protocol is SOCK_STREAM (matches BgSupervisor + cli._bg_nudge);
+        # bind + listen here, then accept to read the \x03 frame.
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             server.bind(str(sock_path))
+            server.listen(1)
             server.settimeout(2.0)
 
             task_id_hex = uuid.uuid4().hex
             task_runner._nudge(short_dir, task_id_hex)
 
-            data, _ = server.recvfrom(64)
+            client, _ = server.accept()
+            try:
+                client.settimeout(2.0)
+                data = client.recv(64)
+            finally:
+                client.close()
             assert data[:1] == b"\x03"
             assert data[1:] == uuid.UUID(hex=task_id_hex).bytes
         finally:

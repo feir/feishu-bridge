@@ -982,6 +982,25 @@ class FeishuBot:
             auto_reconnect=True,
         )
 
+        # Boot background-task supervisor before the WS loop blocks.
+        # Paths mirror feishu_bridge.cli (_bg_home / bg_tasks.db / wake.sock).
+        self._bg_supervisor = None
+        try:
+            from feishu_bridge.bg_supervisor import BgSupervisor
+            bg_home = Path.home() / ".feishu-bridge"
+            self._bg_supervisor = BgSupervisor(
+                db_path=bg_home / "bg_tasks.db",
+                tasks_dir=bg_home / "bg_tasks",
+                sock_path=bg_home / "wake.sock",
+            )
+            self._bg_supervisor.start()
+        except Exception:
+            # Swallow so a bg-tasks boot failure doesn't kill the WS loop.
+            # The /status command should surface this (bg_supervisor is None).
+            log.warning("bg-supervisor failed to start — bridge continues "
+                        "without background-task support", exc_info=True)
+            self._bg_supervisor = None
+
         log.info("Connecting to Feishu WebSocket (bot=%s)...", self.bot_id)
         ws_client.start()  # Blocks forever
 
@@ -1757,6 +1776,15 @@ def main():
         bot.start()
     except KeyboardInterrupt:
         log.info("Shutting down")
+    finally:
+        # Graceful shutdown of the bg-task supervisor so wake.sock is
+        # unlinked and threads exit cleanly on next boot.
+        sup = getattr(bot, "_bg_supervisor", None)
+        if sup is not None:
+            try:
+                sup.stop()
+            except Exception:
+                log.warning("bg-supervisor stop failed", exc_info=True)
 
 
 if __name__ == "__main__":

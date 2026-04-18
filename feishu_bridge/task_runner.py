@@ -666,13 +666,20 @@ def _signal_name_from_exit_code(exit_code: int) -> Optional[str]:
 
 
 def _nudge(bridge_home: Path, task_id: str) -> None:
+    """Send \\x03+uuid delivery-ready nudge to bridge wake.sock.
+
+    Uses SOCK_STREAM to match the supervisor listener (bg_supervisor.py) and
+    the CLI nudger (cli._bg_nudge). Fail-open: if no bridge is listening or
+    the connect fails, the poller will catch up within poll_interval.
+    """
     sock_path = bridge_home / "wake.sock"
     if not sock_path.exists():
         return
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
-            s.sendto(b"\x03" + uuid.UUID(hex=task_id).bytes, str(sock_path))
+            s.connect(str(sock_path))
+            s.sendall(b"\x03" + uuid.UUID(hex=task_id).bytes)
     except (OSError, ValueError) as exc:
         log.debug("nudge to %s failed (non-fatal): %s", sock_path, exc)
 
