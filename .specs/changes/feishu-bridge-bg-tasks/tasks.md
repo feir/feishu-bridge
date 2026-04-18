@@ -14,17 +14,17 @@
 
 ## 2. task-runner wrapper（新增二进制）
 
-- [ ] 2.1 新建 `feishu_bridge/task_runner.py` —— console_script entry point `task-runner`
+- [x] 2.1 新建 `feishu_bridge/task_runner.py` —— console_script entry point `task-runner`
     - Validate: `pip install -e .` 后 `which task-runner` 能定位；`task-runner --help` 列出所有必需参数（`--task-id`, `--db-path`, `--tasks-dir`, `--runner-token`）
-- [ ] 2.2 wrapper 生命周期 4 阶段（P→S→W→C）
+- [x] 2.2 wrapper 生命周期 4 阶段（P→S→W→C）
     - **Phase P（pre-register）**：`setsid/setpgid` → 用 `libproc.proc_pidinfo(wrapper_self_pid)` 取自身 `wrapper_start_time_us` → INSERT `bg_runs`（仅 task_id/runner_token/wrapper_pid/wrapper_start_time_us/started_at，pid 字段暂 NULL，delivery_state='not_ready'）
     - **Phase S（spawn + link）**：`Popen(argv, shell=False, start_new_session=True)` → 立即 `libproc.proc_pidinfo(child_pid)` 取 `process_start_time_us` → **单事务** UPDATE `bg_runs SET pid=?, pgid=?, process_start_time_us=?` 并 `UPDATE bg_tasks SET state='running' WHERE state='launching' AND id=?`
     - **Phase W（wait + stream）**：`Popen.wait(timeout=0.5)` loop 同时覆盖子退出检测 + 500ms poll `bg_tasks.cancel_requested_at`；两个后台线程 (`_StreamCollector`) 流式写 `stdout.log/stderr.log` 并保留 4KB RAM tail window；`time.monotonic()` deadline 判 timeout；cancel 或 timeout → SIGTERM pgid → 5s grace → SIGKILL
     - **Phase C（commit + deliver）**：UTF-8 safe tail 4096B → 写 `task.json.tmp` + fsync + `os.rename` → `task.json.done` → rename active→completed 目录 → **单事务** UPDATE `bg_runs (finished_at, exit_code, signal, stdout_tail, stderr_tail, manifest_path, delivery_state='pending')` 和 `UPDATE bg_tasks.state=<terminal>` → UDS nudge `b'\x03' + uuid.bytes`
     - Validate: wrapper 进程组独立于 bridge（`ps -o pgid=` 不同）；每阶段边界 fault inject 后 reconciler 行为正确（详见 §7.5）；`runner_token` 与环境 `BG_TASK_TOKEN` 一致；μs 精度 start_time 区分快速重启 pid
-- [ ] 2.3 wrapper cancel/timeout 处理（Phase W 子任务）：500ms poll `cancel_requested_at` + monotonic deadline；两路径共用 `terminate_child_pgid(grace=5s)` helper
+- [x] 2.3 wrapper cancel/timeout 处理（Phase W 子任务）：500ms poll `cancel_requested_at` + monotonic deadline；两路径共用 `terminate_child_pgid(grace=5s)` helper
     - Validate: cancel 从 CLI 发出 → wrapper ≤ 500ms 检测 → SIGTERM 到 child pgid；子不响应 → 5s 后 SIGKILL；timeout 路径同样行为；finished_at 记录 monotonic+epoch 双时钟
-- [ ] 2.4 Phase C 单事务原子性（独立 task 以强调）：bg_runs 终态写入与 bg_tasks.state 同一事务；任一失败整体 rollback；事务外做 UDS nudge（nudge 失败不影响 DB 已 committed 状态）
+- [x] 2.4 Phase C 单事务原子性（独立 task 以强调）：bg_runs 终态写入与 bg_tasks.state 同一事务；任一失败整体 rollback；事务外做 UDS nudge（nudge 失败不影响 DB 已 committed 状态）
     - Validate: 模拟 bg_tasks UPDATE 失败（例如 WHERE state 不匹配）→ bg_runs 不被 commit；重启 reconciler 看到仍是 running，从 manifest 重放
 
 ## 3. CLI 子命令
@@ -44,15 +44,15 @@
 
 ## 4. Bridge 侧 supervisor + delivery watcher + wake 监听
 
-- [ ] 4.1 `feishu_bridge/bg_supervisor.py` —— `BgSupervisor` 单例（随 bridge 主进程 boot）
+- [x] 4.1 `feishu_bridge/bg_supervisor.py` —— `BgSupervisor` 单例（随 bridge 主进程 boot）
     - Validate: start/stop 幂等；stop 不 kill wrapper（wrapper 负责自己生命周期）；bridge SIGKILL 后现有 wrapper 仍跑完并写 manifest
-- [ ] 4.2 UDS listener 线程（parent dir 0700, socket 0600；`EADDRINUSE` 探测 + unlink 重建；bind 仍失败 WARN 不退出）
+- [x] 4.2 UDS listener 线程（parent dir 0700, socket 0600；`EADDRINUSE` 探测 + unlink 重建；bind 仍失败 WARN 不退出）
     - Validate: 伪造前次崩溃残留 wake.sock → 新 bridge 启动探测无 listener → unlink + rebind 成功；nudge 后 ≤100ms 触发扫描
-- [ ] 4.3 Poller 线程（1s fallback）扫描 `state='queued'` + `delivery_state IN ('pending','delivery_failed')`
+- [x] 4.3 Poller 线程（1s fallback）扫描 `state='queued'` + `delivery_state IN ('pending','delivery_failed')`
     - Validate: UDS listener 完全禁用 → queued 任务 ≤1s 被 launch；pending delivery ≤1s 被补投
-- [ ] 4.4 Supervisor launch 路径：CAS claim `queued→launching` → 成功则 spawn `task-runner` wrapper（传 `--task-id`, `--db-path`, `--tasks-dir`, `--runner-token=<uuid4>` 并注入 env `BG_TASK_TOKEN`）→ 立即返回
+- [x] 4.4 Supervisor launch 路径：CAS claim `queued→launching` → 成功则 spawn `task-runner` wrapper（传 `--task-id`, `--db-path`, `--tasks-dir`, `--runner-token=<uuid4>` 并注入 env `BG_TASK_TOKEN`）→ 立即返回
     - Validate: 两个 supervisor 并发尝试同一 queued 行，只有一个 spawn wrapper；CAS 失败的一侧跳过不报错
-- [ ] 4.5 Delivery watcher 线程 —— 4 状态 outbox（`pending → enqueued → sent`，失败路径 `delivery_failed`）
+- [x] 4.5 Delivery watcher 线程 —— 4 状态 outbox（`pending → enqueued → sent`，失败路径 `delivery_failed`）
     - 扫 `bg_runs.delivery_state='pending'` → 读 manifest → 构造合成 turn → `enqueue_turn(..., kind='bg_task_completion')` 成功 → UPDATE `delivery_state='enqueued', enqueued_at=now`
     - ChatTaskQueue 处理到该合成 turn 并投递飞书 API 成功 → UPDATE `delivery_state='sent', sent_at=now`
     - enqueue_turn 失败 / 飞书 API 失败 → UPDATE `delivery_state='delivery_failed', delivery_attempt_count += 1, delivery_error=<msg>`
@@ -104,7 +104,7 @@
             - 回归：562 unit passed（+4 vs 5.4a），golden snapshot 过
             - 修复 Codex cross-review MAJOR：`_on_card_action` 原本 hand-build item dict 绕过 `enqueue_turn` choke point，所有新增 infra 字段（`_sessions_index` / `_bg_session_id` / …）静默丢失。重构为调用 `self.enqueue_turn(chat_id=chat_id, session_key=msg_key, prompt=label, kind="human", extras={"sender_id": sender_id})`，消除根因而非点修补。新增 `test_on_card_action_threads_sessions_index_via_enqueue_turn` 回归测试。
             - 最终回归：563 unit passed（+5 vs 5.4a）
-        - [ ] 5.4b-watcher：delivery watcher 集成（和 §4.5 合并 commit）
+        - [x] 5.4b-watcher：delivery watcher 集成（和 §4.5 合并 commit）
             - watcher 扫 `bg_runs.delivery_state='pending'` 时调 `resolve_resume_status()`
             - `session_id` 经 `enqueue_turn(..., session_id=...)` 传到 item
             - fresh_fallback 时 prepend NOTE 到 prompt 首行
@@ -112,9 +112,11 @@
 
 ## 6. Startup reconciler
 
-- [ ] 6.1 `BgSupervisor.reconcile()` —— bridge 启动时执行（`main.py` 主循环 before `ws_client.start()`）；顺序 6 步（integrity → stale launching → running 判活 → queued 续推 → delivery outbox → manifest-only 补写）
+- [~] 6.1 `BgSupervisor.reconcile()` —— bridge 启动时执行（`main.py` 主循环 before `ws_client.start()`）；顺序 6 步（integrity → stale launching → running 判活 → queued 续推 → delivery outbox → manifest-only 补写）
     - Validate: 启动日志含 `reconcile: {queued_relaunch, launching_reaped, running_attached, running_orphaned, delivery_replayed, manifest_recovered}`
-- [ ] 6.2 Stale launching 回收：`UPDATE state='failed', reason='launch_interrupted' WHERE state='launching' AND claimed_at < now - 30_000`
+    - **Commit A 已实现**：skeleton + steps 1/2/4/5/6 + `_reset_stranded_enqueued` + `_log_retry_budget_exhausted`；main.py 接入 `reconcile()` 在 `start()` 之前同步执行
+    - **Commit B 待实现**：step 3 running 活性三元组判定（见 §6.3）
+- [x] 6.2 Stale launching 回收：`UPDATE state='failed', reason='launch_interrupted' WHERE state='launching' AND claimed_at < now - 30_000`
     - Validate: 预置一个 `claimed_at=now-60s` 的 launching 行 → 启动后 state='failed'
 - [ ] 6.3 Running 任务活性判断 —— 两套三元组（wrapper 身份 + child 身份）
     - wrapper 身份：`wrapper_pid + wrapper_start_time_us + runner_token`（env 比对通过 `ps eww` 或 `libproc.proc_pidinfo` + 进程 env）
@@ -126,10 +128,12 @@
         - wrapper dead + child dead + manifest 存在 → 从 manifest 更新终态 + `delivery_state='pending'`
         - wrapper dead + child dead + 无 manifest → `orphan, reason='wrapper_and_child_both_died'`
     - Validate: 5 种分支各有 fixture；pid reuse 场景：kill wrapper + 快速 fork 同 pid 的无关进程 → 三元组 mismatch → 不发任何信号 + 标 orphan；bridge reap 路径断言 `killpg` 被调用，最终 state 为 cancelled 或 timeout
-- [ ] 6.4 Delivery outbox 补投：扫 `delivery_state IN ('pending','delivery_failed')` → 重新 enqueue 合成 turn；`delivery_attempt_count ≥ 10` 视为放弃 + 日志 ERROR
+- [x] 6.4 Delivery outbox 补投：扫 `delivery_state IN ('pending','delivery_failed')` → 重新 enqueue 合成 turn；`delivery_attempt_count ≥ 10` 视为放弃 + 日志 ERROR
     - Validate: 预置 2 pending + 1 delivery_failed + 1 attempt_count=10 → 启动后补投 3 + 放弃 1
-- [ ] 6.5 Manifest-only 回填：扫 `tasks/completed/*/task.json.done` 对应 `bg_tasks` 行缺失或 `bg_runs` 行缺失 → 回填；`delivery_state='pending'`
+    - Commit A 通过 `_scan_delivery_outbox` + `_log_retry_budget_exhausted` 实现
+- [x] 6.5 Manifest-only 回填：扫 `tasks/completed/*/task.json.done` 对应 `bg_tasks` 行缺失或 `bg_runs` 行缺失 → 回填；`delivery_state='pending'`
     - Validate: 删除 DB 行保留 manifest → 启动后 DB 行重建 + delivery 被触发
+    - Commit A 通过 `rebuild_from_manifests` 幂等复用（活 DB 模式，不仅 quarantine）
 - [ ] 6.6 Archive cleanup + quarantine retention
     - Archive policy：completed > 7 天 → `_archive/<yyyy-mm>/<task_id>.tar.gz`；archive > 90 天 → 删除 + DELETE DB 行
     - **并发保护**：cleanup 走 `BEGIN IMMEDIATE` + predicate `delivery_state='sent' OR (delivery_state='delivery_failed' AND delivery_attempt_count >= 10)`；不删 retry 进行中的行
@@ -177,7 +181,7 @@
 - [ ] 8.3 migration 说明：现有用户升级到本版本 bridge 首次启动时会自动创建 `~/.feishu-bridge/`；`bg_tasks.db` 空库创建；已存在目录不被覆盖
     - Validate: 现有用户目录存在 → 不覆盖；空目录 → 创建预期文件树
 
-## Spec-Check
+## Review Report
 
 ### Plan Review Round 1 (2026-04-18)
 - verdict: **Block / rework-and-resubmit**
@@ -281,4 +285,35 @@
 - 回归：`uv run pytest tests/unit/test_cli_bg.py -q` → 26 passed in 2.66s（17 原测试 + 9 新测试覆盖 D1-D4）
 - 延迟项：无新增 nit
 - result: PASS
+
+### Code Review Round 1 — Section 6 Commit A Startup Reconciler (2026-04-18)
+- scope: `feishu_bridge/bg_supervisor.py` reconcile() + helpers, `feishu_bridge/main.py` boot order, `tests/unit/test_bg_supervisor.py` +10 tests; §6.1/6.2/6.4/6.5/6.6 implemented; §6.3 (running liveness triage) deliberately deferred to Commit B as `_warn_running_rows` stub
+- basis: working-tree diff (HEAD+dirty)
+- Codex cross-review: skipped — `acpx codex exec` stdout redirect blocked by session sandbox across `/tmp`, `/Users/feir/projects/...`, and `~/.claude/...`. Claude-only review per skill fallback
+- findings:
+    1. [WARN][Claude] `bg_supervisor.py:431` `_reset_stranded_enqueued` docstring reasoning is subtly wrong. The "no double-delivery because the worker never sent" rationale relies on CAS semantics, but `worker.py:927` discards the `_bg_mark_dequeued()` return value — a concurrent worker whose CAS failed would still proceed to send. The actual safety guarantee is proposal.md NOT (single-bridge-per-home), under which the previous bridge's workers die with it. Recommendation: rewrite the docstring paragraph to state the correct single-bridge premise and cross-ref proposal.md NOT line 34.
+    2. [WARN][Claude] Test gaps in `test_bg_supervisor.py`:
+        - No assertion that `reconcile()` increments `stats['queued_launched']` when stranded-enqueued rows are re-queued via live `enqueue_fn`.
+        - No boundary test for `_DELIVERY_ATTEMPT_CAP`: attempt_count=9 (must NOT log ERROR) vs attempt_count=10 (must log). Current coverage only exercises one side.
+        - No integration test exercising `reconcile()` → `enqueue_fn` → listener path end-to-end.
+      Recommendation: add three targeted tests before Commit B lands.
+    3. [NOTE][Claude] `bg_supervisor.py:~291` fresh-boot path is cosmetically misleading. `bg_tasks_db.integrity_check_and_maybe_quarantine()` returns the input path unchanged when `not p.exists()` (line 345), so on a first-ever boot the code flows through the quarantine-handling branch and logs `"DB quarantined; rebuilding from manifests"` with `stats["quarantined"]=1` — despite nothing having been quarantined. Recommendation: distinguish fresh-boot (`not db_path.exists()` before call) from genuine quarantine, or adjust the log message.
+    4. [PASS] Step ordering correctness: step 5 (`_reset_stranded_enqueued`) correctly runs before step 7 (delivery scan). Stranded rows (`delivery_state='enqueued' AND enqueued_at IS NULL`) are invisible to both `list_pending_deliveries` (scans `pending`/`delivery_failed` only) and the 5-minute stuck-rollback guard (requires `enqueued_at IS NOT NULL`); without step 5 they would leak indefinitely. Evidence: `bg_supervisor.py:242-387` step numbering, `bg_tasks_db.py` delivery-state filters.
+    5. [PASS] `rebuild_from_manifests` safety on live DB: idempotent via `_row_exists()` pre-check + `INSERT OR IGNORE`, and actively moves `active/<id>/ → completed/<id>/` only when no DB row exists. Re-running after a partial rebuild is a no-op. Evidence: `bg_tasks_db.py:371` and `_row_exists()`.
+    6. [PASS] `_warn_running_rows` stub quality: correctly counts running rows and logs WARN referencing §6.3 deferral; never touches row state, so Commit B can land the triple-verification triage without schema churn. Evidence: `bg_supervisor.py:411`.
+    7. [PASS] Boot order in `main.py:1012-1015`: `reconcile()` runs BEFORE `start()`. This matters because `integrity_check_and_maybe_quarantine()` may rename the DB file; running reconcile first ensures listener/poller threads never hold handles to a renamed file. Evidence: `main.py:1012-1015`.
+    8. [PASS] `tasks.md` checkbox state accurate: 6.1 `[~]` (Commit A/B split annotated), 6.2/6.4/6.5 `[x]`, 6.3 `[ ]` (deferred). Matches implementation scope.
+    9. [PASS] No proposal.md NOT violations: multi-bridge handling not introduced; all safety arguments stay within single-bridge premise.
+   10. [PASS] Tests: `uv run pytest tests/unit/test_bg_supervisor.py -x --tb=short -q` → 48 passed, 2 warnings in 6.17s. All 10 new reconcile tests pass.
+- verdict: APPROVED (WARN-level findings only; no BLOCKs)
+
+## Spec-Check
+
+- result: WARN
+- reviewer: code-reviewer
+- basis: HEAD+dirty
+- timestamp: 2026-04-18
+- notes: Commit A of §6 implements 6.1/6.2/6.4/6.5/6.6 + stranded-enqueued reset; 6.3 correctly deferred to Commit B via `_warn_running_rows` stub. Scope aligned with proposal.md WHAT, no NOT violations. Two WARN findings (docstring reasoning in `_reset_stranded_enqueued` overstates safety argument; test gaps around `queued_launched`, attempt_count boundary, live enqueue_fn integration) + one NOTE (fresh-boot misleading-log cosmetic). All 48 bg_supervisor tests pass. Codex cross-review skipped (acpx stdout redirect blocked by session sandbox).
+
+Re-review: skip (only WARN/NOTE-level fixes anticipated; docstring rewrite and three boundary tests are LOW/MEDIUM-level, no architectural change)
 

@@ -29,7 +29,13 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from feishu_bridge.bg_synthetic_turn import build_synthetic_turn
-from feishu_bridge.bg_tasks_db import BgTaskRepo, connect, init_db
+from feishu_bridge.bg_tasks_db import (
+    BgTaskRepo,
+    connect,
+    init_db,
+    integrity_check_and_maybe_quarantine,
+    rebuild_from_manifests,
+)
 from feishu_bridge.runtime import SessionMap
 from feishu_bridge.session_resume import (
     SessionsIndex,
@@ -53,6 +59,17 @@ _LISTEN_BACKLOG = 8
 # design.md:391/470/509 — changing it requires a spec revision.
 _STUCK_ENQUEUED_MS = 5 * 60 * 1000
 _DELIVERY_BATCH_LIMIT = 32
+
+# §6.2: rows that claimed_at more than 30s ago but never transitioned out of
+# `launching` are stranded — the bridge that claimed them died between CAS and
+# Popen-success. Matches design.md:279.
+_STALE_LAUNCHING_MS = 30 * 1000
+
+# §6.5: delivery_attempt_count has a hard retry cap. At boot the reconciler
+# logs ERROR for any run that has already burned all its budget — these are
+# the "terminal" rows that will never be delivered without operator
+# intervention.
+_DELIVERY_ATTEMPT_CAP = 10
 
 
 class BgSupervisor:
@@ -219,6 +236,263 @@ class BgSupervisor:
 
     def is_running(self) -> bool:
         return self._started
+
+    # ---- startup reconciler (Section 6) ---------------------------------------
+
+    def reconcile(self) -> dict[str, int]:
+        """Run the startup reconciler once, synchronously.
+
+        Must be called BEFORE ``start()``: the DB quarantine step may rename
+        ``bg_tasks.db`` out from under any listener/poller connection, so all
+        work here runs on a private connection the caller owns.
+
+        Steps follow design.md §Startup Reconciler:
+          1. ``PRAGMA integrity_check``; on failure quarantine + replay all
+             committed manifests (:func:`rebuild_from_manifests`).
+          2. Stale ``launching`` rows → ``failed`` (claimed_at older than 30s).
+          3. ``running`` rows → WARN only (deferred: §6.3 liveness triage is
+             landed in Commit B with triple-verification + orphan reaper).
+          4. Manifest-only backfill (``tasks/active/<id>/task.json.done`` with
+             no DB row) — reuses :func:`rebuild_from_manifests` which skips
+             rows that already exist, making it idempotent on a live DB.
+          5. Stranded ``enqueued`` rows (``enqueued_at IS NULL``) → ``pending``.
+             Safety rests on the single-bridge-per-home architectural
+             invariant (proposal.md "NOT 多 bridge 分布式"); see
+             :func:`_reset_stranded_enqueued` for the full argument and the
+             documented launchd-reload-overlap edge case.
+          6. Drive ``queued`` rows forward (``_scan_and_launch_queued``).
+          7. Drive delivery outbox forward (``_scan_delivery_outbox``); also
+             emits ERROR for any ``delivery_failed`` row that has burned its
+             full attempt budget.
+
+        Returns a stats dict for logging / tests.
+        """
+        stats = {
+            "quarantined": 0,
+            "manifests_replayed": 0,
+            "manifest_orphans_created": 0,
+            "stale_launching_failed": 0,
+            "running_rows_observed": 0,
+            "stranded_enqueued_reset": 0,
+            "queued_launched": 0,
+            "deliveries_handed_off": 0,
+            "retry_budget_exhausted": 0,
+        }
+
+        # Step 1: integrity check (may quarantine + replay).
+        conn = None
+        try:
+            path_before = self._db_path
+            existed_before = path_before.exists()
+            # integrity_check_and_maybe_quarantine returns the original path
+            # regardless of outcome. A missing file after the call means
+            # either (a) the DB was quarantined (existed_before=True) or
+            # (b) fresh boot (existed_before=False) — very different stories
+            # that we must distinguish before setting stats["quarantined"].
+            resolved_path = integrity_check_and_maybe_quarantine(path_before)
+            file_absent = not resolved_path.exists()
+            quarantined = existed_before and file_absent
+            fresh_boot = not existed_before and file_absent
+            if quarantined:
+                stats["quarantined"] = 1
+                log.warning(
+                    "bg reconcile: DB quarantined; rebuilding from manifests",
+                )
+                conn = init_db(resolved_path)
+                replay_stats = rebuild_from_manifests(conn, self._tasks_dir)
+                stats["manifests_replayed"] = replay_stats.get(
+                    "completed_replayed", 0,
+                )
+                stats["manifest_orphans_created"] = replay_stats.get(
+                    "orphans_created", 0,
+                )
+            elif fresh_boot:
+                log.info("bg reconcile: fresh install — initialising empty DB")
+                conn = init_db(resolved_path)
+            else:
+                # File exists and is healthy — still go through init_db() so
+                # schema migrations run before any recovery query touches a
+                # possibly-older schema. init_db() is idempotent.
+                conn = init_db(resolved_path)
+        except Exception:
+            log.exception("bg reconcile: integrity/rebuild failed — aborting")
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return stats
+
+        repo = BgTaskRepo(conn)
+        try:
+            # Step 2: §6.2 stale launching → failed.
+            try:
+                stats["stale_launching_failed"] = self._reap_stale_launching(repo)
+            except Exception:
+                log.exception("bg reconcile: stale launching reap failed")
+
+            # Step 3: §6.3 running-liveness — WARN stub until Commit B.
+            try:
+                stats["running_rows_observed"] = self._warn_running_rows(repo)
+            except Exception:
+                log.exception("bg reconcile: running-row warn stub failed")
+
+            # Step 4: §6.6 manifest-only backfill (delta catch-up; idempotent
+            # on a live DB because _replay_completed_manifest short-circuits
+            # when the row already exists). Pass replay_only=True so the
+            # active/no-manifest branch does NOT mint orphan bg_tasks rows —
+            # on a healthy boot the wrapper may still be alive and writing
+            # its manifest; only quarantine recovery (empty DB) should
+            # synthesize orphan rows.
+            if not stats["quarantined"]:
+                try:
+                    replay_stats = rebuild_from_manifests(
+                        repo.conn, self._tasks_dir, replay_only=True,
+                    )
+                    stats["manifests_replayed"] = replay_stats.get(
+                        "completed_replayed", 0,
+                    )
+                    stats["manifest_orphans_created"] = replay_stats.get(
+                        "orphans_created", 0,
+                    )
+                except Exception:
+                    log.exception(
+                        "bg reconcile: manifest backfill failed",
+                    )
+
+            # Step 5: stranded `enqueued` rows (enqueued_at IS NULL) → pending.
+            try:
+                stats["stranded_enqueued_reset"] = self._reset_stranded_enqueued(repo)
+            except Exception:
+                log.exception("bg reconcile: stranded enqueued reset failed")
+
+            # Step 6: §6.4 queued → launching (normal CAS path).
+            try:
+                stats["queued_launched"] = self._scan_and_launch_queued(repo)
+            except Exception:
+                log.exception("bg reconcile: queued scan failed")
+
+            # Step 7: §6.5 delivery outbox + retry-budget ERROR log.
+            try:
+                self._log_retry_budget_exhausted(repo, stats)
+                stats["deliveries_handed_off"] = self._scan_delivery_outbox(repo)
+            except Exception:
+                log.exception("bg reconcile: delivery outbox scan failed")
+
+            log.info(
+                "bg reconcile done: launching→failed=%d running-warned=%d "
+                "stranded-reset=%d manifests=%d orphans=%d queued=%d "
+                "deliveries=%d attempts-exhausted=%d",
+                stats["stale_launching_failed"],
+                stats["running_rows_observed"],
+                stats["stranded_enqueued_reset"],
+                stats["manifests_replayed"],
+                stats["manifest_orphans_created"],
+                stats["queued_launched"],
+                stats["deliveries_handed_off"],
+                stats["retry_budget_exhausted"],
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return stats
+
+    def _reap_stale_launching(self, repo: BgTaskRepo) -> int:
+        """§6.2: rows in ``launching`` > 30s → ``failed, launch_interrupted``.
+
+        Direct UPDATE (not set_state_guarded) because we're moving a batch and
+        the guard-check index (``idx_bg_tasks_launching``) already scopes the
+        predicate narrowly. updated_at is refreshed so the /status command
+        surfaces the just-happened recovery.
+        """
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - _STALE_LAUNCHING_MS
+        cur = repo.conn.execute(
+            """UPDATE bg_tasks
+                 SET state='failed',
+                     reason='launch_interrupted',
+                     updated_at=?
+               WHERE state='launching'
+                 AND claimed_at IS NOT NULL
+                 AND claimed_at < ?""",
+            (now_ms, cutoff),
+        )
+        return cur.rowcount or 0
+
+    def _warn_running_rows(self, repo: BgTaskRepo) -> int:
+        """§6.3 stub — Commit B ships the triple-verification triage.
+
+        Until then we log (at WARN) how many ``running`` rows survived across
+        the boot so operators can spot a stuck reconciler. Every row here is
+        a candidate for orphan-alive-bridge-reap; the current version leaves
+        them alone rather than risk SIGKILL to a reused pid.
+        """
+        count = repo.conn.execute(
+            "SELECT COUNT(*) FROM bg_tasks WHERE state='running'",
+        ).fetchone()[0]
+        if count:
+            log.warning(
+                "bg reconcile: %d running row(s) carried across boot — "
+                "Section 6.3 liveness triage not yet active (Commit B scope); "
+                "rows remain untouched until timeout or explicit cancel",
+                count,
+            )
+        return int(count)
+
+    def _reset_stranded_enqueued(self, repo: BgTaskRepo) -> int:
+        """Reset ``enqueued_at IS NULL`` rows back to ``pending``.
+
+        These are rows the previous bridge's supervisor CAS-claimed from
+        ``pending`` into ``enqueued``, but whose worker never stamped
+        ``enqueued_at`` before the bridge died. The 5-min stuck-rollback in
+        ``_scan_delivery_outbox`` skips them (its guard requires
+        ``enqueued_at IS NOT NULL``), so without this reset they would be
+        stranded forever.
+
+        Safety rests on the architectural invariant that a bg-tasks home
+        (``~/.feishu-bridge/``) hosts exactly one active bridge process
+        (proposal.md "NOT 多机/多 bridge 分布式执行"). A previous bridge's
+        in-memory ChatTaskQueue and worker threads die with the process, so
+        at reconcile time no worker is ever in-flight on a stranded row.
+
+        Known edge case (design.md:169 "launchd reload 重叠窗口"): two bridges
+        overlap briefly. In that window a concurrent worker between its
+        watcher's CAS and its ``_bg_mark_dequeued`` stamp could be racing
+        this reset. Accepted risk: the worker discards ``_bg_mark_dequeued``'s
+        return value (worker.py:927) and proceeds to send, so a reset during
+        that millisecond-level gap could produce double delivery. The race
+        is bounded by launchd's kill-old-then-start-new sequencing; the
+        tradeoff is accepted over stranding rows forever.
+        """
+        cur = repo.conn.execute(
+            """UPDATE bg_runs
+                 SET delivery_state='pending'
+               WHERE delivery_state='enqueued'
+                 AND enqueued_at IS NULL""",
+        )
+        return cur.rowcount or 0
+
+    def _log_retry_budget_exhausted(
+        self, repo: BgTaskRepo, stats: dict[str, int],
+    ) -> None:
+        """Emit ERROR for delivery_failed rows that have burned their budget."""
+        rows = repo.conn.execute(
+            """SELECT id, task_id, delivery_attempt_count, delivery_error
+                 FROM bg_runs
+                WHERE delivery_state='delivery_failed'
+                  AND delivery_attempt_count >= ?""",
+            (_DELIVERY_ATTEMPT_CAP,),
+        ).fetchall()
+        stats["retry_budget_exhausted"] = len(rows)
+        for r in rows:
+            log.error(
+                "bg reconcile: run %s (task=%s) exhausted delivery retries "
+                "(%d/%d): last error=%r — operator intervention required",
+                r["id"], r["task_id"], r["delivery_attempt_count"],
+                _DELIVERY_ATTEMPT_CAP, r["delivery_error"],
+            )
 
     # ---- UDS bind -------------------------------------------------------------
 

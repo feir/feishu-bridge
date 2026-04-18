@@ -508,6 +508,53 @@ def test_rebuild_from_manifests_replays_completed(tmp_path):
     assert run["manifest_path"].endswith("task.json.done")
 
 
+def test_rebuild_from_manifests_uses_canonical_manifest_schema(tmp_path):
+    """Regression: task_runner writes started_at_ms/finished_at_ms + base64 tails.
+
+    Earlier replay code read plain started_at/finished_at and ignored tails,
+    silently zeroing timestamps and dropping tails on every recovered row.
+    """
+    import base64
+    tasks_dir = tmp_path / "tasks"
+    completed = tasks_dir / "completed"
+    tid = uuid.uuid4().hex
+    task_dir = completed / tid
+    task_dir.mkdir(parents=True)
+    manifest = task_dir / "task.json.done"
+    stdout_raw = b"hello stdout\n"
+    stderr_raw = b"hello stderr\n"
+    manifest.write_text(json.dumps({
+        "task_id": tid,
+        "chat_id": "oc_x",
+        "session_id": "sess_y",
+        "command_argv": ["echo", "hi"],
+        "on_done_prompt": "done",
+        "state": "completed",
+        "exit_code": 0,
+        "wrapper_pid": 9001,
+        "wrapper_start_time_us": 12345,
+        "started_at_ms": 1700000000000,
+        "finished_at_ms": 1700000005000,
+        "created_at": 1700000000000,
+        "runner_token": "tok",
+        "stdout_tail_b64": base64.b64encode(stdout_raw).decode("ascii"),
+        "stderr_tail_b64": base64.b64encode(stderr_raw).decode("ascii"),
+    }))
+
+    conn = init_db(tmp_path / "bg.db")
+    stats = rebuild_from_manifests(conn, tasks_dir)
+    assert stats["completed_replayed"] == 1
+
+    run = conn.execute(
+        "SELECT started_at, finished_at, stdout_tail, stderr_tail "
+        "FROM bg_runs WHERE task_id=?", (tid,)
+    ).fetchone()
+    assert run["started_at"] == 1700000000000
+    assert run["finished_at"] == 1700000005000
+    assert run["stdout_tail"] == stdout_raw
+    assert run["stderr_tail"] == stderr_raw
+
+
 def test_rebuild_from_manifests_active_without_manifest_marks_orphan(tmp_path):
     tasks_dir = tmp_path / "tasks"
     tid = uuid.uuid4().hex
@@ -521,6 +568,57 @@ def test_rebuild_from_manifests_active_without_manifest_marks_orphan(tmp_path):
     row = conn.execute("SELECT state, reason FROM bg_tasks WHERE id=?", (tid,)).fetchone()
     assert row["state"] == "orphan"
     assert row["reason"] == "wrapper_and_child_both_died"
+
+
+def test_rebuild_from_manifests_replay_only_suppresses_orphan_minting(tmp_path):
+    """Regression: reconcile on live DB must not mint orphan rows for active/
+
+    dirs with no manifest — the wrapper may still be alive writing its
+    manifest, and mis-marking it as orphan would break a running task.
+    Only quarantine recovery (empty DB) should synthesize orphans.
+    """
+    tasks_dir = tmp_path / "tasks"
+    tid = uuid.uuid4().hex
+    (tasks_dir / "active" / tid).mkdir(parents=True)
+    (tasks_dir / "active" / tid / "stdout.log").write_bytes(b"partial")
+
+    conn = init_db(tmp_path / "bg.db")
+    stats = rebuild_from_manifests(conn, tasks_dir, replay_only=True)
+    assert stats["completed_replayed"] == 0
+    assert stats["orphans_created"] == 0
+    row = conn.execute("SELECT state FROM bg_tasks WHERE id=?", (tid,)).fetchone()
+    assert row is None
+
+
+def test_rebuild_from_manifests_preserves_null_finished_at_ms(tmp_path):
+    """Regression: a completed manifest missing finished_at_ms stores NULL."""
+    tasks_dir = tmp_path / "tasks"
+    completed = tasks_dir / "completed"
+    tid = uuid.uuid4().hex
+    task_dir = completed / tid
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.json.done").write_text(json.dumps({
+        "task_id": tid,
+        "chat_id": "oc_x",
+        "session_id": "sess_y",
+        "command_argv": ["echo", "hi"],
+        "on_done_prompt": "done",
+        "state": "completed",
+        "exit_code": 0,
+        "wrapper_pid": 9001,
+        "wrapper_start_time_us": 12345,
+        "started_at_ms": 1700000000000,
+        "runner_token": "tok",
+    }))
+
+    conn = init_db(tmp_path / "bg.db")
+    stats = rebuild_from_manifests(conn, tasks_dir)
+    assert stats["completed_replayed"] == 1
+    run = conn.execute(
+        "SELECT started_at, finished_at FROM bg_runs WHERE task_id=?", (tid,)
+    ).fetchone()
+    assert run["started_at"] == 1700000000000
+    assert run["finished_at"] is None
 
 
 def test_rebuild_from_manifests_skips_corrupt_manifest(tmp_path):

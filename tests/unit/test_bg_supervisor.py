@@ -1098,3 +1098,337 @@ def test_bg_mark_dequeued_noop_for_non_bg_items(short_env):
     _bg_mark_dequeued({})
     _bg_mark_dequeued({"_bg_run_id": None, "_bg_db_path": short_env["db_path"]})
     _bg_mark_dequeued({"_bg_run_id": 42, "_bg_db_path": None})
+
+
+# ---------------------------------------------------------------------------
+# Section 6 startup reconciler (Commit A: §6.1/2/4/5/6 + step 0)
+# ---------------------------------------------------------------------------
+
+def _make_launching_task(
+    repo: BgTaskRepo,
+    *,
+    claimed_at_ms: int,
+    bridge_instance_id: str = "b-prior",
+) -> str:
+    """Create a bg_tasks row stuck in `launching` with an arbitrary
+    claimed_at. Used to exercise §6.2 stale-launching reap.
+    """
+    tid = repo.insert_task(
+        chat_id="oc_test",
+        session_id="sess_test",
+        command_argv=["echo", "hi"],
+        on_done_prompt="done",
+    )
+    # CAS stamps claimed_at=_now_ms(); overwrite it to the caller's value so
+    # the test can pick "old enough" vs "still fresh".
+    assert repo.claim_queued_cas(tid, bridge_instance_id=bridge_instance_id)
+    repo.conn.execute(
+        "UPDATE bg_tasks SET claimed_at=? WHERE id=?",
+        (claimed_at_ms, tid),
+    )
+    return tid
+
+
+def _make_running_task(repo: BgTaskRepo) -> str:
+    """Create a bg_tasks row that is live-running (state='running')."""
+    tid = repo.insert_task(
+        chat_id="oc_test", session_id="sess_test",
+        command_argv=["echo", "hi"], on_done_prompt="done",
+    )
+    assert repo.claim_queued_cas(tid, bridge_instance_id="b1")
+    run_id = repo.start_run(
+        task_id=tid, runner_token="t",
+        wrapper_pid=1000, wrapper_start_time_us=9000,
+    )
+    repo.attach_child(
+        run_id=run_id, task_id=tid, pid=2000, pgid=2000,
+        process_start_time_us=9100,
+    )
+    return tid
+
+
+def test_reconcile_reaps_stale_launching_row_to_failed(short_env, repo):
+    """§6.2: claimed_at > 30s ago with state='launching' → failed."""
+    old_ms = int(time.time() * 1000) - 60_000  # 60s ago
+    tid = _make_launching_task(repo, claimed_at_ms=old_ms)
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["stale_launching_failed"] == 1
+    row = repo.conn.execute(
+        "SELECT state, reason FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "failed"
+    assert row["reason"] == "launch_interrupted"
+
+
+def test_reconcile_preserves_recently_claimed_launching_row(short_env, repo):
+    """Rows claimed < 30s ago are still "fresh" — spawner may be mid-Popen."""
+    recent_ms = int(time.time() * 1000) - 5_000  # 5s ago
+    tid = _make_launching_task(repo, claimed_at_ms=recent_ms)
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["stale_launching_failed"] == 0
+    row = repo.conn.execute(
+        "SELECT state FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "launching"
+
+
+def test_reconcile_resets_stranded_enqueued_to_pending(short_env, repo):
+    """Step 0: enqueued rows with enqueued_at=NULL (supervisor CAS'd but
+    worker never dequeued) → pending. The existing 5-min rollback only
+    covers enqueued_at NOT NULL rows, so without this they'd be stranded.
+    """
+    tid, run_id = _make_pending_run(repo)
+    # Supervisor-side CAS would move pending→enqueued WITHOUT stamping
+    # enqueued_at (worker stamps at dequeue). Simulate that state.
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='enqueued', enqueued_at=NULL "
+        "WHERE id=?", (run_id,),
+    )
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["stranded_enqueued_reset"] == 1
+    assert _delivery_state(repo.conn, run_id) == "pending"
+
+
+def test_reconcile_preserves_stamped_enqueued_at_rows(short_env, repo):
+    """Rows with enqueued_at stamped are owned by a worker that dequeued —
+    they're the 5-min stuck-rollback's jurisdiction, not ours."""
+    tid, run_id = _make_pending_run(repo)
+    now = int(time.time() * 1000)
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='enqueued', enqueued_at=? "
+        "WHERE id=?", (now, run_id),
+    )
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["stranded_enqueued_reset"] == 0
+    assert _delivery_state(repo.conn, run_id) == "enqueued"
+
+
+def test_reconcile_warns_on_running_rows_but_does_not_touch_state(
+    short_env, repo, caplog,
+):
+    """§6.3 deferred to Commit B — running rows must pass through unchanged."""
+    tid = _make_running_task(repo)
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    with caplog.at_level("WARNING", logger="feishu-bridge.bg-supervisor"):
+        stats = sup.reconcile()
+
+    assert stats["running_rows_observed"] == 1
+    row = repo.conn.execute(
+        "SELECT state FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "running", (
+        "§6.3 liveness triage lands in Commit B — until then reconcile must "
+        "leave running rows unchanged, never accidentally SIGKILL a pid-reused "
+        "victim"
+    )
+    assert any(
+        "Section 6.3" in rec.message or "liveness triage" in rec.message
+        for rec in caplog.records
+    ), "must WARN that §6.3 is deferred"
+
+
+def test_reconcile_backfills_manifest_only_active_dir(short_env, repo):
+    """§6.6: tasks/active/<id>/task.json.done with no DB row → replay + mv."""
+    import json as _json
+    tid = uuid.uuid4().hex
+    active_dir = Path(short_env["tasks_dir"]) / "active" / tid
+    active_dir.mkdir(parents=True)
+    (active_dir / "task.json.done").write_text(_json.dumps({
+        "task_id": tid,
+        "chat_id": "oc_manifest",
+        "session_id": "sess_manifest",
+        "command_argv": ["echo", "manifest-replay"],
+        "on_done_prompt": "replayed",
+        "state": "completed",
+        "exit_code": 0,
+        "wrapper_pid": 9001,
+        "wrapper_start_time_us": 123456,
+        "started_at": 1000,
+        "finished_at": 2000,
+        "created_at": 500,
+        "runner_token": "tok",
+    }))
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["manifests_replayed"] == 1
+    row = repo.conn.execute(
+        "SELECT state FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "completed"
+    run = repo.conn.execute(
+        "SELECT delivery_state FROM bg_runs WHERE task_id=?", (tid,),
+    ).fetchone()
+    assert run["delivery_state"] == "pending"
+    # active dir should have been promoted to completed/.
+    assert not active_dir.exists()
+    assert (Path(short_env["tasks_dir"]) / "completed" / tid).is_dir()
+
+
+def test_reconcile_logs_error_on_retry_budget_exhausted(
+    short_env, repo, caplog,
+):
+    """delivery_failed rows at attempt_count ≥ 10 → ERROR log at boot."""
+    tid, run_id = _make_pending_run(repo)
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='delivery_failed', "
+        "delivery_attempt_count=10, delivery_error='persistent enqueue fail' "
+        "WHERE id=?", (run_id,),
+    )
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    with caplog.at_level("ERROR", logger="feishu-bridge.bg-supervisor"):
+        stats = sup.reconcile()
+
+    assert stats["retry_budget_exhausted"] == 1
+    assert any(
+        "exhausted delivery retries" in rec.message
+        for rec in caplog.records
+    ), "must ERROR on each budget-exhausted run"
+
+
+def test_reconcile_integrity_failure_triggers_rebuild(short_env):
+    """§6.1 quarantine path: corrupt DB → rename + replay manifests."""
+    import json as _json
+    # Seed a manifest so rebuild has something to replay after quarantine.
+    tid = uuid.uuid4().hex
+    completed_dir = Path(short_env["tasks_dir"]) / "completed" / tid
+    completed_dir.mkdir(parents=True)
+    (completed_dir / "task.json.done").write_text(_json.dumps({
+        "task_id": tid,
+        "chat_id": "oc_quar",
+        "session_id": "sess_quar",
+        "command_argv": ["echo", "rebuilt"],
+        "on_done_prompt": "rebuilt",
+        "state": "completed",
+        "exit_code": 0,
+        "wrapper_pid": 9001,
+        "wrapper_start_time_us": 999,
+        "started_at": 1000,
+        "finished_at": 2000,
+        "created_at": 500,
+        "runner_token": "tok",
+    }))
+
+    # Init DB then corrupt the header so integrity_check quarantines it.
+    init_db(short_env["db_path"]).close()
+    raw = short_env["db_path"].read_bytes()
+    short_env["db_path"].write_bytes(b"\x00" * 100 + raw[100:])
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["quarantined"] == 1
+    assert stats["manifests_replayed"] == 1
+    # Fresh DB should have the replayed row.
+    fresh_conn = connect(short_env["db_path"])
+    try:
+        row = fresh_conn.execute(
+            "SELECT state FROM bg_tasks WHERE id=?", (tid,),
+        ).fetchone()
+    finally:
+        fresh_conn.close()
+    assert row is not None and row["state"] == "completed"
+    # Quarantine sidecar must exist for forensic retention (≤3 files / 30d).
+    quarantined = list(
+        short_env["db_path"].parent.glob("bg.db.quarantine.*"),
+    )
+    assert len(quarantined) >= 1
+
+
+def test_reconcile_retry_budget_boundary_9_does_not_log(short_env, repo, caplog):
+    """attempt_count=9 is below the cap → must NOT emit ERROR."""
+    tid, run_id = _make_pending_run(repo)
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='delivery_failed', "
+        "delivery_attempt_count=9 WHERE id=?", (run_id,),
+    )
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    with caplog.at_level("ERROR", logger="feishu-bridge.bg-supervisor"):
+        stats = sup.reconcile()
+
+    assert stats["retry_budget_exhausted"] == 0
+    assert not any(
+        "exhausted delivery retries" in rec.message
+        for rec in caplog.records
+    ), "attempt_count=9 < cap=10 must not trigger the ERROR log"
+
+
+def test_reconcile_queued_stats_reflects_launches(short_env, repo):
+    """§6.4 stats["queued_launched"]: drive queued rows during reconcile."""
+    _enqueue(repo)
+    _enqueue(repo)
+
+    spawner = MagicMock(return_value=MagicMock(pid=12345))
+    sup = BgSupervisor(
+        db_path=short_env["db_path"],
+        tasks_dir=short_env["tasks_dir"],
+        sock_path=short_env["sock_path"],
+        runner_cmd=["/bin/true"],
+        spawner=spawner,
+    )
+    stats = sup.reconcile()
+
+    assert stats["queued_launched"] == 2
+    assert spawner.call_count == 2
+
+
+def test_reconcile_fresh_boot_does_not_claim_quarantine(short_env, caplog):
+    """Fresh install (DB file absent before first reconcile) must not log as
+    quarantine event — that would mislead operators who only greened a box."""
+    assert not short_env["db_path"].exists()
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    with caplog.at_level("WARNING", logger="feishu-bridge.bg-supervisor"):
+        stats = sup.reconcile()
+
+    assert stats["quarantined"] == 0
+    assert short_env["db_path"].exists(), "fresh boot should have created DB"
+    assert not any(
+        "DB quarantined" in rec.message for rec in caplog.records
+    ), "fresh boot must not emit the quarantine WARNING"
+
+
+def test_reconcile_returns_stats_dict_with_all_keys(short_env, repo):
+    """Contract: stats dict shape is stable for /status integration later."""
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+    expected_keys = {
+        "quarantined",
+        "manifests_replayed",
+        "manifest_orphans_created",
+        "stale_launching_failed",
+        "running_rows_observed",
+        "stranded_enqueued_reset",
+        "queued_launched",
+        "deliveries_handed_off",
+        "retry_budget_exhausted",
+    }
+    assert set(stats.keys()) == expected_keys
+
+
+def test_reconcile_before_start_is_safe_and_stat_invariants_hold(short_env):
+    """Smoke: reconcile() → start() → stop() with no data races."""
+    sup, _spawner = _fast_supervisor(short_env)
+    stats = sup.reconcile()
+    assert stats["stale_launching_failed"] == 0
+    sup.start()
+    try:
+        assert sup.is_running()
+    finally:
+        sup.stop()

@@ -12,6 +12,8 @@ breakdown.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -368,11 +370,23 @@ def integrity_check_and_maybe_quarantine(db_path: str | Path) -> Path:
     return p  # caller will init_db() on the (now-absent) original path
 
 
-def rebuild_from_manifests(conn: sqlite3.Connection, tasks_dir: str | Path) -> dict[str, int]:
+def rebuild_from_manifests(
+    conn: sqlite3.Connection,
+    tasks_dir: str | Path,
+    *,
+    replay_only: bool = False,
+) -> dict[str, int]:
     """Replay `tasks/completed/*/task.json.done` into a fresh DB.
 
     `tasks/active/<id>/` directories without a committed manifest become `orphan`
     rows. Pre-launch queued tasks that never produced a manifest are lost (logged).
+
+    ``replay_only=True`` disables the orphan-minting branch. The reconciler
+    calls with this flag on healthy boots so the scheduled delta backfill
+    doesn't mark a live running task (wrapper alive, no manifest yet) as
+    orphan. Quarantine recovery calls with the default ``replay_only=False``
+    because a quarantined DB is empty and we genuinely need to synthesize
+    orphan rows for wrapper-and-child-both-died tasks.
 
     Returns {'completed_replayed': N, 'orphans_created': N}.
     """
@@ -432,6 +446,14 @@ def rebuild_from_manifests(conn: sqlite3.Connection, tasks_dir: str | Path) -> d
                     continue
 
             # Neither DB row nor manifest — wrapper and child died together.
+            # Skip on live-DB delta backfill: the wrapper may still be alive
+            # and writing its manifest; we'd mis-mark a running task as orphan.
+            # Only quarantine recovery (empty DB) should mint orphan rows.
+            if replay_only:
+                log.debug(
+                    "bg reconcile: skip active/%s orphan-mint (replay_only)", tid,
+                )
+                continue
             now = _now_ms()
             with _tx(conn):
                 conn.execute(
@@ -556,13 +578,56 @@ def _replay_completed_manifest(
                 now,
             ),
         )
+        # task_runner.py writes canonical keys `started_at_ms` / `finished_at_ms`
+        # and base64-encoded `stdout_tail_b64` / `stderr_tail_b64`. Older test
+        # fixtures and hand-written manifests may still use plain forms —
+        # accept both so recovery doesn't silently corrupt timestamps/tails.
+        started_at = data.get("started_at_ms")
+        if started_at is None:
+            started_at = data.get("started_at", now)
+        finished_at = data.get("finished_at_ms")
+        if finished_at is None:
+            finished_at = data.get("finished_at")
+
+        def _decode_tail(obj: Any, field: str) -> Optional[bytes]:
+            if obj is None:
+                return None
+            if isinstance(obj, bytes):
+                return obj
+            if isinstance(obj, str):
+                try:
+                    return base64.b64decode(obj, validate=True)
+                except (ValueError, TypeError, binascii.Error) as exc:
+                    log.warning(
+                        "manifest %s has corrupt %s (base64): %s — storing NULL",
+                        manifest_path, field, exc,
+                    )
+                    return None
+            log.warning(
+                "manifest %s %s has unexpected type %s — storing NULL",
+                manifest_path, field, type(obj).__name__,
+            )
+            return None
+
+        stdout_tail = _decode_tail(
+            data.get("stdout_tail_b64") if data.get("stdout_tail_b64") is not None
+            else data.get("stdout_tail"),
+            "stdout_tail",
+        )
+        stderr_tail = _decode_tail(
+            data.get("stderr_tail_b64") if data.get("stderr_tail_b64") is not None
+            else data.get("stderr_tail"),
+            "stderr_tail",
+        )
+
         conn.execute(
             """INSERT INTO bg_runs
                (task_id, runner_token, pid, pgid, process_start_time_us,
                 wrapper_pid, wrapper_start_time_us, started_at, finished_at,
                 exit_code, signal, manifest_path,
+                stdout_tail, stderr_tail,
                 delivery_state)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
             (
                 tid,
                 data.get("runner_token", ""),
@@ -571,11 +636,13 @@ def _replay_completed_manifest(
                 data.get("process_start_time_us"),
                 int(data.get("wrapper_pid", 0)),
                 int(data.get("wrapper_start_time_us", 0)),
-                int(data.get("started_at", now)),
-                data.get("finished_at"),
+                int(started_at),
+                int(finished_at) if finished_at is not None else None,
                 data.get("exit_code"),
                 data.get("signal"),
                 manifest_path,
+                stdout_tail,
+                stderr_tail,
             ),
         )
     return True

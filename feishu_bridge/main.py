@@ -1009,6 +1009,10 @@ class FeishuBot:
                 bot_id=self.bot_id,
                 sessions_index=self._sessions_index,
             )
+            # Reconcile BEFORE start(): integrity check may rename the DB
+            # file, so listener/poller threads must not hold a connection
+            # when that happens. Must complete synchronously here.
+            self._bg_supervisor.reconcile()
             self._bg_supervisor.start()
         except Exception:
             # Swallow so a bg-tasks boot failure doesn't kill the WS loop.
