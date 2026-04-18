@@ -1622,6 +1622,7 @@ HUMAN_TURN_GOLDEN = {
     "_quota_poller": None,
     "_ledger": None,
     "_queue_key": "test-bot:oc_group1:",
+    "_bg_session_id": None,
 }
 
 
@@ -1650,7 +1651,10 @@ def test_enqueue_turn_rejects_protected_keys_in_extras():
     """
     import pytest
     bot = _make_full_bot(default_mode="auto-reply")
-    for key in ("bot_id", "_cost_store", "_quota_poller", "_ledger", "_queue_key"):
+    for key in (
+        "bot_id", "_cost_store", "_quota_poller", "_ledger", "_queue_key",
+        "_bg_session_id",
+    ):
         with pytest.raises(ValueError, match="protected keys"):
             bot.enqueue_turn(
                 chat_id="oc_x",
@@ -1684,6 +1688,30 @@ def test_enqueue_turn_bg_completion_kind_bypasses_backpressure():
         kind="bg_task_completion",
     )
     assert bot._enqueue_bypass_calls == [True]
+
+
+def test_enqueue_turn_bg_session_id_lands_on_item_when_provided():
+    """5.4a scaffolding: delivery watcher will pass the bg-task's origin
+    Claude UUID via session_id; it must land on the queued item so
+    5.4b's worker post-turn can consult the session-resume index."""
+    bot = _make_full_bot(default_mode="auto-reply")
+    bot.enqueue_turn(
+        chat_id="oc_x", session_key="k",
+        prompt="[bg-task:abc] done", kind="bg_task_completion",
+        session_id="uuid-origin-123",
+    )
+    assert bot._enqueued_items[0]["_bg_session_id"] == "uuid-origin-123"
+
+
+def test_enqueue_turn_bg_session_id_defaults_to_none_on_human_path():
+    """Human path leaves session_id unset — worker continues to derive
+    the UUID from session_map as before. _bg_session_id must be None so
+    the 5.4b worker branch can skip resume-index consultation cleanly."""
+    bot = _make_full_bot(default_mode="auto-reply")
+    bot.enqueue_turn(
+        chat_id="oc_x", session_key="k", prompt="hi", kind="human",
+    )
+    assert bot._enqueued_items[0]["_bg_session_id"] is None
 
 
 def test_enqueue_turn_unknown_kind_does_not_bypass():

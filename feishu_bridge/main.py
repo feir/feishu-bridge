@@ -1012,6 +1012,7 @@ class FeishuBot:
         prompt: str,
         kind: str,
         extras: dict | None = None,
+        session_id: str | None = None,
     ) -> tuple[str, dict]:
         """Single entry point for queueing a turn into ChatTaskQueue.
 
@@ -1021,6 +1022,11 @@ class FeishuBot:
             'bg_task_completion' — synthetic turn from bg-task delivery watcher
                                    (Section 4.5); bypasses backpressure because
                                    dropping it means the user never sees the result
+
+        session_id (5.4 scaffolding, no-op in 5.4a): optional Claude UUID that
+        the delivery watcher will pass in 5.4b so the worker can consult the
+        session-resume index. Human path leaves this None — worker derives
+        the UUID from ``session_map`` as before.
 
         extras carries kind-specific fields merged on top of the base item
         (thread_id, parent_id, message_id, image_key, reactions, …).
@@ -1057,6 +1063,7 @@ class FeishuBot:
             # could silently lose bot_id / cost store / ledger wiring.
             _protected = {
                 "bot_id", "_cost_store", "_quota_poller", "_ledger", "_queue_key",
+                "_bg_session_id",
             }
             bad = _protected & extras.keys()
             if bad:
@@ -1065,6 +1072,10 @@ class FeishuBot:
                 )
             item.update(extras)
         item["_queue_key"] = session_key
+        # Scaffolding for Section 5.4b: delivery watcher stamps the
+        # bg-task's origin Claude UUID here so worker post-turn can
+        # consult the session-resume index. None on human path.
+        item["_bg_session_id"] = session_id
         status = self._chat_queue.enqueue(
             session_key, item,
             bypass_backpressure=(kind == "bg_task_completion"),
