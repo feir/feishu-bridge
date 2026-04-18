@@ -43,6 +43,7 @@ from feishu_bridge.bg_tasks_db import (
     cleanup_and_archive,
     cleanup_quarantine_files,
     integrity_check_and_maybe_quarantine,
+    promote_active_to_completed,
     rebuild_from_manifests,
 )
 from feishu_bridge.runtime import SessionMap
@@ -1178,10 +1179,12 @@ class BgSupervisor:
         # can locate the on-disk payload.
         tid = row["task_id"]
         manifest_path: Optional[str] = None
+        manifest_subdir: Optional[str] = None
         for subdir in ("active", "completed"):
             cand = self._tasks_dir / subdir / tid / "task.json.done"
             if cand.is_file() and not cand.is_symlink():
                 manifest_path = str(cand)
+                manifest_subdir = subdir
                 break
         if manifest_path is None:
             # Race: file existed at _load_task_manifest and is now gone.
@@ -1221,6 +1224,14 @@ class BgSupervisor:
                 "bg triage: finish_run refused task=%s: %s", tid, exc,
             )
             return False
+        # Wrapper Phase C3 (mv active/ → completed/) was skipped because the
+        # wrapper died before it could run. Do it ourselves now so
+        # cleanup_and_archive can scope its archival pass to completed/ only.
+        # Bounded crash window: if we die between finish_run (durable) and
+        # rename, the row is terminal but active/<tid>/ sits stranded until
+        # operator cleanup. Accepted — the row won't resurface for triage.
+        if manifest_subdir == "active":
+            promote_active_to_completed(self._tasks_dir, tid)
         return True
 
     def _reset_stranded_enqueued(self, repo: BgTaskRepo) -> int:

@@ -392,6 +392,31 @@ def integrity_check_and_maybe_quarantine(db_path: str | Path) -> Path:
     return p  # caller will init_db() on the (now-absent) original path
 
 
+def promote_active_to_completed(tasks_dir: str | Path, tid: str) -> bool:
+    """Atomically rename ``active/<tid>/`` → ``completed/<tid>/``.
+
+    Idempotent callers: missing source is a silent no-op (True). OSError —
+    typically ``completed/<tid>`` already present from a prior partial move —
+    is logged at warning and returns False; the caller has already committed
+    the durable DB state so the stranded ``active/`` dir is cosmetic but
+    will resurface in logs.
+    """
+    root = Path(tasks_dir)
+    src = root / "active" / tid
+    if not src.is_dir() or src.is_symlink():
+        return True
+    dest = root / "completed" / tid
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dest)
+    except OSError as exc:
+        log.warning("bg reconcile: promote active/%s → completed/ failed: %s",
+                    tid, exc)
+        return False
+    log.info("bg reconcile: promoted active/%s → completed/", tid)
+    return True
+
+
 def rebuild_from_manifests(
     conn: sqlite3.Connection,
     tasks_dir: str | Path,
@@ -453,18 +478,7 @@ def rebuild_from_manifests(
                 else:
                     if _replay_completed_manifest(conn, data, str(manifest), tid):
                         stats["completed_replayed"] += 1
-                        try:
-                            dest = root / "completed" / tid
-                            dest.parent.mkdir(parents=True, exist_ok=True)
-                            task_dir.rename(dest)
-                            log.info(
-                                "bg reconcile: promoted active/%s → completed/", tid,
-                            )
-                        except OSError as exc:
-                            log.warning(
-                                "active/%s manifest replayed but mv failed: %s",
-                                tid, exc,
-                            )
+                        promote_active_to_completed(root, tid)
                     continue
 
             # Neither DB row nor manifest — wrapper and child died together.

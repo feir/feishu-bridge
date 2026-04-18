@@ -1427,6 +1427,85 @@ def test_reconcile_triage_manifest_applied_on_both_dead(
     assert run["finished_at"] is not None
     assert run["delivery_state"] == "pending"
     assert run["exit_code"] == 0
+    # §6.6 leak-fix: manifest replayed out of active/ must also promote the
+    # directory to completed/ so cleanup_and_archive can reach it.
+    assert not active.exists()
+    assert (Path(short_env["tasks_dir"]) / "completed" / tid).is_dir()
+
+
+def test_apply_manifest_to_running_promotes_active_dir_on_reaper_path(
+    short_env, repo,
+):
+    """Reaper path (post-child-exit) also promotes active/ → completed/.
+
+    Directly exercises `_apply_manifest_to_running` to confirm the promotion
+    hook fires regardless of which caller (triage or reaper worker) invokes
+    it. The reaper reaches this method via bg_supervisor.py:1103, and the
+    active/→completed rename must run there too, otherwise reaped children
+    leak their active/<tid>/ directory the same way triage did before the
+    fix.
+    """
+    import json as _json
+    tid = _make_running_task(repo)
+    active = Path(short_env["tasks_dir"]) / "active" / tid
+    active.mkdir(parents=True, exist_ok=True)
+    (active / "task.json.done").write_text(_json.dumps({
+        "task_id": tid,
+        "state": "completed",
+        "exit_code": 0,
+        "signal": None,
+        "started_at_ms": int(time.time() * 1000) - 1000,
+        "finished_at_ms": int(time.time() * 1000),
+        "reason": None,
+    }))
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    row = repo.conn.execute(
+        "SELECT t.id AS task_id, r.id AS run_id FROM bg_tasks t "
+        "JOIN bg_runs r ON r.task_id=t.id WHERE t.id=?", (tid,),
+    ).fetchone()
+    manifest = sup._load_task_manifest(tid)
+    assert manifest is not None
+    assert sup._apply_manifest_to_running(repo, row, manifest) is True
+
+    assert not active.exists()
+    assert (Path(short_env["tasks_dir"]) / "completed" / tid).is_dir()
+
+
+def test_apply_manifest_to_running_noop_when_already_completed(
+    short_env, repo,
+):
+    """Manifest already sitting in completed/ → finish_run commits, no move.
+
+    Defence against a needless rename pass when the wrapper succeeded in its
+    Phase C3 mv but the DB row never reached terminal (e.g., power loss
+    mid-commit). Promotion must be gated on `manifest_subdir == 'active'`.
+    """
+    import json as _json
+    tid = _make_running_task(repo)
+    completed = Path(short_env["tasks_dir"]) / "completed" / tid
+    completed.mkdir(parents=True, exist_ok=True)
+    (completed / "task.json.done").write_text(_json.dumps({
+        "task_id": tid,
+        "state": "completed",
+        "exit_code": 0,
+        "signal": None,
+        "started_at_ms": int(time.time() * 1000) - 1000,
+        "finished_at_ms": int(time.time() * 1000),
+        "reason": None,
+    }))
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    row = repo.conn.execute(
+        "SELECT t.id AS task_id, r.id AS run_id FROM bg_tasks t "
+        "JOIN bg_runs r ON r.task_id=t.id WHERE t.id=?", (tid,),
+    ).fetchone()
+    manifest = sup._load_task_manifest(tid)
+    assert sup._apply_manifest_to_running(repo, row, manifest) is True
+
+    # completed/ must survive intact; no stray active/<tid>/ spawned.
+    assert completed.is_dir()
+    assert not (Path(short_env["tasks_dir"]) / "active" / tid).exists()
 
 
 def test_reconcile_triage_spawns_reaper_for_alive_orphan_child(
