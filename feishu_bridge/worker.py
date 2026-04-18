@@ -882,6 +882,23 @@ def process_message(
 
         if effective_sid:
             session_map.put(key, effective_sid)
+
+            # Section 5.4b: record last-seen Claude UUID → chat_id mapping
+            # so a future bg-task completion can decide resume vs fresh.
+            # Gated on not-is_error — failed turns are unreliable to resume
+            # from, so don't pollute the index with them.
+            sessions_index = item.get("_sessions_index")
+            if sessions_index is not None and not result.get("is_error"):
+                try:
+                    sessions_index.touch(
+                        session_id=effective_sid,
+                        chat_id=chat_id,
+                        now_ms=int(time.time() * 1000),
+                    )
+                except Exception:
+                    log.warning("sessions_index.touch failed for sid=%s",
+                                effective_sid[:8], exc_info=True)
+
             cost_store = item.get("_cost_store")
             prev_session_cost = 0
             cur_session_cost = result.get("total_cost_usd") or 0

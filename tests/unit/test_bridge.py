@@ -605,6 +605,148 @@ def test_worker_fallback_when_card_refetch_returns_none():
     assert "[用户转发了一条卡片消息: Test]" in captured["text"]
 
 
+# ---------------------------------------------------------------------------
+# Section 5.4b: worker post-turn records last-seen session_id in sessions_index
+# ---------------------------------------------------------------------------
+
+class _FakeSessionsIndex:
+    def __init__(self):
+        self.touches: list[tuple[str, str, int]] = []
+
+    def touch(self, *, session_id, chat_id, now_ms):
+        self.touches.append((session_id, chat_id, now_ms))
+
+
+def test_worker_touches_sessions_index_on_successful_turn():
+    """After a successful turn produces an effective session_id, worker
+    must call sessions_index.touch so a future bg-task synthetic turn
+    can decide whether resume is viable."""
+    idx = _FakeSessionsIndex()
+
+    class OKRunner:
+        def run(self, text, **kwargs):
+            return {"result": "hi", "session_id": "uuid-ok", "is_error": False}
+
+    bridge_worker.process_message(
+        item={
+            "bot_id": "bot", "chat_id": "oc_x", "thread_id": None,
+            "message_id": "mid", "text": "hello",
+            "_sessions_index": idx,
+        },
+        bot_config={"workspace": "/tmp"},
+        lark_client=None,
+        session_map=DummySessionMap(),
+        runner=OKRunner(),
+        response_handle_cls=FakeHandle,
+        download_image_fn=lambda *a, **k: None,
+        fetch_quoted_message_fn=lambda *a, **k: None,
+        remove_typing_indicator_fn=lambda *a, **k: None,
+        session_not_found_signatures=[],
+    )
+
+    assert len(idx.touches) == 1
+    sid, chat_id, now_ms = idx.touches[0]
+    assert sid == "uuid-ok"
+    assert chat_id == "oc_x"
+    # now_ms is epoch-ms int — just sanity-check the order of magnitude.
+    assert now_ms > 1_700_000_000_000
+
+
+def test_worker_skips_sessions_index_on_error_turn():
+    """Failed turns may not have a reliably-resumable session_id. Worker
+    must NOT pollute the index with them — if there's no session_map.put
+    (the is_error branch zeroes effective_sid), there's no touch either."""
+    idx = _FakeSessionsIndex()
+
+    class ErrRunner:
+        def run(self, text, **kwargs):
+            # is_error=True + no existing_sid → effective_sid=None per worker.py:879
+            return {"result": "err", "session_id": "uuid-err", "is_error": True}
+
+    bridge_worker.process_message(
+        item={
+            "bot_id": "bot", "chat_id": "oc_x", "thread_id": None,
+            "message_id": "mid", "text": "hello",
+            "_sessions_index": idx,
+        },
+        bot_config={"workspace": "/tmp"},
+        lark_client=None,
+        session_map=DummySessionMap(),
+        runner=ErrRunner(),
+        response_handle_cls=FakeHandle,
+        download_image_fn=lambda *a, **k: None,
+        fetch_quoted_message_fn=lambda *a, **k: None,
+        remove_typing_indicator_fn=lambda *a, **k: None,
+        session_not_found_signatures=[],
+    )
+
+    assert idx.touches == []
+
+
+def test_worker_tolerates_missing_sessions_index():
+    """Pre-5.4 callers / tests may not wire _sessions_index. Worker must
+    treat absence as no-op rather than AttributeError."""
+    class OKRunner:
+        def run(self, text, **kwargs):
+            return {"result": "hi", "session_id": "uuid-ok", "is_error": False}
+
+    # No _sessions_index key in item at all — must not raise.
+    handle = bridge_worker.process_message(
+        item={
+            "bot_id": "bot", "chat_id": "oc_x", "thread_id": None,
+            "message_id": "mid", "text": "hello",
+        },
+        bot_config={"workspace": "/tmp"},
+        lark_client=None,
+        session_map=DummySessionMap(),
+        runner=OKRunner(),
+        response_handle_cls=FakeHandle,
+        download_image_fn=lambda *a, **k: None,
+        fetch_quoted_message_fn=lambda *a, **k: None,
+        remove_typing_indicator_fn=lambda *a, **k: None,
+        session_not_found_signatures=[],
+    )
+    assert handle is not None
+
+
+def test_worker_suppresses_sessions_index_touch_exceptions():
+    """If sessions_index.touch raises (disk full, corrupt JSON racing a
+    write), worker must not crash — cost/ledger side-effects must still
+    land, and the turn result must still be delivered."""
+    class AngryIndex:
+        def touch(self, **kwargs):
+            raise RuntimeError("disk full")
+
+    class OKRunner:
+        def run(self, text, **kwargs):
+            return {
+                "result": "hi", "session_id": "uuid-ok", "is_error": False,
+                "total_cost_usd": 0.01,
+            }
+
+    cost_store = {}
+    handle = bridge_worker.process_message(
+        item={
+            "bot_id": "bot", "chat_id": "oc_x", "thread_id": None,
+            "message_id": "mid", "text": "hello",
+            "_sessions_index": AngryIndex(),
+            "_cost_store": cost_store,
+        },
+        bot_config={"workspace": "/tmp"},
+        lark_client=None,
+        session_map=DummySessionMap(),
+        runner=OKRunner(),
+        response_handle_cls=FakeHandle,
+        download_image_fn=lambda *a, **k: None,
+        fetch_quoted_message_fn=lambda *a, **k: None,
+        remove_typing_indicator_fn=lambda *a, **k: None,
+        session_not_found_signatures=[],
+    )
+    # Worker completed and cost_store got written despite angry touch().
+    assert handle is not None
+    assert "uuid-ok" in cost_store
+
+
 def test_forward_messages_safe_sort_with_null_create_time():
     """fetch_forward_messages handles None/missing create_time without ValueError."""
     import types
@@ -1621,6 +1763,7 @@ HUMAN_TURN_GOLDEN = {
     "_cost_store": {},
     "_quota_poller": None,
     "_ledger": None,
+    "_sessions_index": None,
     "_queue_key": "test-bot:oc_group1:",
     "_bg_session_id": None,
 }
@@ -1653,7 +1796,7 @@ def test_enqueue_turn_rejects_protected_keys_in_extras():
     bot = _make_full_bot(default_mode="auto-reply")
     for key in (
         "bot_id", "_cost_store", "_quota_poller", "_ledger", "_queue_key",
-        "_bg_session_id",
+        "_bg_session_id", "_sessions_index",
     ):
         with pytest.raises(ValueError, match="protected keys"):
             bot.enqueue_turn(
@@ -1722,6 +1865,37 @@ def test_enqueue_turn_unknown_kind_does_not_bypass():
     bot.enqueue_turn(
         chat_id="oc_x", session_key="k", prompt="x", kind="bg-task-completion",
     )
+    assert bot._enqueue_bypass_calls == [False]
+
+
+def test_on_card_action_threads_sessions_index_via_enqueue_turn():
+    """Card-action path routes through enqueue_turn so every infra field
+    (_sessions_index, _cost_store, _ledger, _bg_session_id, …) lands on
+    the item. Before Section 5.4b the card path hand-built an item dict
+    and silently dropped new fields — Codex cross-review MAJOR finding.
+    """
+    bot = _make_full_bot(default_mode="auto-reply")
+    sentinel_index = object()
+    bot._sessions_index = sentinel_index
+
+    action_obj = _NS(value={
+        "label": "选项A",
+        "chat_id": "oc_group1",
+        "bot_id": "test-bot",
+    })
+    operator_obj = _NS(open_id="ou_clicker")
+    event_obj = _NS(action=action_obj, operator=operator_obj)
+    data = _NS(event=event_obj)
+
+    bot._on_card_action(data)
+
+    assert len(bot._enqueued_items) == 1
+    item = bot._enqueued_items[0]
+    assert item["_sessions_index"] is sentinel_index
+    assert item["sender_id"] == "ou_clicker"
+    assert item["text"] == "选项A"
+    assert item["_queue_key"] == "test-bot:oc_group1:"
+    # Card-action is a human turn; must not bypass backpressure.
     assert bot._enqueue_bypass_calls == [False]
 
 

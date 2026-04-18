@@ -94,10 +94,21 @@
         - 新增 26 个 tests：24 个 session_resume（SessionsIndex 持久化+并发 10 线程×20 sessions+损坏 JSON 恢复、4 种 probe 分类、resolve 6 种策略分支含 clock-rollback 未来时间戳兜底、probe 抛异常兜底为 resume_failed）+ 2 个 bridge（`_bg_session_id` 正向 round-trip + None 默认）。
         - 修复 code-reviewer 3 个 MAJOR：M1 `resolve_resume_status` 包 try/except 兜底 probe_fn 异常；M2 recency 检查要求 `0 <= age < threshold`（clock rollback 时 fail-closed 走 probe）；M3 补 `_bg_session_id` 到 protected keys 测试 + 新增 round-trip 测试。
         - 回归：558 unit passed（24 session_resume + 197 bridge + 其余）。1 pre-existing failure（`test_footer_no_model_no_workspace`）与本次无关。
-    - [ ] 5.4b 集成进 worker + delivery watcher（独立 commit）
-        - worker post-turn（`worker.py:881` 取到 `effective_sid` 处）调 `SessionsIndex.touch()`
-        - delivery watcher 在 enqueue 合成 turn 前调 `resolve_resume_status()`，把 `session_id` 传给 `enqueue_turn()`，把 status/reason 写入 `bg_runs.session_resume_status`
-        - fresh_fallback 时 worker 端 prepend NOTE 到 prompt 首行
+    - [~] 5.4b 集成进 worker + delivery watcher（拆两段 commit）
+        - [x] 5.4b-worker：worker post-turn `touch()` 接入（本次 commit）
+            - `FeishuBot.__init__` 实例化 `SessionsIndex(~/.feishu-bridge/sessions.json)` 赋 `self._sessions_index`；ctor 失败降级 None 不阻塞启动
+            - `enqueue_turn` item dict 加 `_sessions_index`（和 `_cost_store` / `_ledger` 同模式）；加入 extras protected keys
+            - `worker.py:884` `session_map.put()` 之后立即调 `sessions_index.touch(session_id=effective_sid, chat_id=chat_id, now_ms=int(time.time()*1000))`；gated `not result.get("is_error")` 防止失败 turn 污染索引；外层 try/except 吞 touch 异常（disk full / JSON 竞争写不阻塞用户回复）
+            - 新增 4 个 worker 测试：成功 turn 触发 touch（UUID+chat+epoch）/ 失败 turn 跳过 touch / 缺失 `_sessions_index` 不崩 / touch 抛异常不阻塞 cost_store 写入
+            - 更新 HUMAN_TURN_GOLDEN + protected keys 测试增补 `_sessions_index`
+            - 回归：562 unit passed（+4 vs 5.4a），golden snapshot 过
+            - 修复 Codex cross-review MAJOR：`_on_card_action` 原本 hand-build item dict 绕过 `enqueue_turn` choke point，所有新增 infra 字段（`_sessions_index` / `_bg_session_id` / …）静默丢失。重构为调用 `self.enqueue_turn(chat_id=chat_id, session_key=msg_key, prompt=label, kind="human", extras={"sender_id": sender_id})`，消除根因而非点修补。新增 `test_on_card_action_threads_sessions_index_via_enqueue_turn` 回归测试。
+            - 最终回归：563 unit passed（+5 vs 5.4a）
+        - [ ] 5.4b-watcher：delivery watcher 集成（和 §4.5 合并 commit）
+            - watcher 扫 `bg_runs.delivery_state='pending'` 时调 `resolve_resume_status()`
+            - `session_id` 经 `enqueue_turn(..., session_id=...)` 传到 item
+            - fresh_fallback 时 prepend NOTE 到 prompt 首行
+            - status/reason 写入 `bg_runs.session_resume_status`
 
 ## 6. Startup reconciler
 

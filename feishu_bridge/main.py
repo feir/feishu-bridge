@@ -696,6 +696,18 @@ class FeishuBot:
             log.warning("ledger disabled (open failed)", exc_info=True)
             self._ledger = None
 
+        # Section 5.4b: per-process sessions_index records last-seen Claude
+        # UUIDs so the future delivery watcher can decide whether a bg-task
+        # synthetic turn can resume vs must fall back to a fresh session.
+        try:
+            from .session_resume import SessionsIndex
+            self._sessions_index = SessionsIndex(
+                Path.home() / ".feishu-bridge" / "sessions.json"
+            )
+        except Exception:
+            log.warning("sessions_index disabled (open failed)", exc_info=True)
+            self._sessions_index = None
+
         # Components
         self.dedup = MessageDedup(
             ttl=self.dedup_config.get("ttl_seconds", DEDUP_TTL),
@@ -1056,6 +1068,7 @@ class FeishuBot:
             "_cost_store": self._session_cost,
             "_quota_poller": getattr(self, "_quota_poller", None),
             "_ledger": getattr(self, "_ledger", None),
+            "_sessions_index": getattr(self, "_sessions_index", None),
         }
         if extras:
             # Infrastructure fields are self-derived; extras must never
@@ -1063,7 +1076,7 @@ class FeishuBot:
             # could silently lose bot_id / cost store / ledger wiring.
             _protected = {
                 "bot_id", "_cost_store", "_quota_poller", "_ledger", "_queue_key",
-                "_bg_session_id",
+                "_bg_session_id", "_sessions_index",
             }
             bad = _protected & extras.keys()
             if bad:
@@ -1536,29 +1549,20 @@ class FeishuBot:
             log.info("Card action: bot=%s chat=%s sender=%s label=%s",
                      bot_id, chat_id, sender_id, label)
 
-            # Enqueue as a new user message through the normal pipeline
+            # Route through the single enqueue_turn choke point so all
+            # infra fields (_cost_store, _ledger, _sessions_index, …) stay
+            # in sync with the _on_message path. Hand-rolling an item dict
+            # here caused bg-task sessions_index drift (Codex cross-review,
+            # Section 5.4b).
             msg_key = SessionMap._key_str((bot_id, chat_id, None))
-            item = {
-                "bot_id": bot_id,
-                "chat_id": chat_id,
-                "thread_id": None,
-                "parent_id": None,
-                "message_id": None,
-                "sender_id": sender_id,
-                "text": label,
-                "image_key": None,
-                "_queued_reaction_id": None,
-                "_todo_task_id": None,
-                "_card_message_id": None,
-                "_merge_forward_message_id": None,
-                "_feishu_urls": [],
-                "_cost_store": self._session_cost,
-                "_quota_poller": getattr(self, "_quota_poller", None),
-                "_ledger": getattr(self, "_ledger", None),
-                "_queue_key": msg_key,
-            }
             try:
-                self._chat_queue.enqueue(msg_key, item)
+                self.enqueue_turn(
+                    chat_id=chat_id,
+                    session_key=msg_key,
+                    prompt=label,
+                    kind="human",
+                    extras={"sender_id": sender_id},
+                )
             except SessionQueueFull:
                 return _toast("warning", "消息过多，请稍后再试")
 
