@@ -61,8 +61,12 @@
 
 ## 5. Completion 链路与 `_on_message` 重构
 
-- [ ] 5.1 重构 `feishu_bridge/main.py::_on_message` —— 抽取 enqueue 逻辑为 `enqueue_turn(chat_id, session_id, prompt, kind)`
+- [x] 5.1 重构 `feishu_bridge/main.py::_on_message` —— 抽取 enqueue 逻辑为 `enqueue_turn(chat_id, session_id, prompt, kind)`
     - Validate: 现有 `tests/test_*.py` 全部通过；`enqueue_turn` 对 `kind='human'` 行为与重构前 bit-identical（用 golden test 录入队快照）
+    - Implementation (Option C — narrow core + extras): `FeishuBot.enqueue_turn(*, chat_id, session_key, prompt, kind, extras=None) -> (status, item)`。base item 内置 18 个字段默认值，`extras` 按 kind 合并。`_on_message` 人类分支改为 `self.enqueue_turn(kind='human', extras={thread_id, parent_id, message_id, sender_id, image_key, file_key, file_name, _todo_task_id, _card_message_id, _merge_forward_message_id, _feishu_urls})`。
+    - Golden test `test_enqueue_turn_human_bit_identical_golden` in test_bridge.py — 冻结 19-field item dict，refactor 前后均通过。
+    - 全回归：186 test_bridge.py + 33 test_task_runner.py + 22 test_bg_supervisor.py = 241 passed。
+    - Code Review (Claude code-reviewer): APPROVE with warnings. MEDIUM #1 (extras 可覆盖 infra keys) 已应用 `_PROTECTED={bot_id, _cost_store, _quota_poller, _ledger, _queue_key}` guard + 回归测试。MEDIUM #2 (5.3 bypass 需 queue 层 API 改动) 已 forward-note 到 5.3 checkbox。Codex 跨模型评审本轮跳过（refactor bit-identical, golden 已兜底，risk 面小于 Section 4）。
 - [ ] 5.2 合成 turn 构造器：按 design.md §Synthetic Turn Format 拼 prompt；16KB 硬上限；**确定性 4 步截断顺序**
     - 步骤 1：stdout_tail / stderr_tail 各截到 1024B（UTF-8 boundary-safe）
     - 步骤 2：output_paths 保留 top 5（按字典序）
@@ -71,6 +75,7 @@
     - Validate: 构造各字段均超长的 fixture，断言截断顺序与最终大小 ≤16KB；`[bg-task:id]` 和 manifest path 在任何输入下均存在；多字节字符跨边界不破坏
 - [ ] 5.3 `enqueue_turn` 对 `kind='bg_task_completion'` 绕过 `MAX_PENDING_PER_SESSION=10`；人类消息仍受限
     - Validate: 同 session 预置 10 pending 人类消息 → 新的 bg completion 仍能入队；反之预置 1 bg completion + 10 人类 → 下一条人类消息被 backpressure
+    - **Prerequisite (from 5.1 review)**: `ChatTaskQueue.enqueue` 目前无条件执行 `MAX_PENDING_PER_SESSION` 检查并抛 `SessionQueueFull`。bypass 需在 queue 层加参数（如 `bypass_backpressure: bool = False`）或新增 `enqueue_bypass()` 方法；`enqueue_turn` 里单独判断 kind 无法绕过。
 - [ ] 5.4 Session resume fallback —— probe 契约
     - `sessions_index`（in-memory dict + `~/.feishu-bridge/sessions.json` 持久化）记录 `{session_id: {last_active_at, chat_id}}`；bridge 每次处理 human turn 更新 last_active_at
     - enqueue_turn 发现 `now - last_active_at > 24h` → 启动 sentinel probe：`claude -p --resume <session_id> -p ":probe:"` 5s timeout；成功 → 正常 resume；失败（timeout/session not found） → fork 新 session + prepend `[NOTE: original session no longer resumable at <timestamp>, resuming in fresh context]` 到 prompt

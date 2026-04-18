@@ -1591,6 +1591,74 @@ def test_on_message_per_group_override_auto_reply_in_disabled_default():
 
 
 # ---------------------------------------------------------------------------
+# Golden: enqueue_turn(kind='human') bit-identical refactor guard (Section 5.1)
+# ---------------------------------------------------------------------------
+#
+# Freezes the exact item dict shape that _on_message produces for a human
+# turn. If Section 5.1's enqueue_turn extraction alters any field (order,
+# key name, value), this test fires. The dict values are derived from a
+# known deterministic input (message_id='om_golden', text='hello world').
+
+HUMAN_TURN_GOLDEN = {
+    "bot_id": "test-bot",
+    "chat_id": "oc_group1",
+    "thread_id": None,
+    "parent_id": None,
+    "message_id": "om_golden",
+    "sender_id": "ou_user",
+    "text": "hello world",
+    "image_key": None,
+    "file_key": None,
+    "file_name": None,
+    "_queued_reaction_id": None,
+    "_todo_task_id": None,
+    "_card_message_id": None,
+    "_merge_forward_message_id": None,
+    "_feishu_urls": [],
+    "_cost_store": {},
+    "_quota_poller": None,
+    "_ledger": None,
+    "_queue_key": "test-bot:oc_group1:",
+}
+
+
+def test_enqueue_turn_human_bit_identical_golden():
+    """Item dict for a plain human turn matches the frozen golden shape.
+
+    Guards Section 5.1 refactor: extracting enqueue_turn must not alter
+    the dict that lands in ChatTaskQueue.enqueue(key, item).
+    """
+    bot = _make_full_bot(default_mode="auto-reply")
+    data = _make_event_data(
+        "hello world", chat_type="group", message_id="om_golden",
+    )
+    bot._on_message(data)
+    assert len(bot._enqueued_items) == 1
+    item = bot._enqueued_items[0]
+    assert item == HUMAN_TURN_GOLDEN, \
+        f"enqueue item drifted from golden:\n  got:      {item!r}\n  expected: {HUMAN_TURN_GOLDEN!r}"
+
+
+def test_enqueue_turn_rejects_protected_keys_in_extras():
+    """Extras must not override bot_id/_cost_store/_quota_poller/_ledger/_queue_key.
+
+    Guards against a future kind='bg_task_completion' caller silently
+    losing infrastructure wiring (review Finding #1).
+    """
+    import pytest
+    bot = _make_full_bot(default_mode="auto-reply")
+    for key in ("bot_id", "_cost_store", "_quota_poller", "_ledger", "_queue_key"):
+        with pytest.raises(ValueError, match="protected keys"):
+            bot.enqueue_turn(
+                chat_id="oc_x",
+                session_key="k",
+                prompt="p",
+                kind="human",
+                extras={key: "oops"},
+            )
+
+
+# ---------------------------------------------------------------------------
 # load_config validation
 # ---------------------------------------------------------------------------
 

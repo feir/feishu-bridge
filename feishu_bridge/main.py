@@ -1004,6 +1004,68 @@ class FeishuBot:
         log.info("Connecting to Feishu WebSocket (bot=%s)...", self.bot_id)
         ws_client.start()  # Blocks forever
 
+    def enqueue_turn(
+        self,
+        *,
+        chat_id: str,
+        session_key: str,
+        prompt: str,
+        kind: str,
+        extras: dict | None = None,
+    ) -> tuple[str, dict]:
+        """Single entry point for queueing a turn into ChatTaskQueue.
+
+        kind:
+            'human'              — user-originated message (from _on_message)
+            'bg_task_completion' — synthetic turn from bg-task delivery watcher
+                                   (Section 4.5 / 5.3; backpressure bypass lands
+                                   in 5.3)
+
+        extras carries kind-specific fields merged on top of the base item
+        (thread_id, parent_id, message_id, image_key, reactions, …).
+
+        Returns (status, item) where status is 'queued' or 'immediate' and
+        item is the final dict handed to ChatTaskQueue — callers may mutate
+        it (e.g. command_handler.add_queued_reaction_to_item writes back the
+        reaction id). Raises SessionQueueFull; callers handle per kind.
+        """
+        item: dict = {
+            "bot_id": self.bot_id,
+            "chat_id": chat_id,
+            "thread_id": None,
+            "parent_id": None,
+            "message_id": None,
+            "sender_id": None,
+            "text": prompt,
+            "image_key": None,
+            "file_key": None,
+            "file_name": None,
+            "_queued_reaction_id": None,
+            "_todo_task_id": None,
+            "_card_message_id": None,
+            "_merge_forward_message_id": None,
+            "_feishu_urls": [],
+            "_cost_store": self._session_cost,
+            "_quota_poller": getattr(self, "_quota_poller", None),
+            "_ledger": getattr(self, "_ledger", None),
+        }
+        if extras:
+            # Infrastructure fields are self-derived; extras must never
+            # override them or a future caller (kind='bg_task_completion')
+            # could silently lose bot_id / cost store / ledger wiring.
+            _protected = {
+                "bot_id", "_cost_store", "_quota_poller", "_ledger", "_queue_key",
+            }
+            bad = _protected & extras.keys()
+            if bad:
+                raise ValueError(
+                    f"enqueue_turn extras cannot override protected keys: {sorted(bad)}"
+                )
+            item.update(extras)
+        item["_queue_key"] = session_key
+        status = self._chat_queue.enqueue(session_key, item)
+        return status, item
+
     def _on_message(self, data):
         """Event handler — MUST return immediately, zero network I/O."""
         try:
@@ -1375,32 +1437,28 @@ class FeishuBot:
                 return
 
             # Enqueue via ChatTaskQueue (zero I/O, non-blocking)
-            item = {
-                "bot_id": self.bot_id,
-                "chat_id": chat_id,
-                "thread_id": thread_id,
-                "parent_id": parent_id,
-                "message_id": message_id,
-                "sender_id": sender_id,
-                "text": text,
-                "image_key": image_key,
-                "file_key": file_key,
-                "file_name": file_name,
-                "_queued_reaction_id": None,
-                "_todo_task_id": _todo_task_id,
-                "_card_message_id": _card_message_id,
-                "_merge_forward_message_id": _merge_forward_message_id,
-                "_feishu_urls": _feishu_urls,
-                "_cost_store": self._session_cost,
-                "_quota_poller": getattr(self, "_quota_poller", None),
-                "_ledger": getattr(self, "_ledger", None),
-            }
             msg_key = SessionMap._key_str(
                 (self.bot_id, chat_id, thread_id))
-            item["_queue_key"] = msg_key
-
             try:
-                status = self._chat_queue.enqueue(msg_key, item)
+                status, item = self.enqueue_turn(
+                    chat_id=chat_id,
+                    session_key=msg_key,
+                    prompt=text,
+                    kind="human",
+                    extras={
+                        "thread_id": thread_id,
+                        "parent_id": parent_id,
+                        "message_id": message_id,
+                        "sender_id": sender_id,
+                        "image_key": image_key,
+                        "file_key": file_key,
+                        "file_name": file_name,
+                        "_todo_task_id": _todo_task_id,
+                        "_card_message_id": _card_message_id,
+                        "_merge_forward_message_id": _merge_forward_message_id,
+                        "_feishu_urls": _feishu_urls,
+                    },
+                )
             except SessionQueueFull:
                 self._io_executor.submit(
                     self.command_handler.reply_queue_full,
