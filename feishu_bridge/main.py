@@ -57,6 +57,7 @@ from feishu_bridge.runtime import (
     _resource_stack,
 )
 from feishu_bridge.runtime_local import LocalHTTPRunner
+from feishu_bridge.runtime_pi import PiRunner
 
 
 class ConfigError(ValueError):
@@ -138,6 +139,7 @@ _RUNNER_CLASSES: dict[str, type[BaseRunner]] = {
     "claude": ClaudeRunner,
     "codex": CodexRunner,
     "local": LocalHTTPRunner,
+    "pi": PiRunner,
 }
 
 
@@ -467,7 +469,8 @@ def load_config(config_path: str, bot_name: str) -> dict:
     agent_cfg = config.get("agent", {"type": "claude", "command": "claude"})
     agent_type = agent_cfg.get("type")
     if not agent_type:
-        log.error("agent.type is required (claude or codex)")
+        log.error("agent.type is required. Supported: %s",
+                  list(_RUNNER_CLASSES.keys()))
         sys.exit(1)
     if agent_type not in _RUNNER_CLASSES:
         log.error("Unknown agent type '%s'. Supported: %s",
