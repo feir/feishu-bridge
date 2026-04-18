@@ -174,11 +174,12 @@ $ feishu-bridge --bot my-bot
     "group_policy": { ... }             // 可选：群聊响应策略
   }],
   "agent": {
-    "type": "claude",                   // claude | codex
+    "type": "claude",                   // claude | codex | local | pi
     "command": "claude",
     "commands": {                       // 可选：为热切换指定命令
       "claude": "claude",
-      "codex": "codex"
+      "codex": "codex",
+      "pi": "pi"
     },
     "args": ["--verbose"],             // 可选：当前 agent 的额外 CLI 参数
     "env": {                            // 可选：当前 agent 的固定环境变量
@@ -202,7 +203,7 @@ $ feishu-bridge --bot my-bot
 }
 ```
 
-发送 `/agent claude` 或 `/agent codex` 可在当前 bot 进程内热切换后端。切换会清空旧会话映射，避免复用不兼容的 `session_id` / `thread_id`；该切换仅影响当前运行实例，重启后仍以配置文件中的 `agent.type` 为准。
+发送 `/agent claude`、`/agent codex`、`/agent local` 或 `/agent pi` 可在当前 bot 进程内热切换后端。切换会清空旧会话映射，避免复用不兼容的 `session_id` / `thread_id`；该切换仅影响当前运行实例，重启后仍以配置文件中的 `agent.type` 为准。
 
 `agent.args` / `agent.env` 是当前 `agent.type` 的简写；如需给热切换目标预置不同参数，使用 `args_by_type` / `env_by_type`。
 
@@ -292,6 +293,64 @@ $ feishu-bridge --bot my-bot
   "args": ["--profile", "ollama-launch"]
 }
 ```
+
+### 连接 Pi / oMLX
+
+Pi runner 适合把本机 `pi` 作为 bridge 后端，再由 Pi 连接本地 oMLX。推荐先以只读工具启用，确认 Feishu 端 smoke 后再显式加入写入或 shell 工具。
+
+前置条件：
+
+- `pi` 已在 PATH 中，或在 `agent.commands.pi` 中使用绝对路径。
+- `~/.pi/agent/models.json` 已配置 oMLX provider，例如 `baseUrl: "http://127.0.0.1:8000/v1"`。
+- oMLX 服务已监听本机端口。
+
+示例配置：
+
+```jsonc
+"agent": {
+  "type": "claude",
+  "provider": "default",
+  "commands": {
+    "claude": "claude",
+    "codex": "codex",
+    "local": "local",
+    "pi": "/Users/feir/.local/bin/pi"
+  },
+  "providers": {
+    "default": {},
+    "pi-local": {
+      "workspace": "/Users/feir/.claude",
+      "models": {
+        "pi": "Qwen3.6-35B-A3B-mxfp4"
+      },
+      "args_by_type": {
+        "pi": [
+          "--provider", "omlx",
+          "--no-context-files",
+          "--no-extensions",
+          "--no-skills",
+          "--no-prompt-templates",
+          "--no-themes"
+        ]
+      },
+      "prompt": {
+        "safety": "minimal",
+        "feishu_cli": false,
+        "cron_mgr": false
+      }
+    }
+  }
+}
+```
+
+飞书内切换顺序：
+
+```text
+/agent pi
+/provider pi-local
+```
+
+默认情况下，`PiRunner` 会自动注入只读工具 `read,grep,find,ls`。如果配置里显式传入 `--tools` 或 `--no-tools`，bridge 会尊重该设置，不再追加默认工具。
 
 配置查找顺序：`--config <path>` → `$FEISHU_BRIDGE_CONFIG` → `~/.config/feishu-bridge/config.json`
 
