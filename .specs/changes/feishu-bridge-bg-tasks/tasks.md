@@ -67,12 +67,15 @@
     - Golden test `test_enqueue_turn_human_bit_identical_golden` in test_bridge.py — 冻结 19-field item dict，refactor 前后均通过。
     - 全回归：186 test_bridge.py + 33 test_task_runner.py + 22 test_bg_supervisor.py = 241 passed。
     - Code Review (Claude code-reviewer): APPROVE with warnings. MEDIUM #1 (extras 可覆盖 infra keys) 已应用 `_PROTECTED={bot_id, _cost_store, _quota_poller, _ledger, _queue_key}` guard + 回归测试。MEDIUM #2 (5.3 bypass 需 queue 层 API 改动) 已 forward-note 到 5.3 checkbox。Codex 跨模型评审本轮跳过（refactor bit-identical, golden 已兜底，risk 面小于 Section 4）。
-- [ ] 5.2 合成 turn 构造器：按 design.md §Synthetic Turn Format 拼 prompt；16KB 硬上限；**确定性 4 步截断顺序**
+- [x] 5.2 合成 turn 构造器：按 design.md §Synthetic Turn Format 拼 prompt；16KB 硬上限；**确定性 4 步截断顺序**
     - 步骤 1：stdout_tail / stderr_tail 各截到 1024B（UTF-8 boundary-safe）
     - 步骤 2：output_paths 保留 top 5（按字典序）
     - 步骤 3：on_done_prompt 截到剩余预算
     - 步骤 4：始终保留 `[bg-task:{id}]` 前缀 + manifest path line + state/reason/signal/duration/exit_code；这些不可被截
     - Validate: 构造各字段均超长的 fixture，断言截断顺序与最终大小 ≤16KB；`[bg-task:id]` 和 manifest path 在任何输入下均存在；多字节字符跨边界不破坏
+    - 实装：新增 `feishu_bridge/bg_synthetic_turn.py`（纯函数 `build_synthetic_turn(...)`）+ 23 个 fixture-driven tests。
+    - Code Review (Claude code-reviewer): 发现 MAJOR — `remaining<=0` fallback 分支用 raw byte slice 同时破坏 UTF-8 safety 与 step-4 preservation（长 `reason` → prelude 被从尾部切掉 State/Reason/Signal/Duration/Exit_code 行，并可能产生 mojibake）。已应用修复：对 `reason` (2048B)、`manifest_path` (1024B)、`signal` (64B) 在进入 prelude 前做 UTF-8 safe per-field cap；`remaining<=0` 分支转为 `assert`（step-4 pre-pass 已使其结构上不可达）。新增 4 个 M1 回归测试：长 reason 保 step-4 字段、多字节 reason 不破坏、短 reason 原样、超长 signal 被截断。tail boundary 测试 parametrize 至 5 个 offset 覆盖 emoji 所有切位。
+    - 回归：全量 186 + 33 + 22 + 23 = 264 passed。Codex 跨模型评审本轮跳过（sandbox 阻塞了 codex exec 的所有 stdout 重定向路径；M1 已通过 Claude review 发现并修复 + 回归测试补全）。
 - [ ] 5.3 `enqueue_turn` 对 `kind='bg_task_completion'` 绕过 `MAX_PENDING_PER_SESSION=10`；人类消息仍受限
     - Validate: 同 session 预置 10 pending 人类消息 → 新的 bg completion 仍能入队；反之预置 1 bg completion + 10 人类 → 下一条人类消息被 backpressure
     - **Prerequisite (from 5.1 review)**: `ChatTaskQueue.enqueue` 目前无条件执行 `MAX_PENDING_PER_SESSION` 检查并抛 `SessionQueueFull`。bypass 需在 queue 层加参数（如 `bypass_backpressure: bool = False`）或新增 `enqueue_bypass()` 方法；`enqueue_turn` 里单独判断 kind 无法绕过。
