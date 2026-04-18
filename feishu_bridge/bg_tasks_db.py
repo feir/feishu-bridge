@@ -18,11 +18,14 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import tarfile
 import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -331,6 +334,25 @@ def _tx(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.execute("COMMIT")
 
 
+@contextmanager
+def _tx_immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Explicit ``BEGIN IMMEDIATE`` — acquires RESERVED lock up-front.
+
+    Used by §6.6 cleanup paths where proposal.md:58 specifies IMMEDIATE
+    isolation. For pure DELETE transactions the upgrade-from-DEFERRED path
+    is equivalent, but IMMEDIATE makes the spec alignment explicit and
+    prevents a SELECT+write txn from being preempted between the two.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
+
+
 # ---------------------------------------------------------------------------
 # Integrity check / quarantine / manifest replay
 # ---------------------------------------------------------------------------
@@ -470,6 +492,299 @@ def rebuild_from_manifests(
     log.info("bg reconcile: manifests replayed=%d orphans=%d",
              stats["completed_replayed"], stats["orphans_created"])
     return stats
+
+
+# ---------------------------------------------------------------------------
+# §6.6 Archive cleanup + quarantine retention
+# ---------------------------------------------------------------------------
+
+_TERMINAL_STATE_SQL = (
+    "'completed','failed','cancelled','timeout','orphan'"
+)
+
+# Predicate for a delivery-settled row: either the bg_runs join is empty
+# (orphan rows synthesized by reconcile never create bg_runs), or the row
+# reached a terminal delivery state, or it burned its full retry budget,
+# or it was never eligible for delivery at all ('not_ready' that survived
+# past finalisation — only happens for orphans marked by `_mark_orphan`).
+_DELIVERY_SETTLED_SQL = (
+    "("
+    "r.id IS NULL "
+    "OR r.delivery_state = 'sent' "
+    "OR r.delivery_state = 'not_ready' "
+    "OR (r.delivery_state = 'delivery_failed' AND r.delivery_attempt_count >= 10)"
+    ")"
+)
+
+
+def cleanup_and_archive(
+    conn: sqlite3.Connection,
+    tasks_dir: str | Path,
+    *,
+    completed_retention_days: int = 7,
+    archive_retention_days: int = 90,
+    now_ms: Optional[int] = None,
+) -> dict[str, int]:
+    """Tar-gz settled completed tasks older than 7 days, drop expired tarballs
+    older than 90 days along with their DB rows.
+
+    Ordering per directory is: (1) tar.gz → rename → (2) rm source dir → (3)
+    DELETE bg_tasks row. A crash after step 1 leaves a tarball and a live row;
+    next pass skips step 1 (tarball exists) and completes. A crash after step 2
+    leaves no manifest for ``rebuild_from_manifests`` to replay, so the row can
+    be deleted on retry without duplication risk.
+
+    BEGIN IMMEDIATE is held only for the two tiny SQL windows (candidate SELECT
+    and terminal DELETE). Tar compression runs outside any transaction so a
+    multi-MB task directory doesn't block writers.
+
+    Returns {'archived': N, 'expired': N, 'skipped': N} — 'skipped' counts
+    candidates whose predicate still held at SELECT but were rejected by the
+    DELETE re-check (concurrent state mutation; should be zero in normal
+    single-bridge operation).
+    """
+    root = Path(tasks_dir)
+    if now_ms is None:
+        now_ms = _now_ms()
+    archive_cutoff_ms = now_ms - completed_retention_days * 86_400_000
+    expire_cutoff_ms = now_ms - archive_retention_days * 86_400_000
+
+    archive_root = root / "_archive"
+    completed_root = root / "completed"
+
+    stats = {"archived": 0, "expired": 0, "skipped": 0}
+
+    # -------- Pass 1: archive settled completed > retention --------
+    with _tx_immediate(conn):
+        rows = conn.execute(
+            f"""SELECT t.id,
+                       COALESCE(r.finished_at, t.updated_at) AS finish_ms
+                FROM bg_tasks t
+                LEFT JOIN bg_runs r ON r.task_id = t.id
+                WHERE t.state IN ({_TERMINAL_STATE_SQL})
+                  AND COALESCE(r.finished_at, t.updated_at) < ?
+                  AND {_DELIVERY_SETTLED_SQL}
+                ORDER BY t.id""",
+            (archive_cutoff_ms,),
+        ).fetchall()
+    candidates = [(r[0], int(r[1])) for r in rows if _TASK_ID_RE.match(r[0])]
+
+    for tid, finish_ms in candidates:
+        src_dir = completed_root / tid
+        # Defense-in-depth: never follow a symlinked task dir (could redirect
+        # tar.gz + rm into arbitrary filesystem locations). Skip the DELETE
+        # too — the live data the symlink points at is untouched, so the row
+        # must survive for operator investigation.
+        if src_dir.is_symlink():
+            log.warning(
+                "bg cleanup: %s has symlinked completed/ dir; skipping entire row",
+                tid,
+            )
+            stats["skipped"] += 1
+            continue
+        yyyy_mm = datetime.fromtimestamp(
+            finish_ms / 1000.0, tz=timezone.utc,
+        ).strftime("%Y-%m")
+        dest = archive_root / yyyy_mm / f"{tid}.tar.gz"
+        _archive_task_dir(src_dir, dest, tid)
+        # Tarball is in place (or both tarball and source missing — row alone,
+        # still safe because manifest is gone and rebuild_from_manifests won't
+        # replay). Delete DB row under the same predicate so a concurrent retry
+        # that flipped delivery_state back to pending doesn't get yanked.
+        deleted = _delete_terminal_row_with_guard(conn, tid, archive_cutoff_ms)
+        if deleted:
+            stats["archived"] += 1
+        else:
+            stats["skipped"] += 1
+            log.warning(
+                "bg cleanup: %s archived but DELETE skipped "
+                "(delivery predicate no longer holds)",
+                tid,
+            )
+
+    # -------- Pass 2: expire archives older than archive_retention_days --------
+    if archive_root.is_dir():
+        for month_dir in sorted(archive_root.iterdir()):
+            if not month_dir.is_dir():
+                continue
+            for tarball in sorted(month_dir.glob("*.tar.gz")):
+                try:
+                    mtime_ms = int(tarball.stat().st_mtime * 1000)
+                except OSError:
+                    continue
+                if mtime_ms >= expire_cutoff_ms:
+                    continue
+                tid_stem = tarball.stem
+                if tid_stem.endswith(".tar"):
+                    tid_stem = tid_stem[:-4]
+                if not _TASK_ID_RE.match(tid_stem):
+                    continue
+                try:
+                    tarball.unlink()
+                except OSError as exc:
+                    log.warning("bg cleanup: unlink %s failed: %s", tarball, exc)
+                    continue
+                # DB row already deleted in pass 1 of some prior run. Defensive
+                # second delete in case the pass-1 delete crashed before the
+                # tarball was rolled over to expiry. Guarded by terminal-state
+                # filter so a hypothetical operator-side "manual archive" of a
+                # live row cannot trigger row deletion via stale tarball.
+                with _tx_immediate(conn):
+                    conn.execute(
+                        f"""DELETE FROM bg_tasks
+                            WHERE id=?
+                              AND state IN ({_TERMINAL_STATE_SQL})""",
+                        (tid_stem,),
+                    )
+                stats["expired"] += 1
+            # Remove month dir if empty now.
+            try:
+                next(month_dir.iterdir())
+            except StopIteration:
+                try:
+                    month_dir.rmdir()
+                except OSError:
+                    pass
+            except OSError:
+                pass
+
+    log.info(
+        "bg cleanup: archived=%d expired=%d skipped=%d",
+        stats["archived"], stats["expired"], stats["skipped"],
+    )
+    return stats
+
+
+def _archive_task_dir(src_dir: Path, dest: Path, tid: str) -> bool:
+    """Create ``dest`` (.tar.gz) from ``src_dir`` atomically and then remove
+    the source. Idempotent: if ``dest`` already exists, just remove ``src_dir``
+    if still present. Returns True iff at least one of (tarball, src removal)
+    made progress.
+
+    Rejects symlinked ``src_dir`` outright: ``rebuild_from_manifests`` already
+    filters symlinks via ``_is_trusted_task_dir`` at scan time, but cleanup
+    reads candidate IDs from the DB rather than the filesystem, so we repeat
+    the check here as defense-in-depth against a tampered ``completed/<tid>``
+    link.
+    """
+    if src_dir.is_symlink():
+        log.warning("bg cleanup: refusing to archive symlinked %s", src_dir)
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    progress = False
+    if not dest.exists():
+        if not src_dir.is_dir():
+            return False
+        tmp = dest.with_name(dest.name + ".tmp")
+        try:
+            with tarfile.open(tmp, "w:gz") as tar:
+                tar.add(src_dir, arcname=tid)
+            os.replace(tmp, dest)
+            progress = True
+        except OSError as exc:
+            log.warning("bg cleanup: tar %s failed: %s", tid, exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False
+    if src_dir.is_dir():
+        try:
+            shutil.rmtree(src_dir)
+            progress = True
+        except OSError as exc:
+            log.warning("bg cleanup: rmtree %s failed: %s", src_dir, exc)
+    return progress
+
+
+def _delete_terminal_row_with_guard(
+    conn: sqlite3.Connection,
+    tid: str,
+    archive_cutoff_ms: int,
+) -> bool:
+    """DELETE bg_tasks row iff the archive predicate still holds. Returns True
+    iff a row was deleted. bg_runs cascade-deletes via FK."""
+    with _tx_immediate(conn):
+        cur = conn.execute(
+            f"""DELETE FROM bg_tasks
+                WHERE id = ?
+                  AND state IN ({_TERMINAL_STATE_SQL})
+                  AND EXISTS (
+                    SELECT 1 FROM bg_tasks t
+                    LEFT JOIN bg_runs r ON r.task_id = t.id
+                    WHERE t.id = ?
+                      AND COALESCE(r.finished_at, t.updated_at) < ?
+                      AND {_DELIVERY_SETTLED_SQL}
+                  )""",
+            (tid, tid, archive_cutoff_ms),
+        )
+        return cur.rowcount > 0
+
+
+def cleanup_quarantine_files(
+    db_path: str | Path,
+    *,
+    retain_count: int = 3,
+    retain_days: int = 30,
+    now_ms: Optional[int] = None,
+) -> int:
+    """Trim ``<db_path>.quarantine.<ts>`` files (and their ``-shm`` / ``-wal``
+    sidecars) down to the union of (top N by mtime) ∪ (files within retain_days).
+
+    "取更晚的" means: keep whichever set is larger — a burst of 4 quarantines
+    in one week keeps all 4; a single old quarantine more than 30 days old is
+    still retained if it's within the top N.
+
+    Returns the number of base files deleted (sidecars counted with their
+    base).
+    """
+    p = Path(db_path)
+    base_dir = p.parent
+    if not base_dir.is_dir():
+        return 0
+    if now_ms is None:
+        now_ms = _now_ms()
+    cutoff_ms = now_ms - retain_days * 86_400_000
+
+    # Base file pattern: "<name>.quarantine.<digits>" with no sidecar suffix.
+    base_re = re.compile(rf"^{re.escape(p.name)}\.quarantine\.\d+$")
+    bases: list[tuple[Path, int]] = []
+    for entry in base_dir.iterdir():
+        if not entry.is_file():
+            continue
+        if not base_re.match(entry.name):
+            continue
+        try:
+            mtime_ms = int(entry.stat().st_mtime * 1000)
+        except OSError:
+            continue
+        bases.append((entry, mtime_ms))
+
+    if not bases:
+        return 0
+
+    # Newest first.
+    bases.sort(key=lambda t: t[1], reverse=True)
+    keep: set[Path] = {b for b, _ in bases[:retain_count]}
+    keep.update(b for b, m in bases if m >= cutoff_ms)
+
+    deleted = 0
+    for base, _ in bases:
+        if base in keep:
+            continue
+        for suffix in ("", "-shm", "-wal"):
+            target = base.with_name(base.name + suffix) if suffix else base
+            if target.exists():
+                try:
+                    target.unlink()
+                except OSError as exc:
+                    log.warning(
+                        "bg cleanup: unlink quarantine %s failed: %s",
+                        target, exc,
+                    )
+        deleted += 1
+        log.info("bg cleanup: pruned quarantine %s", base.name)
+    return deleted
 
 
 def _row_exists(conn: sqlite3.Connection, task_id: str) -> bool:

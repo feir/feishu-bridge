@@ -19,6 +19,8 @@ from feishu_bridge.bg_tasks_db import (
     _AttachRace,
     _FinishRace,
     _now_ms,
+    cleanup_and_archive,
+    cleanup_quarantine_files,
     init_db,
     integrity_check_and_maybe_quarantine,
     rebuild_from_manifests,
@@ -860,3 +862,317 @@ def test_rebuild_from_manifests_rejects_symlink_dir(tmp_path):
     conn = init_db(tmp_path / "bg.db")
     stats = rebuild_from_manifests(conn, tasks_dir)
     assert stats["completed_replayed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# §6.6 — archive cleanup + quarantine retention
+# ---------------------------------------------------------------------------
+
+def _seed_terminal_task(
+    conn,
+    tasks_dir: Path,
+    *,
+    finished_at_ms: int,
+    state: str = "completed",
+    delivery_state: str = "sent",
+    delivery_attempt_count: int = 0,
+    create_runs_row: bool = True,
+) -> str:
+    """Create bg_tasks (+ optional bg_runs) row and a completed/<tid>/ dir with
+    a trivial manifest. Returns the task id."""
+    repo = BgTaskRepo(conn)
+    tid = repo.insert_task(
+        chat_id="c", session_id="s", command_argv=["true"], on_done_prompt="",
+    )
+    # Force task row into the desired terminal state with updated_at = finished_at.
+    conn.execute(
+        "UPDATE bg_tasks SET state=?, updated_at=? WHERE id=?",
+        (state, finished_at_ms, tid),
+    )
+    if create_runs_row:
+        conn.execute(
+            """INSERT INTO bg_runs
+                 (task_id, runner_token, wrapper_pid, wrapper_start_time_us,
+                  started_at, finished_at, delivery_state, delivery_attempt_count)
+               VALUES (?, 'tok', 1, 1, ?, ?, ?, ?)""",
+            (tid, finished_at_ms, finished_at_ms, delivery_state,
+             delivery_attempt_count),
+        )
+    conn.commit()
+    # Matching filesystem dir so archive has something to tar.
+    task_dir = tasks_dir / "completed" / tid
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.json.done").write_text('{"id":"%s"}' % tid)
+    return tid
+
+
+def _age_ms(days: int) -> int:
+    return _now_ms() - days * 86_400_000
+
+
+def test_cleanup_archives_sent_task_older_than_retention(tmp_path):
+    conn = _bootstrap(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    old_tid = _seed_terminal_task(
+        conn, tasks_dir,
+        finished_at_ms=_age_ms(8), delivery_state="sent",
+    )
+    fresh_tid = _seed_terminal_task(
+        conn, tasks_dir,
+        finished_at_ms=_age_ms(1), delivery_state="sent",
+    )
+    stats = cleanup_and_archive(conn, tasks_dir)
+    assert stats["archived"] == 1
+    # old task: DB row gone, tarball in _archive, source dir removed
+    assert conn.execute(
+        "SELECT COUNT(*) FROM bg_tasks WHERE id=?", (old_tid,)
+    ).fetchone()[0] == 0
+    tarballs = list((tasks_dir / "_archive").rglob("*.tar.gz"))
+    assert len(tarballs) == 1
+    assert tarballs[0].name == f"{old_tid}.tar.gz"
+    assert not (tasks_dir / "completed" / old_tid).exists()
+    # fresh task untouched
+    assert conn.execute(
+        "SELECT COUNT(*) FROM bg_tasks WHERE id=?", (fresh_tid,)
+    ).fetchone()[0] == 1
+    assert (tasks_dir / "completed" / fresh_tid).is_dir()
+
+
+def test_cleanup_skips_delivery_failed_under_budget(tmp_path):
+    conn = _bootstrap(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    # attempt_count=9 → under budget; should NOT be archived.
+    under = _seed_terminal_task(
+        conn, tasks_dir,
+        finished_at_ms=_age_ms(10),
+        delivery_state="delivery_failed", delivery_attempt_count=9,
+    )
+    # attempt_count=10 → at budget; SHOULD be archived.
+    at = _seed_terminal_task(
+        conn, tasks_dir,
+        finished_at_ms=_age_ms(10),
+        delivery_state="delivery_failed", delivery_attempt_count=10,
+    )
+    stats = cleanup_and_archive(conn, tasks_dir)
+    assert stats["archived"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM bg_tasks WHERE id=?", (under,)
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM bg_tasks WHERE id=?", (at,)
+    ).fetchone()[0] == 0
+
+
+def test_cleanup_archives_orphan_without_runs_row(tmp_path):
+    """Orphans minted by rebuild have no bg_runs row; they still age out."""
+    conn = _bootstrap(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    tid = _seed_terminal_task(
+        conn, tasks_dir,
+        finished_at_ms=_age_ms(8), state="orphan",
+        create_runs_row=False,
+    )
+    stats = cleanup_and_archive(conn, tasks_dir)
+    assert stats["archived"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM bg_tasks WHERE id=?", (tid,)
+    ).fetchone()[0] == 0
+
+
+def test_cleanup_is_idempotent(tmp_path):
+    conn = _bootstrap(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    _seed_terminal_task(conn, tasks_dir, finished_at_ms=_age_ms(8))
+    first = cleanup_and_archive(conn, tasks_dir)
+    second = cleanup_and_archive(conn, tasks_dir)
+    assert first["archived"] == 1
+    assert second["archived"] == 0
+    assert second["expired"] == 0
+    # Tarball still present from first pass.
+    assert len(list((tasks_dir / "_archive").rglob("*.tar.gz"))) == 1
+
+
+def test_cleanup_archive_recovers_when_source_dir_already_rm(tmp_path):
+    """Crash simulation: tarball exists from a prior run but rmtree completed
+    before DB delete — next pass must still delete the row."""
+    conn = _bootstrap(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    tid = _seed_terminal_task(conn, tasks_dir, finished_at_ms=_age_ms(8))
+    # Simulate partial prior run: tarball exists, source dir gone, DB row alive.
+    archive_root = tasks_dir / "_archive" / "2020-01"
+    archive_root.mkdir(parents=True)
+    (archive_root / f"{tid}.tar.gz").write_bytes(b"fake-tarball")
+    import shutil
+    shutil.rmtree(tasks_dir / "completed" / tid)
+
+    stats = cleanup_and_archive(conn, tasks_dir)
+    assert stats["archived"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM bg_tasks WHERE id=?", (tid,)
+    ).fetchone()[0] == 0
+
+
+def test_cleanup_yyyy_mm_uses_finished_at_utc_not_now(tmp_path):
+    conn = _bootstrap(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    # finished at 2024-07-15 12:00:00 UTC (long > 7d ago).
+    finished_ms = 1721044800 * 1000  # 2024-07-15T12:00:00Z
+    _seed_terminal_task(conn, tasks_dir, finished_at_ms=finished_ms)
+    cleanup_and_archive(conn, tasks_dir)
+    # yyyy-mm must key off finished_at UTC, not now().
+    assert (tasks_dir / "_archive" / "2024-07").is_dir()
+
+
+def test_cleanup_expires_tarballs_older_than_90_days(tmp_path):
+    conn = _bootstrap(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    # Pre-seed a tarball with mtime 100 days ago + a matching DB row.
+    month_dir = tasks_dir / "_archive" / "2024-01"
+    month_dir.mkdir(parents=True)
+    tid = uuid.uuid4().hex
+    tarball = month_dir / f"{tid}.tar.gz"
+    tarball.write_bytes(b"fake")
+    old_time = time.time() - 100 * 86400
+    os.utime(tarball, (old_time, old_time))
+    # Add DB row so the defensive second DELETE removes it.
+    conn.execute(
+        """INSERT INTO bg_tasks
+             (id, chat_id, session_id, kind, command_argv, on_done_prompt,
+              state, created_at, updated_at)
+           VALUES (?, 'c', 's', 'adhoc', '[]', '',
+                   'completed', ?, ?)""",
+        (tid, _age_ms(100), _age_ms(100)),
+    )
+    conn.commit()
+
+    stats = cleanup_and_archive(conn, tasks_dir)
+    assert stats["expired"] == 1
+    assert not tarball.exists()
+    # Empty month dir pruned.
+    assert not month_dir.exists()
+    # DB row cleaned defensively.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM bg_tasks WHERE id=?", (tid,)
+    ).fetchone()[0] == 0
+
+
+def test_cleanup_delete_guard_rejects_if_predicate_flips(tmp_path):
+    """If delivery_state flips back to 'pending' between SELECT and DELETE,
+    the row must not be deleted (guard clause re-checks predicate)."""
+    conn = _bootstrap(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    tid = _seed_terminal_task(
+        conn, tasks_dir, finished_at_ms=_age_ms(8), delivery_state="sent",
+    )
+
+    # Patch _archive_task_dir to flip delivery_state mid-cleanup.
+    import feishu_bridge.bg_tasks_db as mod
+    orig = mod._archive_task_dir
+
+    def tamper(src_dir, dest, tidx):
+        result = orig(src_dir, dest, tidx)
+        conn.execute(
+            "UPDATE bg_runs SET delivery_state='pending' WHERE task_id=?",
+            (tidx,),
+        )
+        conn.commit()
+        return result
+
+    mod._archive_task_dir = tamper
+    try:
+        stats = cleanup_and_archive(conn, tasks_dir)
+    finally:
+        mod._archive_task_dir = orig
+    assert stats["archived"] == 0
+    assert stats["skipped"] == 1
+    # Tarball was created before tamper; that's the cost of predicate flip.
+    # DB row survives and can be re-examined on next pass.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM bg_tasks WHERE id=?", (tid,)
+    ).fetchone()[0] == 1
+
+
+def test_quarantine_cleanup_keeps_union_of_top_n_and_recent_window(tmp_path):
+    db_path = tmp_path / "bg.db"
+    db_path.write_bytes(b"fresh-db")
+    now = time.time()
+    # 5 quarantines at various ages: 1, 10, 20, 40, 100 days old.
+    ages = [1, 10, 20, 40, 100]
+    created = []
+    for age in ages:
+        ts = int(now - age * 86400)
+        q = db_path.with_name(f"bg.db.quarantine.{ts}")
+        q.write_bytes(b"x")
+        os.utime(q, (ts, ts))
+        # Sidecars
+        (q.with_name(q.name + "-shm")).write_bytes(b"y")
+        (q.with_name(q.name + "-wal")).write_bytes(b"z")
+        for side in ("-shm", "-wal"):
+            os.utime(q.with_name(q.name + side), (ts, ts))
+        created.append((age, q))
+
+    deleted = cleanup_quarantine_files(db_path, retain_count=3, retain_days=30)
+    # Union: top 3 by mtime (ages 1,10,20) ∪ within 30 days (ages 1,10,20)
+    # = {1,10,20}. Deleted: {40, 100}. Total = 2.
+    assert deleted == 2
+    # Verify survivors: 1, 10, 20 days old
+    for age, q in created:
+        assert q.exists() == (age in (1, 10, 20)), (
+            f"age={age} exists={q.exists()}"
+        )
+        for side in ("-shm", "-wal"):
+            assert q.with_name(q.name + side).exists() == (age in (1, 10, 20))
+
+
+def test_quarantine_cleanup_union_prefers_newer_of_two_sets(tmp_path):
+    """If only 1 file within 30 days but 5 exist, top-3 wins (keeps 3)."""
+    db_path = tmp_path / "bg.db"
+    db_path.write_bytes(b"fresh-db")
+    now = time.time()
+    # All > 30 days old (50, 60, 70, 80, 90).
+    ages = [50, 60, 70, 80, 90]
+    created = []
+    for age in ages:
+        ts = int(now - age * 86400)
+        q = db_path.with_name(f"bg.db.quarantine.{ts}")
+        q.write_bytes(b"x")
+        os.utime(q, (ts, ts))
+        created.append((age, q))
+    deleted = cleanup_quarantine_files(db_path, retain_count=3, retain_days=30)
+    # No file within 30 days, so union = top 3 = ages 50,60,70.
+    assert deleted == 2
+    surviving = sorted(a for a, q in created if q.exists())
+    assert surviving == [50, 60, 70]
+
+
+def test_quarantine_cleanup_noop_on_missing_dir(tmp_path):
+    deleted = cleanup_quarantine_files(tmp_path / "nonexistent" / "bg.db")
+    assert deleted == 0
+
+
+def test_cleanup_refuses_to_archive_symlinked_task_dir(tmp_path):
+    """Defense-in-depth: even if a candidate DB row points to a path that has
+    been swapped to a symlink, _archive_task_dir must refuse rather than
+    tar.gz the symlink target."""
+    conn = _bootstrap(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    tid = _seed_terminal_task(
+        conn, tasks_dir, finished_at_ms=_age_ms(8), delivery_state="sent",
+    )
+    # Replace the legitimate task dir with a symlink to an arbitrary location.
+    import shutil
+    legit_dir = tasks_dir / "completed" / tid
+    shutil.rmtree(legit_dir)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "canary").write_text("do-not-archive")
+    legit_dir.symlink_to(target, target_is_directory=True)
+
+    stats = cleanup_and_archive(conn, tasks_dir)
+    assert stats["archived"] == 0
+    # Row untouched — symlink rejection means guarded DELETE doesn't fire.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM bg_tasks WHERE id=?", (tid,)
+    ).fetchone()[0] == 1
+    # No tarball produced.
+    assert not list((tasks_dir / "_archive").rglob("*.tar.gz"))

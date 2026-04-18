@@ -40,6 +40,8 @@ from feishu_bridge.bg_tasks_db import (
     _FinishRace,
     connect,
     init_db,
+    cleanup_and_archive,
+    cleanup_quarantine_files,
     integrity_check_and_maybe_quarantine,
     rebuild_from_manifests,
 )
@@ -583,6 +585,11 @@ class BgSupervisor:
             "queued_launched": 0,
             "deliveries_handed_off": 0,
             "retry_budget_exhausted": 0,
+            # §6.6 cleanup+archive counters.
+            "archived": 0,
+            "archive_expired": 0,
+            "archive_skipped": 0,
+            "quarantine_pruned": 0,
         }
 
         # Step 1: integrity check (may quarantine + replay).
@@ -689,12 +696,28 @@ class BgSupervisor:
             except Exception:
                 log.exception("bg reconcile: delivery outbox scan failed")
 
+            # Step 8: §6.6 archive cleanup + quarantine retention. Runs last
+            # so cleanup cannot pull the rug out from under an earlier step
+            # that still needed the rows.
+            try:
+                cleanup_stats = cleanup_and_archive(repo.conn, self._tasks_dir)
+                stats["archived"] = cleanup_stats.get("archived", 0)
+                stats["archive_expired"] = cleanup_stats.get("expired", 0)
+                stats["archive_skipped"] = cleanup_stats.get("skipped", 0)
+            except Exception:
+                log.exception("bg reconcile: cleanup+archive failed")
+            try:
+                stats["quarantine_pruned"] = cleanup_quarantine_files(self._db_path)
+            except Exception:
+                log.exception("bg reconcile: quarantine prune failed")
+
             log.info(
                 "bg reconcile done: launching→failed=%d "
                 "running[attached=%d reaped=%d pending_reap=%d "
                 "orphaned=%d manifest_applied=%d] "
                 "stranded-reset=%d manifests=%d orphans=%d queued=%d "
-                "deliveries=%d attempts-exhausted=%d",
+                "deliveries=%d attempts-exhausted=%d "
+                "archived=%d expired=%d skipped=%d quarantine_pruned=%d",
                 stats["stale_launching_failed"],
                 stats["running_attached"],
                 stats["running_reaped"],
@@ -707,6 +730,10 @@ class BgSupervisor:
                 stats["queued_launched"],
                 stats["deliveries_handed_off"],
                 stats["retry_budget_exhausted"],
+                stats["archived"],
+                stats["archive_expired"],
+                stats["archive_skipped"],
+                stats["quarantine_pruned"],
             )
         finally:
             try:

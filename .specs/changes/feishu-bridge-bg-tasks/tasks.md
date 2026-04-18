@@ -134,11 +134,12 @@
 - [x] 6.5 Manifest-only 回填：扫 `tasks/completed/*/task.json.done` 对应 `bg_tasks` 行缺失或 `bg_runs` 行缺失 → 回填；`delivery_state='pending'`
     - Validate: 删除 DB 行保留 manifest → 启动后 DB 行重建 + delivery 被触发
     - Commit A 通过 `rebuild_from_manifests` 幂等复用（活 DB 模式，不仅 quarantine）
-- [ ] 6.6 Archive cleanup + quarantine retention
+- [x] 6.6 Archive cleanup + quarantine retention
     - Archive policy：completed > 7 天 → `_archive/<yyyy-mm>/<task_id>.tar.gz`；archive > 90 天 → 删除 + DELETE DB 行
     - **并发保护**：cleanup 走 `BEGIN IMMEDIATE` + predicate `delivery_state='sent' OR (delivery_state='delivery_failed' AND delivery_attempt_count >= 10)`；不删 retry 进行中的行
-    - **Quarantine retention**：`~/.feishu-bridge/quarantine/bg_tasks-*.db` 保留最近 3 份或 30 天，取更晚的；超出则按 mtime 升序删除
-    - Validate: cleanup 幂等；archive 目录不阻止新 task launch；cascade 删除 DB 行不误伤未完成任务；retry 进行中（`delivery_state='pending'` 或 `'enqueued'`）的 completed 行不被 cleanup 删；quarantine 超 3 份时最旧被删
+    - **Quarantine retention**：`bg_tasks.db.quarantine.<ts>` 保留最近 3 份或 30 天，取更晚的（UNION）；超出则连同 `-shm` / `-wal` sidecars 一并删
+    - **Commit C 实现**：`cleanup_and_archive()` 三步顺序（tar.gz → rm src → DELETE guarded by 同一 predicate）；`cleanup_quarantine_files()` UNION (top N ∪ 30-day window)；step 8 in `BgSupervisor.reconcile()`；`feishu_bridge/bg_tasks_db.py` +~180 行 + `feishu_bridge/bg_supervisor.py` reconcile wiring + `tests/unit/test_bg_tasks_db.py` +11 tests（涵盖幂等、预谓词边界、UTC yyyy-mm、UNION 规则、sidecars、race guard）
+    - Validate: cleanup 幂等（两次运行第二次 archived=0）；archive 目录不阻止新 task launch；DELETE 在 predicate 仍成立时才 cascade；retry 进行中（`delivery_state='pending'` 或 `'enqueued'`）的 completed 行不被 cleanup 删；`delivery_failed` + attempt_count=9 被跳过、=10 被归档；orphan 行（无 bg_runs join）也能归档；quarantine UNION 规则验证两种场景
 
 ## 7. 测试
 
@@ -343,4 +344,33 @@ Re-review: skip (findings #14-#18 are WARN/NOTE-level; #14 is a slow resource-le
 - notes: Commit B of §6 implements 6.3 running-liveness triage — `_triage_running_rows` dispatcher + 5 branch methods + reaper daemon + triple-identity helpers; replaces Commit A's `_warn_running_rows` stub. Scope aligned with proposal.md WHAT; no NOT violations (stays within single-bridge-per-home premise). Safety-critical invariants hold: pid-reuse sends zero signals (§7.6 real-subprocess barrier spy-proven), triage default branch is "orphan, no signal". macOS ps flag bug fixed (`/bin/ps eww` / `axeww` syntax; SIP caveat documented). Two WARN findings (active/→completed/ rename missing after triage manifest replay → slow resource leak; reaper TOCTOU defensive-only) + three NOTE (redundant regex search, log level, additional killpg spy). All 59 bg_supervisor tests pass. Codex cross-review skipped (acpx sandbox friction; `.codex-commit-b-prompt.txt` available for manual second-model pass).
 
 Re-review: skip (findings #14-#18 are WARN/NOTE-level; no BLOCKs or architectural change required)
+
+### Code Review Round 1 — Section 6 Commit C Archive + Quarantine (2026-04-19)
+
+- scope: `feishu_bridge/bg_tasks_db.py` (+`cleanup_and_archive`, `_archive_task_dir`, `_delete_terminal_row_with_guard`, `cleanup_quarantine_files`, `_DELIVERY_SETTLED_SQL`, `_TERMINAL_STATE_SQL`, `_tx_immediate`); `feishu_bridge/bg_supervisor.py` (step-8 wiring + 4 new stats keys); `tests/unit/test_bg_tasks_db.py` (+12 tests: archival path, delivery_failed boundary 9/10, orphan w/o bg_runs, idempotency, crash-partial recovery, UTC yyyy-mm, 90d expiry + month-dir prune, race guard, UNION top-3∪30d, UNION top-3 wins, missing-dir no-op, symlink defense); `tests/unit/test_bg_supervisor.py` (stats-keys contract); tasks.md §6.6 check flip.
+- basis: staged diff (HEAD+staged); 126/126 bg_supervisor+bg_tasks_db tests pass; codex cross-review skipped (session sandbox friction — Claude-only per skill fallback)
+- findings:
+    1. [PASS][Claude] SELECT predicate + orphan handling: `_DELIVERY_SETTLED_SQL` covers (a) `r.id IS NULL` for rebuild-minted orphans, (b) `not_ready` for `_mark_orphan`-marked orphans, (c) `sent` for delivered rows, (d) `delivery_failed AND attempt_count ≥ 10`. The 7-day time gate on `COALESCE(r.finished_at, t.updated_at)` combined with `t.state IN terminal` protects fresh `not_ready` rows from Phase C. Matches proposal.md:58 + design.md:200 (with documented extension of `not_ready` for `_mark_orphan` survivors).
+    2. [PASS][Claude] Crash-safety ordering: tar.gz→rename→rmtree→DELETE is correct. `rebuild_from_manifests` cannot re-materialize deleted rows — it scans `completed/<tid>/task.json.done` only, never `_archive/`. `test_cleanup_archive_recovers_when_source_dir_already_rm` exercises mid-crash recovery.
+    3. [PASS][Claude] Guard EXISTS predicate matches SELECT exactly: `_delete_terminal_row_with_guard` reuses `_TERMINAL_STATE_SQL` + `_DELIVERY_SETTLED_SQL` + same `COALESCE(...) < ?` time gate via shared constants. Race test `test_cleanup_delete_guard_rejects_if_predicate_flips` confirms delivery_state flip → `skipped += 1`, row intact.
+    4. [PASS][Claude] FK cascade: `PRAGMA foreign_keys = ON` verified at init_db (raises if 0). `bg_runs.task_id REFERENCES bg_tasks(id) ON DELETE CASCADE` in schema — cascade works.
+    5. [PASS][Claude] Time units consistent: `now_ms` + `finished_at`/`updated_at` all ms; `st_mtime` multiplied by 1000 for comparison. `test_cleanup_yyyy_mm_uses_finished_at_utc_not_now` pins UTC yyyy-mm behavior explicitly.
+    6. [PASS][Claude] Stats-dict contract: reconcile seeds and populates all four new keys (`archived`, `archive_expired`, `archive_skipped`, `quarantine_pruned`); `test_reconcile_returns_stats_dict_with_all_keys` asserts exact-equal set membership.
+    7. [PASS][Claude] Quarantine UNION: implements `keep = (top-N by mtime DESC) ∪ (mtime ≥ now - retain_days)` per proposal.md:153. Both branches covered: `test_quarantine_cleanup_keeps_union_of_top_n_and_recent_window` (ages 1/10/20/40/100 → keep 1/10/20) + `test_quarantine_cleanup_union_prefers_newer_of_two_sets` (all >30d → top-3 wins). Sidecar handling (-shm/-wal) paired with base file.
+    8. [PASS][Claude-FIXED] Symlink defense-in-depth (was Round 1 WARN #8): symlink check moved to cleanup caller — if `src_dir.is_symlink()` cleanup skips BOTH `_archive_task_dir` AND `_delete_terminal_row_with_guard`, preserving the row for operator investigation. `_archive_task_dir` retains its internal check as belt-and-suspenders. Test `test_cleanup_refuses_to_archive_symlinked_task_dir` asserts row survives + no tarball.
+    9. [PASS][Claude-FIXED] `BEGIN IMMEDIATE` wording alignment (was Round 1 WARN #9): new `_tx_immediate()` helper uses `BEGIN IMMEDIATE` literally; all three cleanup txns (Pass 1 SELECT, guarded DELETE, Pass 2 defensive DELETE) use it. Honors proposal.md:58 exact wording.
+   10. [PASS][Claude-FIXED] Pass 2 defensive DELETE guard (was Round 1 NOTE #11): terminal-state predicate (`state IN terminal`) now on the expiry-path DELETE too, defending against hypothetical "operator manually tarred a live row into _archive/" footgun.
+   11. [NOTE][Claude] Empty-month-dir prune swallows OSError silently (Round 1 NOTE #10 — deferred): fine functionally; consider `log.debug` on `rmdir` OSError for operability. Not blocking.
+   12. [NOTE][Claude] Test coverage gaps for follow-up punch-list (Round 1 NOTE #12 — deferred): (a) concurrent real-writer racing cleanup mid-tar (current test uses monkey-patched tamper); (b) 90-day boundary exactly; (c) `tarfile.open` raising mid-write with .tmp cleanup branch; (d) missing-sidecar `unlink()` branch. Non-blocking; add to §7 test gap list.
+   13. [PASS][Claude] Tests: 126/126 pass (59 supervisor + 67 db including the 12 new §6.6 tests); full suite 622/622 minus one pre-existing unrelated `test_footer_no_model_no_workspace` failure carried from Commit B context.
+- verdict: APPROVED
+
+Re-review: skip — all Round 1 WARNs fixed inline; two remaining NOTEs (#11 log.debug, #12 test gaps) are non-blocking deferred-items for a Section 7 follow-up commit.
+
+Spec-Check
+- scope: `feishu-bridge-bg-tasks` — §6.6 archive cleanup + quarantine retention (Commit C)
+- basis: HEAD+staged
+- timestamp: 2026-04-19
+- notes: Commit C implements §6.6 per proposal.md:58 (BEGIN IMMEDIATE + delivery_state predicate) and proposal.md:153 (quarantine 3-or-30-days union). tasks.md §6.6 checkbox flipped with Commit C annotation; reconcile log line extended with four new counters. No proposal.md NOT violations. Two Round 1 WARNs resolved inline (symlink defense, BEGIN IMMEDIATE wording); one NOTE resolved (Pass 2 guarded DELETE); two deferred NOTEs are non-blocking operability / test-gap items.
+- result: PASS
 

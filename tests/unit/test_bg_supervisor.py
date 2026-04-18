@@ -1676,6 +1676,11 @@ def test_reconcile_returns_stats_dict_with_all_keys(short_env, repo):
         "queued_launched",
         "deliveries_handed_off",
         "retry_budget_exhausted",
+        # §6.6 cleanup + quarantine retention (Commit C).
+        "archived",
+        "archive_expired",
+        "archive_skipped",
+        "quarantine_pruned",
     }
     assert set(stats.keys()) == expected_keys
 
