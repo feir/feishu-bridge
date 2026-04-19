@@ -108,7 +108,7 @@ def test_pi_parse_text_delta_and_final_usage(tmp_path):
         },
         "modelUsage": {
             "Qwen3.6-35B-A3B-mxfp4": {
-                "contextWindow": 32768,
+                "contextWindow": 0,
                 "inputTokens": 369,
                 "outputTokens": 3,
                 "cacheReadInputTokens": 0,
@@ -137,7 +137,7 @@ def test_pi_result_exposes_configured_model_for_footer(tmp_path):
 
     assert result["modelUsage"] == {
         "custom-pi-model": {
-            "contextWindow": 32768,
+            "contextWindow": 0,
             "inputTokens": 10,
             "outputTokens": 2,
             "cacheReadInputTokens": 0,
@@ -213,36 +213,6 @@ def test_pi_parse_protocol_error_event(tmp_path):
     assert result["result"] == "Pi 协议错误：invalid JSON protocol frame"
 
 
-def test_pi_model_aliases_are_semantic(tmp_path):
-    runner = _runner(tmp_path)
-
-    aliases = runner.get_model_aliases()
-
-    assert aliases == {
-        "pi": "Qwen3.6-35B-A3B-mxfp4",
-        "qwen": "Qwen3.6-35B-A3B-mxfp4",
-        "gemma": "gemma-4-26b-a4b-it-mxfp4",
-    }
-    assert "qwen35b" not in aliases
-
-
-def test_pi_model_aliases_can_be_overridden_by_provider_profile(tmp_path):
-    runner = _runner(
-        tmp_path,
-        model_aliases={
-            "pi": "future-pi-model",
-            "qwen": "future-qwen-model",
-            "gemma": "future-gemma-model",
-        },
-    )
-
-    assert runner.get_model_aliases() == {
-        "pi": "future-pi-model",
-        "qwen": "future-qwen-model",
-        "gemma": "future-gemma-model",
-    }
-
-
 def test_pi_parse_tool_status_events(tmp_path):
     runner = _runner(tmp_path)
     state = StreamState()
@@ -300,7 +270,8 @@ def test_create_runner_pi_builds_pi_runner(tmp_path):
     assert "--append-system-prompt" in args
     assert runner.wants_auth_file() is False
     assert runner.supports_compact() is False
-    assert runner.get_model_aliases() == {
+    # Aliases now live on the Bot, not the Runner
+    assert bridge.resolve_model_aliases(agent_cfg) == {
         "pi": "Qwen3.6-35B-A3B-mxfp4",
         "qwen": "Qwen3.6-35B-A3B-mxfp4",
         "gemma": "gemma-4-26b-a4b-it-mxfp4",

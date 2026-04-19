@@ -68,11 +68,10 @@ def test_pi_runner_defaults_to_bridge_workspaces(monkeypatch, tmp_path):
     assert paths.default_runner_workspace("pi") == tmp_path / "workspaces" / "default"
 
 
-def test_codex_and_local_share_non_claude_default(monkeypatch, tmp_path):
+def test_codex_shares_non_claude_default(monkeypatch, tmp_path):
     monkeypatch.setenv("FEISHU_BRIDGE_HOME", str(tmp_path))
     expected = tmp_path / "workspaces" / "default"
     assert paths.default_runner_workspace("codex") == expected
-    assert paths.default_runner_workspace("local") == expected
 
 
 def test_unknown_runner_type_uses_non_claude_default(monkeypatch, tmp_path):

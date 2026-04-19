@@ -16,7 +16,6 @@ Frontmatter schema (extra keys are ignored by Claude Code):
       claude: native | bridge_workflow | unsupported
       pi: native | bridge_workflow | unsupported
       codex: ...
-      local: ...
 """
 
 from __future__ import annotations
@@ -102,7 +101,7 @@ class CommandPolicy:
         """Decide how to route a slash command for a given runner.
 
         `command` may include a leading slash or not. `runner_type` is typically
-        one of 'claude', 'pi', 'codex', 'local' and is lowercased.
+        one of 'claude', 'pi', 'codex' and is lowercased.
         """
         cmd = _normalize_command(command)
         runner = (runner_type or "").lower()

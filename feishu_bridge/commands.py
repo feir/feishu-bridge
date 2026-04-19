@@ -15,9 +15,7 @@ from feishu_bridge.ui import ResponseHandle, add_queued_reaction
 from feishu_bridge.runtime import (
     ClaudeRunner,
     SessionMap,
-    infer_context_window as _context_window_for_model,
     pick_primary_model,
-    resolve_context_window,
 )
 
 
@@ -196,7 +194,7 @@ class BridgeCommandHandler:
                 handle.deliver("上下文已压缩。")
 
         elif cmd == "model":
-            aliases = self.bot.runner.get_model_aliases()
+            aliases = self.bot.model_aliases
             if not arg:
                 model_display = self.bot.runner.model or "(CLI 默认)"
                 if aliases:
@@ -766,21 +764,23 @@ class BridgeCommandHandler:
         cache_create = usage.get("cache_creation_input_tokens", 0)
         total_ctx = inp + cache_read + cache_create
 
-        max_ctx = self.bot.runner.get_default_context_window()
+        max_ctx = 0
         model_name = self.bot.runner.model or ""
         m = pick_primary_model(model_usage, self.bot.runner.model)
         if m:
             model_name = m
-            mu = model_usage[m]
-            max_ctx = resolve_context_window(m, mu.get("contextWindow", 0))
+            max_ctx = int(model_usage[m].get("contextWindow", 0) or 0)
 
-        pct = total_ctx / max_ctx * 100 if max_ctx else 0
-        filled = int(pct / 5)
-        bar = "\u2593" * filled + "\u2591" * (20 - filled)
-
-        # Context header with bar
-        lines.append(f"**Context** `{bar}` **{pct:.0f}%**")
-        meta_parts = [f"{total_ctx:,} / {max_ctx:,} tokens"]
+        if max_ctx > 0:
+            pct = total_ctx / max_ctx * 100
+            filled = int(pct / 5)
+            bar = "\u2593" * filled + "\u2591" * (20 - filled)
+            lines.append(f"**Context** `{bar}` **{pct:.0f}%**")
+            meta_parts = [f"{total_ctx:,} / {max_ctx:,} tokens"]
+        else:
+            pct = 0
+            lines.append("**Context** 上下文窗口：未知（由 CLI 决定）")
+            meta_parts = [f"{total_ctx:,} tokens"]
         if model_name:
             meta_parts.append(model_name)
         lines.append(" · ".join(meta_parts))

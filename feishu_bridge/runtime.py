@@ -41,49 +41,6 @@ def pick_primary_model(model_usage: dict, configured: str | None) -> str | None:
     return max(model_usage.items(), key=lambda kv: _tok(kv[1]))[0]
 
 
-def infer_context_window(model: Optional[str]) -> int:
-    """Authoritative context window table by model family.
-
-    Claude Code CLI runs Opus 4.7 / Sonnet 4.6 with a 1M window by default
-    (verified via the CLI model picker: "Opus 4.7 (1M context) (default)").
-    Do NOT trust ``modelUsage[m].contextWindow`` from the stream event — it
-    reports a legacy 200K value regardless of the actual 1M mode, and using
-    it as the denominator inflates the usage percentage ~5x.
-
-    Haiku 4.5 and the Codex GPT-5.x line stay at 200K.
-    """
-    m = (model or "").lower()
-    if "opus" in m or "sonnet" in m:
-        return 1_000_000
-    if "haiku" in m or "gpt" in m:
-        return 200_000
-    if m:
-        log.warning(
-            "context_window fallback hit for unknown model %r; defaulting to 200K",
-            model,
-        )
-    return 200_000
-
-
-def resolve_context_window(model: Optional[str], stream_cw: int) -> int:
-    """Pick the denominator for context-usage percentages.
-
-    Claude Code CLI reports ``modelUsage[m].contextWindow`` as a legacy
-    200K for Opus/Sonnet even when running at 1M, so the stream value is
-    ignored for those families in favour of the inferred table. For
-    Haiku / Codex / local / custom models the stream value is either
-    authoritative (API-reported) or user-configured (local small-window
-    models), so we trust it when present and fall back to the inferred
-    table only when it is absent or zero.
-    """
-    fam = (model or "").lower()
-    if "opus" in fam or "sonnet" in fam:
-        return infer_context_window(model)
-    if stream_cw > 0:
-        return stream_cw
-    return infer_context_window(model)
-
-
 DEFAULT_TIMEOUT = 300  # 5 minutes
 DEDUP_TTL = 43200  # 12 hours
 DEDUP_MAX = 5000
@@ -129,7 +86,7 @@ class RunResult:
     total_cost_usd: Optional[float] = None
     peak_context_tokens: int = 0
     compact_detected: bool = False
-    default_context_window: int = 200_000
+    default_context_window: int = 0
     rate_limit_info: Optional[dict] = None
 
     def to_dict(self) -> dict:
@@ -375,14 +332,7 @@ class ChatTaskQueue:
 class BaseRunner(ABC):
     """Abstract base for AI Agent CLI runners."""
 
-    DEFAULT_MODEL: ClassVar[str]
     ALWAYS_STREAMING: ClassVar[bool] = False
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        # Enforce DEFAULT_MODEL on concrete subclasses
-        if not getattr(cls, '__abstractmethods__', None) and not hasattr(cls, 'DEFAULT_MODEL'):
-            raise TypeError(f"{cls.__name__} must define DEFAULT_MODEL")
 
     _SAFETY_PROMPT = (
         "CRITICAL: You are running as a subprocess of feishu-bridge. "
@@ -402,8 +352,7 @@ class BaseRunner(ABC):
                  extra_cli_args: Optional[list[str]] = None,
                  fixed_env: Optional[dict[str, str]] = None,
                  safety_prompt_mode: str = "full",
-                 setting_sources: Optional[str] = None,
-                 model_aliases: Optional[dict[str, str]] = None):
+                 setting_sources: Optional[str] = None):
         self.command = command
         self.model = model
         self.workspace = workspace
@@ -417,11 +366,6 @@ class BaseRunner(ABC):
         mode = str(safety_prompt_mode or "full").strip().lower()
         self._safety_prompt_mode = mode if mode in {"full", "minimal", "off"} else "full"
         self._setting_sources = setting_sources
-        self._model_aliases = {
-            str(alias): str(model)
-            for alias, model in (model_aliases or {}).items()
-            if str(alias).strip() and str(model).strip()
-        }
         self._active: dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
@@ -441,14 +385,6 @@ class BaseRunner(ABC):
     @abstractmethod
     def parse_blocking_output(self, stdout: str, session_id: Optional[str]) -> dict:
         """解析阻塞模式的完整 stdout，返回 result dict。"""
-
-    @abstractmethod
-    def get_model_aliases(self) -> dict[str, str]:
-        """返回 {alias: full_model_name} 映射。"""
-
-    @abstractmethod
-    def get_default_context_window(self) -> int:
-        """默认 context window 大小。"""
 
     # ── Optional overrides ──
 
@@ -484,9 +420,7 @@ class BaseRunner(ABC):
         """Whether this runner holds state for the given session_id.
 
         Default True — CLI runners persist via side-files, so we assume
-        the state exists unless the runner explicitly tracks it in memory.
-        LocalHTTPRunner overrides to check its in-memory store so the
-        worker can auto-heal after a bridge restart.
+        the state exists unless a subclass explicitly tracks it in memory.
         """
         return True
 
@@ -494,7 +428,6 @@ class BaseRunner(ABC):
         """Whether the worker should create /tmp/feishu_auth_*.json for this runner.
 
         Default True — CLI runners need the file for feishu-cli OAuth.
-        LocalHTTPRunner overrides to False (no subprocess, no env file).
         """
         return True
 
@@ -507,11 +440,6 @@ class BaseRunner(ABC):
             parts.append(self._MINIMAL_SAFETY_PROMPT)
         parts.extend(self._extra_system_prompts)
         return "\n\n".join(parts)
-
-    def _merge_model_aliases(self, defaults: dict[str, str]) -> dict[str, str]:
-        aliases = dict(defaults)
-        aliases.update(self._model_aliases)
-        return aliases
 
     def _build_streaming_result(self, state: StreamState,
                                 session_id: Optional[str]) -> Optional[dict]:
@@ -638,7 +566,6 @@ class BaseRunner(ABC):
         else:
             result = self._run_blocking(proc, session_id, tag)
 
-        result["default_context_window"] = self.get_default_context_window()
         return result
 
     def _run_blocking(self, proc, session_id, tag) -> dict:
@@ -871,8 +798,6 @@ class BaseRunner(ABC):
 class ClaudeRunner(BaseRunner):
     """Claude Code CLI runner."""
 
-    DEFAULT_MODEL = "claude-opus-4-7"
-
     SESSION_NOT_FOUND_SIGNATURES = [
         "session not found",
         "Session not found",
@@ -1090,16 +1015,6 @@ class ClaudeRunner(BaseRunner):
             "rate_limit_info": state.rate_limit_info,
         }
 
-    def get_model_aliases(self):
-        return self._merge_model_aliases({
-            "opus": "claude-opus-4-7",
-            "sonnet": "claude-sonnet-4-6",
-            "haiku": "claude-haiku-4-5",
-        })
-
-    def get_default_context_window(self):
-        return infer_context_window(self.model)
-
     def get_session_not_found_signatures(self):
         return self.SESSION_NOT_FOUND_SIGNATURES
 
@@ -1114,7 +1029,6 @@ class ClaudeRunner(BaseRunner):
 class CodexRunner(BaseRunner):
     """OpenAI Codex CLI runner."""
 
-    DEFAULT_MODEL = "gpt-5.2-codex"
     ALWAYS_STREAMING = True  # session_id comes from first event (thread.started)
 
     def __init__(self, command: str, model: Optional[str], workspace: str, timeout: int,
@@ -1276,12 +1190,26 @@ class CodexRunner(BaseRunner):
         if not result_text:
             return None  # Fall through to BaseRunner empty-text handler
 
+        usage = state.last_call_usage or {}
+        model_usage = None
+        if self.model:
+            model_usage = {
+                self.model: {
+                    "contextWindow": 0,
+                    "inputTokens": usage.get("input_tokens", 0),
+                    "outputTokens": usage.get("output_tokens", 0),
+                    "cacheReadInputTokens": usage.get("cache_read_input_tokens", 0),
+                    "cacheCreationInputTokens": usage.get("cache_creation_input_tokens", 0),
+                },
+            }
+
         return {
             "result": result_text,
             "session_id": sid,
             "is_error": state.is_error,
-            "usage": state.last_call_usage or {},
-            "last_call_usage": state.last_call_usage or {},
+            "usage": usage,
+            "last_call_usage": usage,
+            **({"modelUsage": model_usage} if model_usage else {}),
             "peak_context_tokens": state.peak_context_tokens,
             "compact_detected": False,
         }
@@ -1290,15 +1218,6 @@ class CodexRunner(BaseRunner):
         # CodexRunner always streams (ALWAYS_STREAMING=True).
         # This method should never be called.
         raise NotImplementedError("CodexRunner always uses streaming mode")
-
-    def get_model_aliases(self):
-        return self._merge_model_aliases({
-            "codex": "gpt-5.2-codex",
-            "codex-mini": "gpt-5.1-codex-mini",
-        })
-
-    def get_default_context_window(self):
-        return 200_000
 
     def get_display_name(self):
         return "Codex"

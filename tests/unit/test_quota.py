@@ -322,7 +322,7 @@ def test_context_health_alert_with_quota_no_context_alert():
     result = {
         "last_call_usage": {"input_tokens": 30000, "cache_read_input_tokens": 0,
                             "cache_creation_input_tokens": 0},
-        "default_context_window": 200_000,
+        "modelUsage": {"claude-opus-4-7": {"contextWindow": 200_000}},
         "rate_limit_info": {"status": "allowed"},
     }
     snap = _make_snap({"five_hour": (85.0, 3600)})
@@ -338,7 +338,7 @@ def test_context_health_alert_with_quota_and_context_alert():
     result = {
         "last_call_usage": {"input_tokens": 170000, "cache_read_input_tokens": 0,
                             "cache_creation_input_tokens": 0},
-        "default_context_window": 200_000,
+        "modelUsage": {"claude-opus-4-7": {"contextWindow": 200_000}},
         "rate_limit_info": {"status": "allowed"},
     }
     snap = _make_snap({"seven_day": (75.0, 86400)})
@@ -352,7 +352,7 @@ def test_context_health_alert_no_quota():
     result = {
         "last_call_usage": {"input_tokens": 150000, "cache_read_input_tokens": 0,
                             "cache_creation_input_tokens": 0},
-        "default_context_window": 200_000,
+        "modelUsage": {"claude-opus-4-7": {"contextWindow": 200_000}},
     }
     alert = bridge_worker._context_health_alert(result, quota_snapshot=None)
     assert alert is not None

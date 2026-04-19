@@ -14,7 +14,7 @@ Entry schema::
     {
         "ts": <float epoch seconds>,
         "kind": "user_turn" | "assistant_turn" | "workflow_event" | "artifact",
-        "runner_type": "claude" | "pi" | "codex" | "local",
+        "runner_type": "claude" | "pi" | "codex",
         "provider": str | None,
         "model": str | None,
         "session_id": str | None,

@@ -235,7 +235,7 @@ def test_latest_timestamp_returns_most_recent(journal_root, scope):
 
 # ---------- runner-agnostic writes ----------
 
-@pytest.mark.parametrize("rtype", ["claude", "pi", "codex", "local"])
+@pytest.mark.parametrize("rtype", ["claude", "pi", "codex"])
 def test_writes_for_all_runner_types(journal_root, scope, rtype):
     j = SessionJournal()
     j.append_user_turn(*scope, text="hi", runner_type=rtype)

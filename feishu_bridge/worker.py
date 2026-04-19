@@ -18,7 +18,7 @@ from feishu_bridge.parsers import (
 )
 from feishu_bridge.quota import WINDOW_LABELS
 from feishu_bridge.runtime import (
-    BaseRunner, SessionMap, pick_primary_model, resolve_context_window,
+    BaseRunner, SessionMap, pick_primary_model,
 )
 from feishu_bridge.session_journal import SessionJournal
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
@@ -45,8 +45,6 @@ def _derive_runner_type(runner) -> str:
         return "pi"
     if "codex" in name:
         return "codex"
-    if "local" in name:
-        return "local"
     return name.replace("runner", "") or "unknown"
 
 # ---------------------------------------------------------------------------
@@ -280,13 +278,17 @@ def _context_health_alert(result: dict, quota_snapshot=None, runner=None) -> str
     Args:
         quota_snapshot: Optional QuotaSnapshot from the API poller.
     """
-    # Determine context window size (opus/sonnet → inferred 1M; others trust stream cw)
-    max_ctx = result.get("default_context_window", 200_000)
+    # Determine context window size from provider-reported modelUsage only.
+    # max_ctx == 0 means "unknown, CLI owns this" — skip percentage-based alerts.
     model_usage = result.get("modelUsage", {})
     configured = getattr(runner, "model", None)
     primary = pick_primary_model(model_usage, configured)
-    if primary:
-        max_ctx = resolve_context_window(primary, model_usage[primary].get("contextWindow", 0))
+    max_ctx = int(model_usage.get(primary, {}).get("contextWindow", 0) or 0) if primary else 0
+
+    rate_alert = _build_quota_alert(result, quota_snapshot)
+
+    if max_ctx == 0:
+        return rate_alert or None
 
     # If auto-compact was detected, alert with pre-compact peak usage
     compact_detected = result.get("compact_detected", False)
@@ -301,17 +303,14 @@ def _context_health_alert(result: dict, quota_snapshot=None, runner=None) -> str
     # No compact — check current usage against thresholds
     usage = result.get("last_call_usage") or result.get("usage")
     if not usage:
-        return None
+        return rate_alert or None
     total_ctx = (usage.get("input_tokens", 0)
                  + usage.get("cache_read_input_tokens", 0)
                  + usage.get("cache_creation_input_tokens", 0))
     if total_ctx == 0:
-        return None
+        return rate_alert or None
 
     pct = total_ctx / max_ctx * 100
-
-    # Build quota alert from both stream event and API snapshot
-    rate_alert = _build_quota_alert(result, quota_snapshot)
 
     supports_compact = runner is None or runner.supports_compact()
     tail_red = "`/compact` 压缩" if supports_compact else "`/new` 开始新会话"

@@ -143,13 +143,13 @@ def test_resolve_bridge_workflow_for_pi(tmp_path: Path):
     assert dec.skill.name == "plan"
 
 
-def test_resolve_unsupported_for_local_runner(tmp_path: Path):
+def test_resolve_unsupported_explicit_status(tmp_path: Path):
     _write_skill(
         tmp_path, "memory-gc",
-        runners={"claude": "native", "pi": "bridge_workflow", "local": "unsupported"},
+        runners={"claude": "native", "pi": "bridge_workflow", "mystery": "unsupported"},
     )
     policy = WorkflowRegistry(agents_home=tmp_path).load()
-    dec = policy.resolve("/memory-gc", "local")
+    dec = policy.resolve("/memory-gc", "mystery")
     assert dec.decision == DECISION_UNSUPPORTED
 
 

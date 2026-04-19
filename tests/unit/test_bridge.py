@@ -857,17 +857,27 @@ def test_context_health_alert_uses_model_context_window():
     assert "83%" in alert
 
 
-def test_context_health_alert_opus_ignores_stale_200k_stream():
-    """Plan C: opus/sonnet with stream contextWindow=200_000 (legacy stale
-    value from Claude Code CLI) must resolve to the inferred 1M denominator.
-    180K / 1M = 18% → no alert, whereas 180K / 200K would produce a red alert."""
+def test_context_health_alert_unknown_window_returns_none():
+    """Path Z: when modelUsage lacks contextWindow (or reports 0), bridge
+    treats the window as unknown and skips percentage-based alerts."""
+    result = {
+        "usage": {"input_tokens": 10_000, "cache_read_input_tokens": 170_000, "cache_creation_input_tokens": 0},
+        "modelUsage": {"claude-opus-4-7": {"contextWindow": 0}},
+    }
+    alert = bridge_worker._context_health_alert(result)
+    assert alert is None
+
+
+def test_context_health_alert_trusts_stream_window():
+    """Path Z: bridge trusts modelUsage[m].contextWindow as-is; no inference."""
     result = {
         "usage": {"input_tokens": 10_000, "cache_read_input_tokens": 170_000, "cache_creation_input_tokens": 0},
         "modelUsage": {"claude-opus-4-7": {"contextWindow": 200_000}},
     }
     alert = bridge_worker._context_health_alert(result)
-    # 180_000 / 1_000_000 = 18% — well below the 70% yellow threshold
-    assert alert is None
+    # 180_000 / 200_000 = 90% → red alert fires using stream-reported window
+    assert alert is not None
+    assert "Context" in alert
 
 
 def test_cost_accumulation_across_turns():
@@ -2128,8 +2138,8 @@ def test_run_result_to_dict_filters_none_and_renames():
     assert d["result"] == "hello"
     assert d["session_id"] == "sid-1"
     assert d["total_cost_usd"] == 0.05
-    # Default non-None values kept
-    assert d["default_context_window"] == 200_000
+    # Path Z: default_context_window defaults to 0 (unknown), not 200K
+    assert d["default_context_window"] == 0
     assert d["is_error"] is False
 
 
@@ -2147,18 +2157,6 @@ def test_base_runner_abc_cannot_instantiate():
         bridge_runtime.BaseRunner(
             command="test", model="m", workspace="/tmp", timeout=30,
         )
-
-
-def test_base_runner_subclass_missing_default_model():
-    """Concrete BaseRunner subclass without DEFAULT_MODEL raises TypeError."""
-    import pytest
-    with pytest.raises(TypeError, match="must define DEFAULT_MODEL"):
-        class BadRunner(bridge_runtime.BaseRunner):
-            def build_args(self, *a, **k): pass
-            def parse_streaming_line(self, *a, **k): pass
-            def parse_blocking_output(self, *a, **k): pass
-            def get_model_aliases(self): return {}
-            def get_default_context_window(self): return 100_000
 
 
 def test_claude_runner_session_not_found_signatures():
@@ -2184,16 +2182,33 @@ def test_claude_runner_get_display_name():
     assert runner.get_display_name() == "Claude"
 
 
-def test_claude_runner_get_model_aliases():
-    """ClaudeRunner provides opus/sonnet/haiku aliases."""
-    runner = bridge_runtime.ClaudeRunner(
-        command="claude", model="claude-opus-4-6",
-        workspace="/tmp", timeout=30,
-    )
-    aliases = runner.get_model_aliases()
-    assert aliases["opus"] == "claude-opus-4-7"
-    assert aliases["sonnet"] == "claude-sonnet-4-6"
-    assert aliases["haiku"] == "claude-haiku-4-5"
+def test_bot_model_aliases_from_provider_profile():
+    """Bridge layer: model aliases come from provider profile, not runner."""
+    from feishu_bridge.main import resolve_model_aliases
+    agent_cfg = {
+        "type": "claude",
+        "provider": "default",
+        "providers": {
+            "default": {
+                "model_aliases": {
+                    "opus": "claude-opus-4-7",
+                    "sonnet": "claude-sonnet-4-6",
+                },
+            },
+        },
+    }
+    aliases = resolve_model_aliases(agent_cfg)
+    assert aliases == {
+        "opus": "claude-opus-4-7",
+        "sonnet": "claude-sonnet-4-6",
+    }
+
+
+def test_bot_model_aliases_empty_when_profile_missing():
+    """resolve_model_aliases returns {} when profile has no aliases."""
+    from feishu_bridge.main import resolve_model_aliases
+    agent_cfg = {"type": "claude", "provider": "default", "providers": {"default": {}}}
+    assert resolve_model_aliases(agent_cfg) == {}
 
 
 def test_stream_state_pending_output_default_empty():
@@ -2370,6 +2385,33 @@ def test_codex_runner_full_streaming_flow():
     assert result["peak_context_tokens"] == 600  # 500 + 100
 
 
+def test_codex_runner_result_exposes_configured_model_for_footer():
+    """Codex result exposes modelUsage so the final card footer can show model."""
+    runner = _make_codex_runner(model="gpt-5.4-codex")
+    state = bridge_runtime.StreamState(session_id="thread-model")
+    state.accumulated_text = "OK"
+    state.done = True
+    state.last_call_usage = {
+        "input_tokens": 18_100,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 11,
+    }
+    state.peak_context_tokens = 18_100
+
+    result = runner._build_streaming_result(state, "fallback-thread")
+
+    assert result["modelUsage"] == {
+        "gpt-5.4-codex": {
+            "contextWindow": 0,
+            "inputTokens": 18_100,
+            "outputTokens": 11,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+        },
+    }
+
+
 def test_codex_runner_streaming_no_on_output():
     """CodexRunner works when on_output is None (ALWAYS_STREAMING path)."""
     runner = _make_codex_runner()
@@ -2440,14 +2482,6 @@ def test_codex_runner_display_name_and_compact():
     assert runner.get_display_name() == "Codex"
     assert runner.supports_compact() is False
     assert runner.get_session_not_found_signatures() == []
-
-
-def test_codex_runner_model_aliases():
-    """CodexRunner provides codex/codex-mini aliases."""
-    runner = _make_codex_runner()
-    aliases = runner.get_model_aliases()
-    assert aliases["codex"] == "gpt-5.2-codex"
-    assert aliases["codex-mini"] == "gpt-5.1-codex-mini"
 
 
 def test_codex_runner_multiple_agent_messages():
@@ -2861,6 +2895,185 @@ def test_create_runner_unknown_type_raises():
     bot_cfg = {"workspace": "/tmp"}
     with pytest.raises(KeyError):
         bridge.create_runner(agent_cfg, bot_cfg, [])
+
+
+# ── Path Z: Empty config → CLI default ──────────────────────────────
+
+
+def test_empty_config_claude_runner(tmp_path):
+    """Path Z: minimal Claude config (no model/args) → runner passes nothing through."""
+    agent_cfg = {"type": "claude", "_resolved_command": "claude"}
+    bot_cfg = {"workspace": str(tmp_path)}
+
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+
+    assert isinstance(runner, bridge_runtime.ClaudeRunner)
+    assert runner.model is None
+    args = runner.build_args("hi", None, False, False)
+    assert "--model" not in args  # bridge does not inject any model flag
+    assert bridge.resolve_model_aliases(agent_cfg) == {}
+
+
+def test_empty_config_codex_runner(tmp_path):
+    """Path Z: minimal Codex config → runner has no model, no alias map."""
+    agent_cfg = {"type": "codex", "_resolved_command": "codex"}
+    bot_cfg = {"workspace": str(tmp_path)}
+
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+
+    assert isinstance(runner, bridge_runtime.CodexRunner)
+    assert runner.model is None
+    args = runner.build_args("hi", None, False, True)
+    # Codex CLI accepts both --model and -m short form; both must be absent.
+    assert "--model" not in args
+    assert "-m" not in args
+    assert bridge.resolve_model_aliases(agent_cfg) == {}
+
+
+def test_empty_config_pi_runner(tmp_path):
+    """Path Z: minimal Pi config → runner has no model; CLI will pick default."""
+    from feishu_bridge.runtime_pi import PiRunner
+
+    agent_cfg = {"type": "pi", "_resolved_command": "pi"}
+    bot_cfg = {"workspace": str(tmp_path)}
+
+    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
+
+    assert isinstance(runner, PiRunner)
+    assert runner.model is None
+    args = runner.build_args("hi", None, False, True)
+    assert "--model" not in args
+    assert bridge.resolve_model_aliases(agent_cfg) == {}
+
+
+def test_context_command_unknown_window_message(tmp_path):
+    """Path Z: when modelUsage.contextWindow == 0, /status shows 未知（由 CLI 决定）."""
+    from feishu_bridge.commands import BridgeCommandHandler
+
+    bot = object.__new__(bridge.FeishuBot)
+    bot.session_map = {("b1", "c1", None): "sid-1"}
+    bot._session_cost = {
+        "sid-1": {
+            "last_call_usage": {
+                "input_tokens": 500,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
+            "model_usage": {"Qwen3.6-35B-A3B-mxfp4": {"contextWindow": 0}},
+        }
+    }
+    bot.runner = types.SimpleNamespace(
+        model="Qwen3.6-35B-A3B-mxfp4",
+        supports_compact=lambda: False,
+    )
+    bot._ledger = None
+    bot.agent_config = {"type": "pi"}
+
+    captured: list[str] = []
+
+    class _Handle:
+        def deliver(self, msg, **kwargs):
+            captured.append(msg)
+
+    handler = BridgeCommandHandler(bot)
+    handler._workflow_status_lines = lambda item: []  # skip workflow section
+
+    handler._handle_status(
+        {"bot_id": "b1", "chat_id": "c1", "thread_id": None},
+        _Handle(),
+    )
+
+    assert captured, "expected /status to deliver a message"
+    text = captured[0]
+    assert "未知（由 CLI 决定）" in text
+    context_line = next(
+        (line for line in text.split("\n") if line.startswith("**Context**")),
+        "",
+    )
+    assert "%" not in context_line  # no percentage when window is unknown
+
+
+def _make_model_command_bot(model_aliases, initial_model):
+    from feishu_bridge.commands import BridgeCommandHandler  # noqa: F401
+
+    bot = object.__new__(bridge.FeishuBot)
+    bot.bot_id = "b1"
+    bot.lark_client = object()
+    bot.session_map = {}
+    bot.model_aliases = dict(model_aliases)
+    bot.runner = types.SimpleNamespace(model=initial_model)
+    return bot
+
+
+def test_model_command_alias_switches_runner_model(monkeypatch):
+    """Path Z: /model <alias> mutates bot.runner.model via bot.model_aliases."""
+    from feishu_bridge.commands import BridgeCommandHandler
+
+    bot = _make_model_command_bot(
+        {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6"},
+        initial_model="claude-sonnet-4-6",
+    )
+    captured: list[str] = []
+
+    class _Handle:
+        def __init__(self, *a, **kw):
+            pass
+
+        def deliver(self, msg, **kw):
+            captured.append(msg)
+
+    monkeypatch.setattr("feishu_bridge.commands.ResponseHandle", _Handle)
+
+    handler = BridgeCommandHandler(bot)
+
+    # Alias → resolved full model
+    handler.handle_bridge_command({
+        "chat_id": "c1", "bot_id": "b1",
+        "_bridge_command": "model", "_cmd_arg": "opus",
+    })
+    assert bot.runner.model == "claude-opus-4-7"
+    assert "claude-opus-4-7" in captured[-1]
+
+    # Exact full-name match → stays, no passthrough label
+    handler.handle_bridge_command({
+        "chat_id": "c1", "bot_id": "b1",
+        "_bridge_command": "model", "_cmd_arg": "claude-sonnet-4-6",
+    })
+    assert bot.runner.model == "claude-sonnet-4-6"
+    assert "未识别" not in captured[-1]
+
+    # Unknown name → passthrough to CLI with warning label
+    handler.handle_bridge_command({
+        "chat_id": "c1", "bot_id": "b1",
+        "_bridge_command": "model", "_cmd_arg": "gpt-5",
+    })
+    assert bot.runner.model == "gpt-5"
+    assert "未识别" in captured[-1]
+
+
+def test_model_command_display_cli_default_when_no_model(monkeypatch):
+    """Path Z: /model (no arg) with runner.model=None shows '(CLI 默认)'."""
+    from feishu_bridge.commands import BridgeCommandHandler
+
+    bot = _make_model_command_bot({}, initial_model=None)
+    captured: list[str] = []
+
+    class _Handle:
+        def __init__(self, *a, **kw):
+            pass
+
+        def deliver(self, msg, **kw):
+            captured.append(msg)
+
+    monkeypatch.setattr("feishu_bridge.commands.ResponseHandle", _Handle)
+
+    handler = BridgeCommandHandler(bot)
+    handler.handle_bridge_command({
+        "chat_id": "c1", "bot_id": "b1",
+        "_bridge_command": "model", "_cmd_arg": "",
+    })
+
+    assert "(CLI 默认)" in captured[0]
 
 
 def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path):
@@ -3445,231 +3658,39 @@ def test_provider_switch_failure_is_error():
 
 
 # ---------------------------------------------------------------------------
-# local-http-runner integration (T6.6)
+# Migration: agent.type='local' removed 2026-04-19 (LocalHTTPRunner deleted)
 # ---------------------------------------------------------------------------
 
-from feishu_bridge.runtime_local import LocalHTTPRunner  # noqa: E402
 
-
-def test_load_config_local_type(tmp_path):
-    """type=local is a valid agent type; PATH check is skipped."""
+def test_migration_error_on_local_agent_type_load_config(tmp_path, caplog):
+    """load_config rejects type=local with log.error + sys.exit(1)."""
     config = {
         "bots": [_base_bot_config()],
-        "agent": {
-            "type": "local",
-            "endpoint": {
-                "base_url": "http://127.0.0.1:8000",
-                "protocol": "anthropic",
-            },
-        },
+        "agent": {"type": "local"},
     }
     cfg_file = tmp_path / "config.json"
     cfg_file.write_text(json.dumps(config))
-    result = bridge.load_config(str(cfg_file), "test")
-    assert result["agent"]["type"] == "local"
-    # No ${...} PATH-resolution required; resolved falls back to sentinel
-    assert result["agent"]["_resolved_command"] == "local"
-
-
-def test_load_config_local_prompt_defaults_are_minimal(tmp_path):
-    """type=local uses minimal prompt defaults (no feishu_cli / cron_mgr)."""
-    config = {
-        "bots": [_base_bot_config()],
-        "agent": {
-            "type": "local",
-            "endpoint": {"base_url": "http://127.0.0.1:8000", "protocol": "openai"},
-        },
-    }
-    cfg_file = tmp_path / "config.json"
-    cfg_file.write_text(json.dumps(config))
-    result = bridge.load_config(str(cfg_file), "test")
-    prompt = result["agent"].get("prompt", {})
-    assert prompt.get("feishu_cli") is False
-    assert prompt.get("cron_mgr") is False
-    assert prompt.get("safety") == "minimal"
-
-
-def test_create_runner_local_builds_http_runner():
-    """Factory builds LocalHTTPRunner from default provider endpoint."""
-    agent_cfg = {
-        "type": "local",
-        "_resolved_command": "local",
-        "timeout_seconds": 30,
-        "providers": {
-            "default": {
-                "endpoint": {
-                    "base_url": "http://127.0.0.1:8000",
-                    "protocol": "anthropic",
-                    "api_key": "KEY",
-                },
-            },
-        },
-    }
-    bot_cfg = {"workspace": "/tmp", "model": "gemma-4-26b"}
-    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
-    assert isinstance(runner, LocalHTTPRunner)
-    assert runner._base_url == "http://127.0.0.1:8000"
-    assert runner._protocol == "anthropic"
-    assert runner._api_key == "KEY"
-    assert runner.model == "gemma-4-26b"
-
-
-def test_local_runner_wants_auth_file_is_false():
-    """LocalHTTPRunner opts out of /tmp/feishu_auth_*.json."""
-    agent_cfg = {
-        "type": "local",
-        "_resolved_command": "local",
-        "providers": {"default": {"endpoint": {
-            "base_url": "http://127.0.0.1:8000", "protocol": "openai",
-        }}},
-        "timeout_seconds": 30,
-    }
-    bot_cfg = {"workspace": "/tmp", "model": "gemma-4-26b"}
-    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
-    assert runner.wants_auth_file() is False
-    assert runner.supports_compact() is False
-
-
-def test_local_build_extra_prompts_empty():
-    """With local defaults (feishu_cli/cron_mgr disabled), extra prompts are empty."""
-    agent_cfg = {
-        "type": "local",
-        "_resolved_command": "local",
-        "providers": {"default": {}},
-        "prompt": {"safety": "minimal", "feishu_cli": False, "cron_mgr": False},
-    }
-    prompts = bridge.build_extra_prompts(agent_cfg)
-    assert prompts == []
-
-
-def test_context_health_alert_local_runner_omits_compact_hint():
-    """Local runner (supports_compact=False) → alert uses /new, not /compact."""
-    agent_cfg = {
-        "type": "local",
-        "_resolved_command": "local",
-        "providers": {"default": {"endpoint": {
-            "base_url": "http://127.0.0.1:8000", "protocol": "openai",
-        }}},
-        "timeout_seconds": 30,
-    }
-    bot_cfg = {"workspace": "/tmp", "model": "gemma-4-26b"}
-    runner = bridge.create_runner(agent_cfg, bot_cfg, [])
-    result = {
-        "usage": {"input_tokens": 10_000, "cache_read_input_tokens": 130_000,
-                  "cache_creation_input_tokens": 0},
-        "modelUsage": {"gemma-4-26b": {"contextWindow": 200_000}},
-    }
-    alert = bridge_worker._context_health_alert(result, runner=runner)
-    assert alert is not None
-    assert "/compact" not in alert
-    assert "/new" in alert
-
-
-def test_switch_agent_claude_to_local_applies_local_defaults(monkeypatch, tmp_path):
-    """C1 regression: switching from claude → local must drop Claude's
-    materialized prompt defaults (feishu_cli=True, cron_mgr=True, safety=full)
-    and pick up Local's (False/False/minimal). Previous code re-normalized
-    from the *materialized* prompt dict, which treated the Claude defaults
-    as explicit user input and preserved them across the switch."""
-    config = {
-        "bots": [_base_bot_config()],
-        "agent": {"type": "claude"},  # No prompt block — user relies on defaults
-    }
-    cfg_file = tmp_path / "config.json"
-    cfg_file.write_text(json.dumps(config))
-
-    # load_config will try to resolve `claude` on PATH; stub it away.
-    monkeypatch.setattr(
-        bridge, "resolve_effective_agent_command",
-        lambda agent_cfg, agent_type: (
-            ("claude-stub", "claude") if agent_type == "claude"
-            else ("local", "local")
-        ),
+    with caplog.at_level("ERROR", logger="feishu-bridge"):
+        with pytest.raises(SystemExit) as exc_info:
+            bridge.load_config(str(cfg_file), "test")
+    assert exc_info.value.code == 1
+    assert any(
+        "已于 2026-04-19 移除" in r.getMessage() and "codex" in r.getMessage()
+        for r in caplog.records
     )
-    monkeypatch.setattr(bridge, "build_extra_prompts", lambda agent_cfg: [])
 
-    result = bridge.load_config(str(cfg_file), "test")
-    # Sanity: claude materialized to full defaults.
-    assert result["agent"]["prompt"]["feishu_cli"] is True
-    assert result["agent"]["prompt"]["cron_mgr"] is True
-    assert result["agent"]["prompt"]["safety"] == "full"
-    # Raw prompt must be stashed as None (user never supplied one).
-    assert result["agent"].get("_prompt_raw") is None
 
-    # Build a FeishuBot shell using load_config output, then switch to local.
+def test_migration_error_on_local_agent_type_switch_agent(tmp_path):
+    """switch_agent('local') returns (False, migration_msg, None)."""
     bot = object.__new__(bridge.FeishuBot)
     bot.bot_id = "test-bot"
-    bot.bot_config = {"workspace": "/tmp", "model": "gemma-4-26b"}
-    bot.agent_config = result["agent"]
-    bot.runner = bridge_runtime.ClaudeRunner(
-        command="claude", model="claude-opus-4-6", workspace="/tmp", timeout=30
-    )
-    bot._extra_prompts = []
-    bot._session_cost = {}
-    bot._session_map_path = tmp_path / "sessions.json"
-    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
-
-    ok, msg, _ = bot.switch_agent("local")
-    assert ok is True, msg
-    prompt = bot.agent_config["prompt"]
-    assert prompt["feishu_cli"] is False, prompt
-    assert prompt["cron_mgr"] is False, prompt
-    assert prompt["safety"] == "minimal", prompt
-
-
-def test_switch_agent_to_local(monkeypatch, tmp_path):
-    """Bot-level switch from claude to local rebuilds LocalHTTPRunner."""
-    bot = object.__new__(bridge.FeishuBot)
-    bot.bot_id = "test-bot"
-    bot.bot_config = {"workspace": "/tmp", "model": "gemma-4-26b"}
-    bot.agent_config = {
-        "type": "claude",
-        "command": "claude",
-        "commands": {"claude": "claude", "local": "local"},
-        "provider": "default",
-        "providers": {
-            "default": {},
-            "local_endpoint": {
-                "type": "local",
-                "endpoint": {"base_url": "http://127.0.0.1:8000", "protocol": "openai"},
-            },
-        },
-        "args_by_type": {"claude": []},
-        "env_by_type": {"claude": {}},
-        "endpoint": {"base_url": "http://127.0.0.1:8000", "protocol": "openai"},
-        "_resolved_command": bridge.shutil.which("python3"),
-        "timeout_seconds": 30,
-    }
-    bot.runner = bridge_runtime.ClaudeRunner(
-        command="claude", model="claude-opus-4-6", workspace="/tmp", timeout=30
-    )
-    bot._extra_prompts = []
-    bot._session_cost = {"sid-old": {"usage": {}}}
-    bot._session_map_path = tmp_path / "sessions.json"
-    bot._session_map_path.write_text(json.dumps({
-        "_agent_type": "claude",
-        "chat-key": "sid-old",
-    }))
-    bot.session_map = bridge.SessionMap(bot._session_map_path, agent_type="claude")
-
-    monkeypatch.setattr(
-        bridge, "resolve_effective_agent_command",
-        lambda agent_cfg, agent_type: ("local", "local"),
-    )
-    monkeypatch.setattr(bridge, "build_extra_prompts", lambda agent_cfg: [])
-
-    ok, message, _resolved = bot.switch_agent("local")
-    assert ok is True
-    assert "local" in message
-    assert isinstance(bot.runner, LocalHTTPRunner)
-    assert bot.agent_config["type"] == "local"
-    # Prompt re-normalized to local defaults
-    assert bot.agent_config["prompt"]["feishu_cli"] is False
-    assert bot.agent_config["prompt"]["cron_mgr"] is False
-    # Session cleared because agent_type changed
-    assert bot._session_cost == {}
-    assert bot.session_map.get(("chat-key",)) is None
-
+    bot.bot_config = {"workspace": "/tmp"}
+    bot.agent_config = {"type": "claude", "_resolved_command": "claude"}
+    ok, msg, resolved = bot.switch_agent("local")
+    assert ok is False
+    assert resolved is None
+    assert "已于 2026-04-19 移除" in msg
+    assert "codex" in msg
 
 
 class _RichHandle(FakeHandle):
@@ -3811,58 +3832,6 @@ def test_cost_store_no_ops_for_local():
 
 
 # --- Context window / threshold / ledger tests ---
-
-def test_context_window_for_model_sonnet_is_1m():
-    assert bridge_commands._context_window_for_model("claude-sonnet-4-6") == 1_000_000
-    assert bridge_commands._context_window_for_model("claude-opus-4-6") == 1_000_000
-    assert bridge_commands._context_window_for_model("claude-haiku-4-5") == 200_000
-
-
-def test_context_window_for_model_unknown_defaults_200k():
-    assert bridge_commands._context_window_for_model("some-other-model") == 200_000
-
-
-def test_infer_context_window_families():
-    assert bridge_runtime.infer_context_window("claude-opus-4-7") == 1_000_000
-    assert bridge_runtime.infer_context_window("claude-sonnet-4-6") == 1_000_000
-    assert bridge_runtime.infer_context_window("claude-haiku-4-5") == 200_000
-    assert bridge_runtime.infer_context_window("gpt-5.4") == 200_000
-    assert bridge_runtime.infer_context_window("some-other-model") == 200_000
-    assert bridge_runtime.infer_context_window(None) == 200_000
-    assert bridge_runtime.infer_context_window("") == 200_000
-
-
-def test_resolve_context_window_opus_sonnet_ignore_stream():
-    """Plan C core behavior: opus/sonnet ignore the stale 200K stream value
-    and use the inferred 1M table, because Claude Code CLI reports a legacy
-    200K contextWindow even when running in 1M mode."""
-    assert bridge_runtime.resolve_context_window("claude-opus-4-7", 200_000) == 1_000_000
-    assert bridge_runtime.resolve_context_window("claude-sonnet-4-6", 200_000) == 1_000_000
-    # Even a non-zero stream value is ignored for opus/sonnet.
-    assert bridge_runtime.resolve_context_window("claude-opus-4-7", 500_000) == 1_000_000
-
-
-def test_resolve_context_window_other_models_trust_stream():
-    """Non-opus/sonnet models trust the stream value when > 0, enabling
-    custom / local / Codex models to report their own window."""
-    assert bridge_runtime.resolve_context_window("claude-haiku-4-5", 200_000) == 200_000
-    assert bridge_runtime.resolve_context_window("custom-model", 60_000) == 60_000
-    assert bridge_runtime.resolve_context_window("gpt-5.4", 400_000) == 400_000
-
-
-def test_resolve_context_window_zero_stream_falls_back_to_inferred():
-    """Stream value <= 0 (absent / truncated) falls back to the inferred table."""
-    assert bridge_runtime.resolve_context_window("claude-haiku-4-5", 0) == 200_000
-    assert bridge_runtime.resolve_context_window("unknown-model", 0) == 200_000
-    assert bridge_runtime.resolve_context_window(None, 0) == 200_000
-
-
-def test_runner_default_context_window_sonnet():
-    runner = bridge_runtime.ClaudeRunner(
-        command="claude", model="claude-sonnet-4-6", timeout=60, workspace="/tmp",
-    )
-    assert runner.get_default_context_window() == 1_000_000
-
 
 def test_compact_alert_thresholds_default(monkeypatch):
     monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)

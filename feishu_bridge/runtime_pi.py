@@ -17,8 +17,6 @@ class PiRunner(BaseRunner):
     configured workspace.
     """
 
-    DEFAULT_MODEL = "Qwen3.6-35B-A3B-mxfp4"
-    DEFAULT_CONTEXT_WINDOW = 32_768
     ALWAYS_STREAMING = True
     READONLY_TOOLS = "read,grep,find,ls"
 
@@ -123,7 +121,7 @@ class PiRunner(BaseRunner):
             return None
 
         usage = state.last_call_usage or {}
-        model_name = self.model or self.DEFAULT_MODEL
+        model_name = self.model or "(cli-default)"
 
         return {
             "result": text,
@@ -133,7 +131,7 @@ class PiRunner(BaseRunner):
             "last_call_usage": usage,
             "modelUsage": {
                 model_name: {
-                    "contextWindow": self.get_default_context_window(),
+                    "contextWindow": 0,
                     "inputTokens": usage.get("input_tokens", 0),
                     "outputTokens": usage.get("output_tokens", 0),
                     "cacheReadInputTokens": usage.get("cache_read_input_tokens", 0),
@@ -148,16 +146,6 @@ class PiRunner(BaseRunner):
 
     def parse_blocking_output(self, stdout: str, session_id: Optional[str]) -> dict:
         raise NotImplementedError("PiRunner always uses streaming mode")
-
-    def get_model_aliases(self) -> dict[str, str]:
-        return self._merge_model_aliases({
-            "pi": self.DEFAULT_MODEL,
-            "qwen": self.DEFAULT_MODEL,
-            "gemma": "gemma-4-26b-a4b-it-mxfp4",
-        })
-
-    def get_default_context_window(self) -> int:
-        return self.DEFAULT_CONTEXT_WINDOW
 
     def get_display_name(self) -> str:
         return "Pi"
