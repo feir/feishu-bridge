@@ -1,0 +1,17 @@
+Review the staged diff in this repo via git diff --cached. Scope is Commit B of feishu-bridge bg-tasks change (Section 6.3 running-task liveness triage + reaper).
+
+Focus areas:
+1. SAFETY-CRITICAL: pid-reuse must send ZERO signals. _verify_triple() must fail-closed on any anchor mismatch (pid dead, start_time_us mismatch, token absent, None inputs). Any killpg must be gated on _verify_triple returning True for the CHILD.
+2. Triage default branch: ambiguous or missing data -> orphan, NEVER signal.
+3. Reaper daemon concurrency: cap at _REAPER_MAX_THREADS=32, pid-keyed dedup, stop_evt clean shutdown, EPERM from os.kill(pid,0) treated as pid-reuse -> abort without signal.
+4. macOS ps flag correctness: /bin/ps eww -p (single) and /bin/ps axeww -o pid=,pgid=,command= (scan). Verify docstrings describe the SIP-protected binary caveat.
+5. Manifest replay: _apply_manifest_to_running must use atomic _tx() (via finish_run) and not corrupt delivery_state.
+6. Test adequacy: branch-coverage unit tests use monkeypatch. Check if monkeypatch over-mocks and misses real bugs. Pay attention to the Section 7.5/7.6 real-subprocess tests (darwin-only).
+7. Proposal NOT single-bridge premise (proposal.md lines 31-38).
+
+Key files:
+- feishu_bridge/bg_supervisor.py (+797 lines, _triage_* + _reaper_worker + helpers)
+- feishu_bridge/bg_tasks_db.py (+64 lines, finalise_reaped + rebuild_from_manifests replay_only kwarg + _FinishRace export)
+- tests/unit/test_bg_supervisor.py (+488 lines)
+
+OUTPUT: Numbered findings list. Each finding with severity (BUG, WARN, STYLE, NOTE), file:line reference, issue, recommendation. Only report real concerns (no PASS items). If no issues, output No issues found.

@@ -1,0 +1,30 @@
+Round 2 re-review. Use read-only shell commands (cat, sed, rg, nl, git diff, ls, head, tail) to inspect files in /Users/feir/projects/feishu-bridge. No writes, no edits, no test execution.
+
+Scope — verify Round 1 fixes ONLY:
+
+1. feishu_bridge/bg_supervisor.py:
+   - enqueued_at is NOT stamped at CAS time (pending→enqueued)
+   - orphan run_row path (task_row is None) marks delivery_failed with bump_attempt=True
+   - rollback UPDATE keeps "enqueued_at IS NOT NULL" guard
+
+2. feishu_bridge/worker.py:
+   - New _bg_mark_dequeued function uses idempotent "enqueued_at IS NULL" CAS
+   - Called inside bg branch BEFORE runner invocation
+
+3. feishu_bridge/runtime.py + commands.py + main.py:
+   - SessionMap._key_str renamed to public format_key
+   - `rg _key_str` returns 0 matches
+   - All callsites migrated
+
+4. tests/unit/test_bg_supervisor.py:
+   - 7 new tests present:
+     * test_scan_delivery_does_not_stamp_enqueued_at_at_cas
+     * test_scan_delivery_retries_delivery_failed_rows
+     * test_scan_delivery_orphan_run_marked_delivery_failed
+     * test_scan_delivery_null_enqueued_at_not_rolled_back
+     * test_bg_mark_dequeued_stamps_enqueued_at_when_null
+     * test_bg_mark_dequeued_idempotent_noop_when_already_stamped
+     * test_bg_mark_dequeued_noop_for_non_bg_items
+
+Produce a numbered findings list, each finding labeled [BUG]/[WARN]/[STYLE].
+End with EXACTLY one line: VERDICT: APPROVED | NEEDS_FIXES | BLOCK

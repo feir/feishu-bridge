@@ -1,0 +1,47 @@
+Cross-model review. Use read-only shell commands (cat, sed, rg, nl, git diff, ls, head, tail, grep) to inspect files in /Users/feir/projects/feishu-bridge. No writes, no edits, no test execution.
+
+This is Commit A of Section 6 (startup reconciler) for feishu-bridge bg-tasks.
+
+SCOPE — verify the following changes are safe to commit:
+
+1. feishu_bridge/bg_supervisor.py (new methods):
+   - `reconcile()` public method — orchestrates 6-step boot recovery
+     - step 1: integrity_check_and_maybe_quarantine + rebuild_from_manifests on quarantine; must distinguish fresh-boot (file absent from start) from real quarantine
+     - step 2: `_reap_stale_launching` — UPDATE bg_tasks SET state='failed', reason='launch_interrupted' WHERE state='launching' AND claimed_at < now-30s
+     - step 3: `_warn_running_rows` — WARN-only stub, §6.3 triage deferred to Commit B
+     - step 4: `rebuild_from_manifests` — manifest-only backfill (idempotent on live DB)
+     - step 5: `_reset_stranded_enqueued` — reset `delivery_state='enqueued' AND enqueued_at IS NULL` rows back to 'pending'
+     - step 6: `_scan_and_launch_queued` (existing)
+     - step 7: `_log_retry_budget_exhausted` + `_scan_delivery_outbox` (existing)
+
+2. feishu_bridge/main.py:
+   - `self._bg_supervisor.reconcile()` called BEFORE `self._bg_supervisor.start()` at line ~1013 (before listener/poller threads spawn)
+
+3. tests/unit/test_bg_supervisor.py — 13 new tests at tail
+
+4. .specs/changes/feishu-bridge-bg-tasks/tasks.md — §6.1 → [~], §6.2/6.4/6.5 → [x]
+
+SPEC REFERENCES:
+   .specs/changes/feishu-bridge-bg-tasks/design.md §274-315 (Startup Reconciler)
+   .specs/changes/feishu-bridge-bg-tasks/proposal.md (acceptance criteria, "NOT 多 bridge 分布式")
+
+KEY CORRECTNESS QUESTIONS:
+
+Q1: Ordering — does step 5 (stranded reset) belong BEFORE or AFTER step 7 (delivery scan)?
+    My claim: before, because step 5 rows are invisible to step 7's stuck-rollback (guard is `enqueued_at IS NOT NULL`).
+
+Q2: Is it safe to call `rebuild_from_manifests()` on a live DB (not just post-quarantine)?
+    My claim: yes, because `_row_exists()` pre-check + `INSERT OR IGNORE` make it idempotent.
+    Location: feishu_bridge/bg_tasks_db.py:371-450.
+
+Q3: `_reset_stranded_enqueued` is unconditional. Is that correct given concurrent-bridge overlap (design.md:169 "launchd reload 重叠窗口")?
+    My claim: safety rests on single-bridge-per-home invariant. The design.md:169 edge case has accepted millisecond-level double-delivery risk, documented in the docstring. The alternative (conditional reset with timestamp threshold) isn't feasible because bg_runs has no `updated_at` column.
+
+Q4: Fresh-boot detection — feishu_bridge/bg_supervisor.py `reconcile()` distinguishes `quarantined = existed_before AND file_absent` vs `fresh_boot = not existed_before AND file_absent`. Correct?
+
+Q5: Does Commit A introduce any backward-incompatible state transitions or schema expectations?
+
+PRODUCE:
+- Numbered findings list, each labeled [BUG] / [WARN] / [STYLE]
+- If no issues, explicit PASS per area
+- End with EXACTLY one line: VERDICT: APPROVED | NEEDS_FIXES | BLOCK
