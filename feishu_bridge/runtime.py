@@ -402,7 +402,8 @@ class BaseRunner(ABC):
                  extra_cli_args: Optional[list[str]] = None,
                  fixed_env: Optional[dict[str, str]] = None,
                  safety_prompt_mode: str = "full",
-                 setting_sources: Optional[str] = None):
+                 setting_sources: Optional[str] = None,
+                 model_aliases: Optional[dict[str, str]] = None):
         self.command = command
         self.model = model
         self.workspace = workspace
@@ -416,6 +417,11 @@ class BaseRunner(ABC):
         mode = str(safety_prompt_mode or "full").strip().lower()
         self._safety_prompt_mode = mode if mode in {"full", "minimal", "off"} else "full"
         self._setting_sources = setting_sources
+        self._model_aliases = {
+            str(alias): str(model)
+            for alias, model in (model_aliases or {}).items()
+            if str(alias).strip() and str(model).strip()
+        }
         self._active: dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
@@ -501,6 +507,11 @@ class BaseRunner(ABC):
             parts.append(self._MINIMAL_SAFETY_PROMPT)
         parts.extend(self._extra_system_prompts)
         return "\n\n".join(parts)
+
+    def _merge_model_aliases(self, defaults: dict[str, str]) -> dict[str, str]:
+        aliases = dict(defaults)
+        aliases.update(self._model_aliases)
+        return aliases
 
     def _build_streaming_result(self, state: StreamState,
                                 session_id: Optional[str]) -> Optional[dict]:
@@ -1080,11 +1091,11 @@ class ClaudeRunner(BaseRunner):
         }
 
     def get_model_aliases(self):
-        return {
+        return self._merge_model_aliases({
             "opus": "claude-opus-4-7",
             "sonnet": "claude-sonnet-4-6",
             "haiku": "claude-haiku-4-5",
-        }
+        })
 
     def get_default_context_window(self):
         return infer_context_window(self.model)
@@ -1281,10 +1292,10 @@ class CodexRunner(BaseRunner):
         raise NotImplementedError("CodexRunner always uses streaming mode")
 
     def get_model_aliases(self):
-        return {
+        return self._merge_model_aliases({
             "codex": "gpt-5.2-codex",
             "codex-mini": "gpt-5.1-codex-mini",
-        }
+        })
 
     def get_default_context_window(self):
         return 200_000

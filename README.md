@@ -323,6 +323,11 @@ Pi runner 适合把本机 `pi` 作为 bridge 后端，再由 Pi 连接本地 oML
       "models": {
         "pi": "Qwen3.6-35B-A3B-mxfp4"
       },
+      "model_aliases": {
+        "pi": "Qwen3.6-35B-A3B-mxfp4",
+        "qwen": "Qwen3.6-35B-A3B-mxfp4",
+        "gemma": "gemma-4-26b-a4b-it-mxfp4"
+      },
       "args_by_type": {
         "pi": [
           "--provider", "omlx",

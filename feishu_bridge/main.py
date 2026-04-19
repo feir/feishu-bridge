@@ -627,6 +627,7 @@ def create_runner(agent_cfg: dict, bot_cfg: dict,
         fixed_env=resolve_agent_env(agent_cfg, agent_type),
         safety_prompt_mode=str(prompt_cfg.get("safety", "full")),
         setting_sources=prompt_cfg.get("setting_sources"),
+        model_aliases=profile.get("model_aliases") or {},
     )
     if agent_type == "local":
         endpoint = profile.get("endpoint") or {}

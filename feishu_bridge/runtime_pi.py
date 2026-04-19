@@ -150,12 +150,11 @@ class PiRunner(BaseRunner):
         raise NotImplementedError("PiRunner always uses streaming mode")
 
     def get_model_aliases(self) -> dict[str, str]:
-        return {
+        return self._merge_model_aliases({
             "pi": self.DEFAULT_MODEL,
-            "qwen": "qwen-3.5-9b",
+            "qwen": self.DEFAULT_MODEL,
             "gemma": "gemma-4-26b-a4b-it-mxfp4",
-            "qwen35b": "Qwen3.6-35B-A3B-mxfp4",
-        }
+        })
 
     def get_default_context_window(self) -> int:
         return self.DEFAULT_CONTEXT_WINDOW
