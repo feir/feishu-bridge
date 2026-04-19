@@ -1163,6 +1163,37 @@ def test_reconcile_reaps_stale_launching_row_to_failed(short_env, repo):
     assert row["reason"] == "launch_interrupted"
 
 
+def test_reconcile_pre_register_launching_without_token_match_marks_orphan(
+    short_env, repo, monkeypatch,
+):
+    """§7.5 post_spawn_pre_register: stale launching row with bg_runs but
+    pid=NULL must be orphaned before the generic stale-launching reaper runs.
+    """
+    from feishu_bridge import bg_supervisor
+
+    old_ms = int(time.time() * 1000) - 60_000
+    tid = _make_launching_task(repo, claimed_at_ms=old_ms)
+    repo.start_run(
+        task_id=tid,
+        runner_token=uuid.uuid4().hex,
+        wrapper_pid=1234,
+        wrapper_start_time_us=5678,
+    )
+    monkeypatch.setattr(bg_supervisor, "_scan_ps_for_token", lambda token: None)
+
+    sup = _make_delivery_supervisor(short_env, enqueue_fn=None)
+    stats = sup.reconcile()
+
+    assert stats["pre_register_orphaned"] == 1
+    assert stats["stale_launching_failed"] == 0
+    row = repo.conn.execute(
+        "SELECT state, reason, signal FROM bg_tasks WHERE id=?", (tid,),
+    ).fetchone()
+    assert row["state"] == "orphan"
+    assert row["reason"] == "wrapper_died_pre_register"
+    assert row["signal"] is None
+
+
 def test_reconcile_preserves_recently_claimed_launching_row(short_env, repo):
     """Rows claimed < 30s ago are still "fresh" — spawner may be mid-Popen."""
     recent_ms = int(time.time() * 1000) - 5_000  # 5s ago
@@ -1744,6 +1775,8 @@ def test_reconcile_returns_stats_dict_with_all_keys(short_env, repo):
         "manifests_replayed",
         "manifest_orphans_created",
         "stale_launching_failed",
+        "pre_register_reaped",
+        "pre_register_orphaned",
         # §6.3 triage replaced the single `running_rows_observed` counter
         # with one label per branch (Commit B).
         "running_attached",

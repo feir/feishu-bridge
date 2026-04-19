@@ -178,6 +178,7 @@ _ALLOWED: dict[TaskState, frozenset[TaskState]] = {
     TaskState.LAUNCHING: frozenset({
         TaskState.RUNNING,
         TaskState.FAILED,     # launch_interrupted reap
+        TaskState.ORPHAN,     # wrapper died after child spawn but before attach_child
     }),
     TaskState.RUNNING: frozenset({
         TaskState.COMPLETED,
@@ -1419,6 +1420,48 @@ class BgTaskRepo:
                          delivery_state=?, completion_detected_at=?
                    WHERE task_id=? AND finished_at IS NULL""",
                 (now, signal, new_delivery, now, task_id),
+            )
+        return True
+
+    def finalise_pre_register_orphan(
+        self,
+        *,
+        task_id: str,
+        reason: str,
+        signal: Optional[str] = None,
+    ) -> bool:
+        """Close the Phase-S pre-register crash window.
+
+        The wrapper has inserted ``bg_runs`` but died before ``attach_child()``
+        could atomically stamp child pid/pgid and flip the task to ``running``.
+        The task is therefore still ``launching``; no user-visible completion
+        can be delivered, so the run is marked ``not_ready`` and the task
+        becomes ``orphan``.
+        """
+        now = _now_ms()
+        with _tx(self.conn):
+            cur_task = self.conn.execute(
+                """UPDATE bg_tasks
+                     SET state='orphan',
+                         reason=COALESCE(?, reason),
+                         signal=COALESCE(?, signal),
+                         updated_at=?
+                   WHERE id=? AND state='launching'""",
+                (reason, signal, now, task_id),
+            )
+            if cur_task.rowcount != 1:
+                raise _FinishRace(
+                    f"finalise_pre_register_orphan: task {task_id} "
+                    "not launching (state race)"
+                )
+            self.conn.execute(
+                """UPDATE bg_runs
+                     SET finished_at=?,
+                         signal=COALESCE(?, signal),
+                         delivery_state='not_ready',
+                         completion_detected_at=?
+                   WHERE task_id=? AND finished_at IS NULL""",
+                (now, signal, now, task_id),
             )
         return True
 

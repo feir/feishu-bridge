@@ -575,6 +575,8 @@ class BgSupervisor:
             "manifests_replayed": 0,
             "manifest_orphans_created": 0,
             "stale_launching_failed": 0,
+            "pre_register_reaped": 0,
+            "pre_register_orphaned": 0,
             # §6.3 triage counters (all five branches tallied by
             # _triage_running_rows; zeros kept for stable log shape).
             "running_attached": 0,
@@ -639,7 +641,18 @@ class BgSupervisor:
 
         repo = BgTaskRepo(conn)
         try:
-            # Step 2: §6.2 stale launching → failed.
+            # Step 2a: §6.3 pre-register crash window. If bg_runs exists but
+            # pid is still NULL, the wrapper died after child spawn but before
+            # attach_child() committed the child identity. Reap by token scan
+            # before the generic stale-launching sweep marks it merely failed.
+            try:
+                pre_stats = self._triage_pre_register_launching(repo)
+                stats["pre_register_reaped"] = pre_stats["reaped"]
+                stats["pre_register_orphaned"] = pre_stats["orphaned"]
+            except Exception:
+                log.exception("bg reconcile: pre-register triage failed")
+
+            # Step 2b: §6.2 stale launching → failed.
             try:
                 stats["stale_launching_failed"] = self._reap_stale_launching(repo)
             except Exception:
@@ -713,12 +726,15 @@ class BgSupervisor:
                 log.exception("bg reconcile: quarantine prune failed")
 
             log.info(
-                "bg reconcile done: launching→failed=%d "
+                "bg reconcile done: pre_register[reaped=%d orphaned=%d] "
+                "launching→failed=%d "
                 "running[attached=%d reaped=%d pending_reap=%d "
                 "orphaned=%d manifest_applied=%d] "
                 "stranded-reset=%d manifests=%d orphans=%d queued=%d "
                 "deliveries=%d attempts-exhausted=%d "
                 "archived=%d expired=%d skipped=%d quarantine_pruned=%d",
+                stats["pre_register_reaped"],
+                stats["pre_register_orphaned"],
                 stats["stale_launching_failed"],
                 stats["running_attached"],
                 stats["running_reaped"],
@@ -764,6 +780,75 @@ class BgSupervisor:
             (now_ms, cutoff),
         )
         return cur.rowcount or 0
+
+    def _triage_pre_register_launching(self, repo: BgTaskRepo) -> dict[str, int]:
+        """§7.5 ``post_spawn_pre_register`` recovery for stale launching rows.
+
+        A wrapper can die after ``phase_p`` created ``bg_runs`` and after it
+        spawned the child, but before ``attach_child`` records pid/pgid and
+        flips the task to ``running``. The only durable identity anchor left is
+        ``runner_token``. Scan the process table for that token; if found, reap
+        the matching pgid and mark the task orphan. If not found, mark orphan
+        without signaling. Both paths run before the generic stale-launching
+        reaper so the task is not mislabeled as a simple pre-Popen failure.
+        """
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - _STALE_LAUNCHING_MS
+        rows = repo.conn.execute(
+            """SELECT t.id AS task_id, r.runner_token
+                 FROM bg_tasks t
+                 JOIN bg_runs r ON r.task_id = t.id
+                WHERE t.state='launching'
+                  AND t.claimed_at IS NOT NULL
+                  AND t.claimed_at < ?
+                  AND r.finished_at IS NULL
+                  AND r.pid IS NULL""",
+            (cutoff,),
+        ).fetchall()
+
+        stats = {"reaped": 0, "orphaned": 0}
+        for row in rows:
+            task_id = row["task_id"]
+            token = row["runner_token"]
+            try:
+                scan = _scan_ps_for_token(token) if token else None
+                if scan is None:
+                    log.warning(
+                        "bg triage: task=%s stale pre-register row has no "
+                        "live token match — marking orphan without signal",
+                        task_id,
+                    )
+                    repo.finalise_pre_register_orphan(
+                        task_id=task_id,
+                        reason=_REAP_REASON_WRAPPER_DIED_PRE_REGISTER,
+                    )
+                    stats["orphaned"] += 1
+                    continue
+
+                found_pid, found_pgid = scan
+                log.warning(
+                    "bg triage: task=%s stale pre-register row matched "
+                    "pid=%d pgid=%d — reaping and marking orphan",
+                    task_id, found_pid, found_pgid,
+                )
+                sig = _kill_pgid_with_grace(found_pgid)
+                repo.finalise_pre_register_orphan(
+                    task_id=task_id,
+                    reason=_REAP_REASON_WRAPPER_DIED_PRE_REGISTER,
+                    signal=sig,
+                )
+                stats["reaped"] += 1
+            except _FinishRace as exc:
+                log.info(
+                    "bg triage: task=%s pre-register state race: %s",
+                    task_id, exc,
+                )
+            except Exception:
+                log.exception(
+                    "bg triage: task=%s pre-register triage failed",
+                    task_id,
+                )
+        return stats
 
     # ---- §6.3 running-row triage (Commit B) ---------------------------------
 

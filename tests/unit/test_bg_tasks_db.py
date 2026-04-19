@@ -104,6 +104,7 @@ def test_schema_check_constraints_reject_bad_delivery_state(tmp_path):
     ("queued",    "cancelled"),
     ("launching", "running"),
     ("launching", "failed"),
+    ("launching", "orphan"),
     ("running",   "completed"),
     ("running",   "failed"),
     ("running",   "cancelled"),
@@ -121,7 +122,7 @@ def test_state_transitions_legal(old, new):
     ("cancelled", "running"),
     ("orphan",    "running"),
     ("running",   "queued"),         # no going back
-    ("launching", "cancelled"),      # must go via running or be reaped to failed
+    ("launching", "cancelled"),      # must go via running or pre-launch cancel
     ("launching", "completed"),
 ])
 def test_state_transitions_illegal(old, new):
