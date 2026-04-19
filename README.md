@@ -408,7 +408,7 @@ feishu-cli bg cancel <task_id>
 
 命令必须以 argv 形式传入：优先使用 `--` 分隔真实命令，或使用 `--cmd-json '["python3","script.py"]'`。bridge 始终用 `shell=False` 启动用户命令，不接受裸 shell 字符串；需要 shell 语义时显式写成 `-- bash -lc '...'`。
 
-运行状态保存在 `~/.feishu-bridge/bg_tasks.db`，任务文件保存在 `~/.feishu-bridge/bg_tasks/`。完成任务会写入 `completed/<task_id>/task.json.done`，manifest 主要字段如下：
+运行状态默认保存在 `~/.feishu-bridge/bg_tasks.db`，任务文件默认保存在 `~/.feishu-bridge/bg_tasks/`。同一台机器运行多个 bridge（例如 production + staging）时，必须给每个实例设置不同的 `FEISHU_BRIDGE_BG_HOME`，例如 `~/.feishu-bridge-staging`，否则多个 bot 会竞争同一个 SQLite 队列和 `wake.sock`。完成任务会写入 `completed/<task_id>/task.json.done`，manifest 主要字段如下：
 
 ```json
 {

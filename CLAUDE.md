@@ -10,6 +10,7 @@
 - bg task 命令必须用 argv：`feishu-cli bg enqueue --chat-id oc_xxx --on-done-prompt "done" -- sleep 10`。
 - 不传裸 shell 字符串。确实需要 shell 语义时，显式写成 `-- bash -lc 'make test > out.log 2>&1'`。
 - bridge/task-runner 用 `shell=False` 执行用户命令；不要绕过这个约束。
+- 同一台机器运行多个 bridge 时，必须为每个实例设置不同的 `FEISHU_BRIDGE_BG_HOME`；不要让 staging/prod 共用 `~/.feishu-bridge`。
 - 长任务应声明可审计输出路径：重复传 `--output-path /path/to/artifact`，完成通知会带上这些路径。
 - 取消任务用 `feishu-cli bg cancel <task_id>`，不要直接 kill 用户进程，除非是在调试 bg reconciler 本身。
 

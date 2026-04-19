@@ -216,7 +216,8 @@ def _safe_json_loads(value: str, param_name: str):
 # ---- bg-task helpers ------------------------------------------------------
 
 def _bg_home() -> Path:
-    return Path.home() / ".feishu-bridge"
+    from feishu_bridge.bg_paths import bg_home
+    return bg_home()
 
 
 def _bg_db_path() -> Path:

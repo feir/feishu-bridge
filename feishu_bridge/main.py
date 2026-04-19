@@ -704,8 +704,9 @@ class FeishuBot:
         # synthetic turn can resume vs must fall back to a fresh session.
         try:
             from .session_resume import SessionsIndex
+            from .bg_paths import bg_home
             self._sessions_index = SessionsIndex(
-                Path.home() / ".feishu-bridge" / "sessions.json"
+                bg_home() / "sessions.json"
             )
         except Exception:
             log.warning("sessions_index disabled (open failed)", exc_info=True)
@@ -999,15 +1000,16 @@ class FeishuBot:
 
         # Boot background-task supervisor before the WS loop blocks.
         # Paths mirror feishu_bridge.cli (_bg_home / bg_tasks.db / wake.sock).
-        bg_home = Path.home() / ".feishu-bridge"
-        self._bg_db_path = bg_home / "bg_tasks.db"
+        from .bg_paths import bg_home
+        bg_root = bg_home()
+        self._bg_db_path = bg_root / "bg_tasks.db"
         self._bg_supervisor = None
         try:
             from feishu_bridge.bg_supervisor import BgSupervisor
             self._bg_supervisor = BgSupervisor(
                 db_path=self._bg_db_path,
-                tasks_dir=bg_home / "bg_tasks",
-                sock_path=bg_home / "wake.sock",
+                tasks_dir=bg_root / "bg_tasks",
+                sock_path=bg_root / "wake.sock",
                 enqueue_fn=self.enqueue_turn,
                 bot_id=self.bot_id,
                 sessions_index=self._sessions_index,

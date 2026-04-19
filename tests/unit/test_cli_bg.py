@@ -275,6 +275,24 @@ def test_enqueue_succeeds_without_bridge_listening(bg_home, tmp_path):
     assert payload["state"] == "queued"
 
 
+def test_enqueue_respects_feishu_bridge_bg_home(tmp_path):
+    """Multiple local bridges can isolate bg DB/socket via env override."""
+    custom_home = tmp_path / "custom-bg-home"
+    rc, out, _ = _run_cli(
+        ["bg", "enqueue", "--chat-id", "oc_x",
+         "--on-done-prompt", "p", "--", "echo", "hi"],
+        env_overrides={
+            "HOME": str(tmp_path / "home"),
+            "FEISHU_BRIDGE_BG_HOME": str(custom_home),
+        },
+        expect_ok=True,
+    )
+    payload = json.loads(out)
+    assert payload["state"] == "queued"
+    assert (custom_home / "bg_tasks.db").exists()
+    assert not (tmp_path / "home" / ".feishu-bridge" / "bg_tasks.db").exists()
+
+
 # ---------------------------------------------------------------------------
 # 3.3 — status / list / cancel
 # ---------------------------------------------------------------------------
