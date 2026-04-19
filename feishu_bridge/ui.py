@@ -849,7 +849,7 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
     if git_label:
         detail_parts.append(git_label)
 
-    status_line = status + (" " + " · ".join(detail_parts) if detail_parts else "")
+    status_line = " · ".join([status, *detail_parts]) if detail_parts else status
     footer_lines = [status_line]
     if context_alert:
         footer_lines.append(context_alert)
