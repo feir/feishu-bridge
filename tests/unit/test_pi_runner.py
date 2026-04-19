@@ -163,8 +163,54 @@ def test_pi_parse_provider_error(tmp_path):
 
     assert state.done is True
     assert result["is_error"] is True
-    assert result["result"] == "404 Model not found"
+    assert result["result"] == "Pi 模型不可用或不存在：404 Model not found"
     assert result["session_id"] == "bridge-sid"
+
+
+def test_pi_error_formatting_classes(tmp_path):
+    runner = _runner(tmp_path)
+
+    cases = [
+        ("401 Invalid API key", "Pi provider 鉴权失败：401 Invalid API key"),
+        (
+            "connect ECONNREFUSED 127.0.0.1:8000",
+            "Pi provider 不可用：connect ECONNREFUSED 127.0.0.1:8000",
+        ),
+        ("tool not allowed: bash", "Pi 工具调用被拒绝：tool not allowed: bash"),
+        ("invalid JSON protocol frame", "Pi 协议错误：invalid JSON protocol frame"),
+    ]
+
+    for raw, expected in cases:
+        state = StreamState(session_id="bridge-sid")
+        runner.parse_streaming_line({
+            "type": "turn_end",
+            "message": {
+                "stopReason": "error",
+                "errorMessage": raw,
+                "usage": {"input": 0, "output": 0},
+            },
+        }, state)
+
+        result = runner._build_streaming_result(state, "bridge-sid")
+
+        assert result["is_error"] is True
+        assert result["result"] == expected
+
+
+def test_pi_parse_protocol_error_event(tmp_path):
+    runner = _runner(tmp_path)
+    state = StreamState(session_id="bridge-sid")
+
+    runner.parse_streaming_line({
+        "type": "error",
+        "message": "invalid JSON protocol frame",
+    }, state)
+
+    result = runner._build_streaming_result(state, "bridge-sid")
+
+    assert state.done is True
+    assert result["is_error"] is True
+    assert result["result"] == "Pi 协议错误：invalid JSON protocol frame"
 
 
 def test_pi_parse_tool_status_events(tmp_path):

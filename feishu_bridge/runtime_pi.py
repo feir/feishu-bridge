@@ -84,6 +84,21 @@ class PiRunner(BaseRunner):
                 state.done = True
             return
 
+        if etype == "error":
+            raw = (
+                event.get("message")
+                or event.get("errorMessage")
+                or event.get("error")
+                or "Unknown Pi protocol error"
+            )
+            if isinstance(raw, dict):
+                raw = raw.get("message") or raw.get("error") or str(raw)
+            state.accumulated_text = self._format_error(str(raw))
+            state.pending_output.append(state.accumulated_text)
+            state.is_error = True
+            state.done = True
+            return
+
         if etype == "message_end":
             message = event.get("message") or {}
             self._update_usage(message.get("usage"), state)
@@ -102,6 +117,8 @@ class PiRunner(BaseRunner):
         is_error = state.is_error or stop_reason in {"error", "aborted"}
         if is_error and not text:
             text = error_message or "Pi request failed."
+        if is_error:
+            text = self._format_error(text)
         if not text:
             return None
 
@@ -223,6 +240,45 @@ class PiRunner(BaseRunner):
                 if text:
                     parts.append(str(text))
         return "".join(parts)
+
+    @classmethod
+    def _format_error(cls, message: str) -> str:
+        raw = (message or "").strip() or "Unknown Pi error"
+        redacted = re.sub(
+            r"(?i)(api[_-]?key|authorization|bearer)\s*[:=]\s*\S+",
+            r"\1=<redacted>",
+            raw,
+        )
+        lower = redacted.lower()
+        if redacted.startswith((
+            "Pi provider ",
+            "Pi 模型",
+            "Pi 工具",
+            "Pi 协议",
+            "Pi 请求",
+        )):
+            return redacted
+        if "invalid api key" in lower or "401" in lower or "unauthorized" in lower:
+            return f"Pi provider 鉴权失败：{redacted}"
+        if "model not found" in lower or "404" in lower:
+            return f"Pi 模型不可用或不存在：{redacted}"
+        if (
+            "econnrefused" in lower
+            or "connection refused" in lower
+            or "failed to fetch" in lower
+            or "network error" in lower
+        ):
+            return f"Pi provider 不可用：{redacted}"
+        if (
+            "tool denied" in lower
+            or "tool not allowed" in lower
+            or "not permitted" in lower
+            or "permission denied" in lower
+        ):
+            return f"Pi 工具调用被拒绝：{redacted}"
+        if "protocol" in lower or "invalid json" in lower or "jsonrpc" in lower:
+            return f"Pi 协议错误：{redacted}"
+        return f"Pi 请求失败：{redacted}"
 
     def _update_usage(self, usage: Optional[dict], state: StreamState) -> None:
         normalized = self._normalize_usage(usage)

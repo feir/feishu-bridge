@@ -352,6 +352,15 @@ Pi runner 适合把本机 `pi` 作为 bridge 后端，再由 Pi 连接本地 oML
 
 默认情况下，`PiRunner` 会自动注入只读工具 `read,grep,find,ls`。如果配置里显式传入 `--tools` 或 `--no-tools`，bridge 会尊重该设置，不再追加默认工具。
 
+Pi 当前不支持 bridge 触发的 `/compact`；当当前 runner 是 Pi 时，`/compact` 会返回“不支持”，context 告警也会提示使用 `/new` 开始新会话。Pi 的 token 使用量来自 Pi JSON 事件中的 usage 字段，bridge 会把它映射到 `/status` 和消息 footer。
+
+为避免本地模型自动吃进过多 Claude Code 上下文，推荐 staging/生产先保留 `--no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes`。如果要给 Pi 增加规则，优先使用短上下文：
+
+- 全局：`~/.pi/agent/AGENTS.md`
+- 项目：`<workspace>/.pi/APPEND_SYSTEM.md`
+
+写入或 shell 工具不建议直接加入生产配置。若确实要测试，应先在一次性目录里显式覆盖 `args_by_type.pi` 的 `--tools`，完成安全审查和 disposable-file smoke test 后再扩大范围。
+
 配置查找顺序：`--config <path>` → `$FEISHU_BRIDGE_CONFIG` → `~/.config/feishu-bridge/config.json`
 
 ### 群聊响应策略
