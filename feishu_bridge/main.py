@@ -583,9 +583,28 @@ def load_config(config_path: str, bot_name: str) -> dict:
     masked = {**bot, "app_secret": "***"}
     log.info("Bot config: %s", json.dumps(masked, ensure_ascii=False))
 
+    # ------------------------------------------------------------------
+    # workflow section (Phase 6.1 — runner-neutral workflow registry)
+    # ------------------------------------------------------------------
+    from feishu_bridge.workflows import (
+        INTERCEPT_ALWAYS, INTERCEPT_AUTO, INTERCEPT_NEVER,
+    )
+    _VALID_INTERCEPT = {INTERCEPT_AUTO, INTERCEPT_ALWAYS, INTERCEPT_NEVER}
+    workflow_raw = config.get("workflow") or {}
+    if not isinstance(workflow_raw, dict):
+        log.error("workflow must be an object, got %r", type(workflow_raw).__name__)
+        sys.exit(1)
+    intercept_mode = str(workflow_raw.get("intercept", INTERCEPT_AUTO)).strip().lower()
+    if intercept_mode not in _VALID_INTERCEPT:
+        log.error("workflow.intercept must be one of %s, got %r",
+                  sorted(_VALID_INTERCEPT), intercept_mode)
+        sys.exit(1)
+    workflow_cfg = {"intercept": intercept_mode}
+
     all_bot_names = [b["name"] for b in config.get("bots", []) if b.get("name")]
     return {"bot": bot, "agent": agent_cfg, "dedup": config.get("dedup", {}),
             "todo_auto_drive": config.get("todo_auto_drive", True),
+            "workflow": workflow_cfg,
             "all_bot_names": all_bot_names}
 
 def create_runner(agent_cfg: dict, bot_cfg: dict,
@@ -675,6 +694,18 @@ class FeishuBot:
         self._todo_auto_drive = config.get("todo_auto_drive", True)
         self._all_bot_names = config.get("all_bot_names", [self.bot_id])
         self.bot_open_id: str | None = None  # set by main() via fetch_bot_info
+
+        # Workflow registry (Phase 6.1 — runner-neutral command policy)
+        try:
+            from feishu_bridge.workflows import WorkflowRegistry
+            workflow_cfg = config.get("workflow") or {}
+            self.command_policy = WorkflowRegistry(
+                intercept_mode=workflow_cfg.get("intercept", "auto"),
+            ).load()
+        except Exception:
+            log.warning("workflow registry disabled (load failed)", exc_info=True)
+            from feishu_bridge.workflows import CommandPolicy
+            self.command_policy = CommandPolicy()
 
         # Group policy (None = legacy/compat mode: process all messages)
         gp = self.bot_config.get("group_policy")
@@ -1439,6 +1470,39 @@ class FeishuBot:
             elif cmd == "/feishu-bitable":
                 bridge_cmd = "feishu-bitable"
 
+            # Deterministic /confirm for bridge-owned workflows waiting on user
+            # confirmation (Phase 6.4). Handled before CommandPolicy resolution
+            # so it routes to the scope's active waiting workflow regardless of
+            # runner type.
+            _workflow_skill: str | None = None
+            if not bridge_cmd and cmd == "/confirm":
+                bridge_cmd = "workflow-confirm"
+                # cmd_arg intentionally kept as trailing text (usually empty)
+                # so the handler can log operator-supplied notes if any.
+
+            # Workflow skill classification (Phase 6.4 — bridge-owned execution).
+            # Runs only if no bridge-native command matched above. Claude-native
+            # decisions fall through to the runner; bridge_workflow/unsupported
+            # are intercepted with the corresponding handler.
+            if not bridge_cmd and cmd.startswith("/") and self.command_policy:
+                from feishu_bridge.workflows import (
+                    DECISION_BRIDGE_WORKFLOW, DECISION_UNSUPPORTED,
+                )
+                runner_type = str(self.agent_config.get("type", "claude"))
+                decision = self.command_policy.resolve(cmd, runner_type)
+                if decision.decision == DECISION_BRIDGE_WORKFLOW:
+                    skill_name = (
+                        decision.skill.name if decision.skill
+                        else cmd.lstrip("/")
+                    )
+                    bridge_cmd = "workflow-run"
+                    _workflow_skill = skill_name
+                    # cmd_arg preserved as user goal text; handler reads
+                    # _workflow_skill from bc_item.
+                elif decision.decision == DECISION_UNSUPPORTED:
+                    bridge_cmd = "workflow-unsupported"
+                    cmd_arg = f"{cmd}|{decision.reason}"
+
             if bridge_cmd:
                 bc_item = {
                     "_bridge_command": bridge_cmd,
@@ -1451,11 +1515,18 @@ class FeishuBot:
                     "chat_type": chat_type,
                     "_queued_reaction_id": None,
                 }
+                if _workflow_skill:
+                    bc_item["_workflow_skill"] = _workflow_skill
                 # Heavy commands (/compact, /new, /reset, /clear, /status)
                 # serialize with normal messages via ChatTaskQueue.
                 # Light commands (/help, /stop, /cancel, /model, /agent, /provider, /feishu-*)
                 # go directly to work queue.
-                _heavy_cmds = {"new", "compact", "status"}
+                # workflow-run / workflow-confirm are heavy (LLM call + SQLite
+                # write) and must serialize with normal turns per scope.
+                _heavy_cmds = {
+                    "new", "compact", "status",
+                    "workflow-run", "workflow-confirm",
+                }
                 if bridge_cmd in _heavy_cmds:
                     bc_key = SessionMap.format_key(
                         (self.bot_id, chat_id, thread_id))

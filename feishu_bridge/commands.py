@@ -52,6 +52,12 @@ def _agent_options_str() -> str:
     return " / ".join(sorted(_RUNNER_CLASSES))
 
 
+def _scope_key_from_item(item: dict) -> str:
+    # Mirrors WorkflowContext.scope_key; kept as a separate helper so the
+    # active_for_scope check can run before we build the context.
+    return f"{item['bot_id']}|{item['chat_id']}|{item.get('thread_id') or ''}"
+
+
 class BridgeCommandHandler:
     """Handle bridge-level and Feishu service commands for a bot instance."""
 
@@ -87,8 +93,12 @@ class BridgeCommandHandler:
             parts = arg.split("|")
             cancelled = parts[0] == "1"
             drained_count = int(parts[1]) if len(parts) > 1 else 0
+            wf_cancelled = self._cancel_waiting_workflow(item)
             if drained_count > 0:
-                handle.deliver(f"{drained_count} 条排队消息已清除。")
+                suffix = "，并放弃了等待中的草稿。" if wf_cancelled else "。"
+                handle.deliver(f"{drained_count} 条排队消息已清除{suffix}")
+            elif wf_cancelled:
+                handle.deliver("已放弃等待中的工作流草稿。")
             elif not cancelled:
                 handle.deliver("当前没有正在执行的任务。")
 
@@ -113,6 +123,22 @@ class BridgeCommandHandler:
                 "`/restart-all` — 重启所有 Bot 实例",
                 "`/help` — 显示本帮助",
             ])
+            # Workflow commands section (Phase 6.1 — runner-neutral skills)
+            policy = getattr(self.bot, "command_policy", None)
+            if policy is not None:
+                skill_names = policy.known_skill_commands()
+                native_names = policy.known_claude_native_commands()
+                if skill_names or native_names:
+                    lines.append("")
+                    lines.append("**Workflow 命令**")
+                if skill_names:
+                    lines.append(
+                        "（跨 runner）`" + "` `".join(f"/{n}" for n in skill_names) + "`"
+                    )
+                if native_names:
+                    lines.append(
+                        "（仅 Claude）`" + "` `".join(f"/{n}" for n in native_names) + "`"
+                    )
             # Version & upgrade info
             mode, plat, src_path = _get_install_info()
             bot_id = self.bot.bot_id
@@ -215,6 +241,21 @@ class BridgeCommandHandler:
         elif cmd == "feishu-bitable":
             self._handle_feishu_service(item, handle, "bitable")
 
+        elif cmd == "workflow-run":
+            self._handle_workflow_run(item, handle)
+
+        elif cmd == "workflow-confirm":
+            self._handle_workflow_confirm(item, handle)
+
+        elif cmd == "workflow-unsupported":
+            slash_cmd, _, reason = arg.partition("|")
+            slash_cmd = slash_cmd.strip() or "/?"
+            reason = reason.strip() or "unsupported"
+            handle.deliver(
+                f"`{slash_cmd}` 命令在当前 runner 下不支持：{reason}",
+                is_error=True,
+            )
+
     def dispatch_task_command(self, arg: str, chat_id: str, sender_id: str) -> str:
         """Parse and dispatch /feishu-tasks sub-commands."""
         parts = arg.split(None, 1)
@@ -234,6 +275,300 @@ class BridgeCommandHandler:
         if action == "help":
             return self._task_help()
         return self._task_help()
+
+    # ---- workflow handlers (Phase 6.4 — bridge-owned /plan + /confirm) ----
+
+    def _get_workflow_storage(self):
+        """Lazy-init WorkflowStorage singleton on the bot."""
+        storage = getattr(self.bot, "_workflow_storage", None)
+        if storage is None:
+            from feishu_bridge.workflows import WorkflowStorage
+            storage = WorkflowStorage()
+            self.bot._workflow_storage = storage
+        return storage
+
+    def _build_workflow_ctx(self, item: dict, skill_md, handle):
+        """Assemble WorkflowContext from bot state + command item."""
+        from feishu_bridge.paths import agents_home as _agents_home
+        from feishu_bridge.worker import _session_journal
+        from feishu_bridge.workflows import WorkflowContext
+
+        bot_id = item["bot_id"]
+        chat_id = item["chat_id"]
+        thread_id = item.get("thread_id")
+        runner_type = str(self.bot.agent_config.get("type", "claude"))
+        sid = self.bot.session_map.get((bot_id, chat_id, thread_id))
+        home = _agents_home()
+        skill_dir = (skill_md.source_dir if skill_md and skill_md.source_dir
+                     else home / "skills" / (skill_md.name if skill_md else ""))
+        return WorkflowContext(
+            bot_id=bot_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            sender_id=item.get("sender_id", ""),
+            chat_type=item.get("chat_type", ""),
+            message_id=item.get("message_id"),
+            workspace=Path(self.bot.workspace),
+            runner=self.bot.runner,
+            runner_type=runner_type,
+            handle=handle,
+            journal=_session_journal,
+            session_id=sid,
+            agents_home=home,
+            skill_dir=Path(skill_dir),
+        )
+
+    def _journal_workflow_result(self, ctx, *, command: str, action: str, result) -> None:
+        """Best-effort workflow/artifact journaling for bridge-owned workflows."""
+        journal = getattr(ctx, "journal", None)
+        if journal is None:
+            return
+        try:
+            journal.append_workflow_event(
+                ctx.bot_id,
+                ctx.chat_id,
+                ctx.thread_id,
+                command=command,
+                decision=f"{action}:{result.state}",
+                runner_type=ctx.runner_type,
+                session_id=ctx.session_id,
+            )
+            for artifact in result.artifacts:
+                journal.append_artifact(
+                    ctx.bot_id,
+                    ctx.chat_id,
+                    ctx.thread_id,
+                    path=str(artifact),
+                    runner_type=ctx.runner_type,
+                    session_id=ctx.session_id,
+                )
+        except Exception:
+            log.warning(
+                "workflow journal append failed for command=%s action=%s chat=%s",
+                command, action, ctx.chat_id, exc_info=True,
+            )
+
+    def _authorize_workflow(self, skill_name: str, item: dict, handle) -> bool:
+        """Workflow-specific safety gate beyond normal message allowlists."""
+        if skill_name != "memory-gc":
+            return True
+        if item.get("chat_type") == "p2p":
+            return True
+
+        sender_id = item.get("sender_id", "")
+        owner = getattr(self.bot, "_group_owner", None)
+        allowed = getattr(self.bot, "allowed_users", []) or []
+        explicitly_allowed = "*" not in allowed and sender_id in allowed
+        if (owner and sender_id == owner) or explicitly_allowed:
+            return True
+
+        handle.deliver(
+            "`/memory-gc` 会读取全局 memory 状态；群聊中仅群主或显式"
+            " allowlist 用户可执行。",
+            is_error=True,
+        )
+        return False
+
+    def _handle_workflow_run(self, item: dict, handle):
+        """Start a bridge-owned workflow (/plan for Phase 6.4)."""
+        skill_name = (item.get("_workflow_skill") or "").strip()
+        goal = item.get("_cmd_arg", "") or ""
+        if not skill_name:
+            handle.deliver("内部错误：workflow-run 缺少 skill 名。", is_error=True)
+            return
+        skill_md = self.bot.command_policy.skills.get(skill_name)
+        if skill_md is None:
+            handle.deliver(
+                f"未找到 skill `{skill_name}`（请检查 ~/.agents/skills/）。",
+                is_error=True,
+            )
+            return
+
+        if not self._authorize_workflow(skill_name, item, handle):
+            return
+
+        # One-active-per-scope invariant: sweep stale waiters first.
+        storage = self._get_workflow_storage()
+        storage.mark_expired_waiting()
+        scope_key = _scope_key_from_item(item)
+        existing = storage.active_for_scope(scope_key)
+        if existing is not None:
+            handle.deliver(
+                f"当前会话已有进行中的 `{existing.skill_name}` 工作流。"
+                f"请先 `/confirm` 或 `/stop`。",
+                is_error=True,
+            )
+            return
+
+        if skill_name not in ("plan", "memory-gc", "done"):
+            handle.deliver(
+                f"`/{skill_name}` 工作流尚未在 bridge 实现。",
+                is_error=True,
+            )
+            return
+
+        from feishu_bridge.workflows import (
+            STATE_WAITING_CONFIRMATION,
+            DoneWorkflow,
+            MemoryGcWorkflow,
+            PlanWorkflow,
+        )
+        import time as _time
+
+        if skill_name == "plan":
+            workflow = PlanWorkflow(
+                skill_dir=skill_md.source_dir,
+                ttl_string=skill_md.ttl,
+            )
+        else:
+            if skill_name == "memory-gc":
+                workflow = MemoryGcWorkflow(
+                    skill_dir=skill_md.source_dir,
+                    ttl_string=skill_md.ttl,
+                )
+            else:
+                workflow = DoneWorkflow(
+                    skill_dir=skill_md.source_dir,
+                    ttl_string=skill_md.ttl,
+                )
+        ctx = self._build_workflow_ctx(item, skill_md, handle)
+        result = workflow.start(ctx, goal)
+        self._journal_workflow_result(
+            ctx, command=f"/{skill_name}", action="start", result=result,
+        )
+
+        if result.state == STATE_WAITING_CONFIRMATION:
+            ttl_seconds = max(
+                1,
+                int((result.expires_at or _time.time()) - _time.time()),
+            )
+            storage.create(
+                scope_key=scope_key,
+                skill_name=skill_name,
+                payload=result.payload,
+                ttl_seconds=ttl_seconds,
+                state=STATE_WAITING_CONFIRMATION,
+            )
+        handle.deliver(result.user_message, is_error=bool(result.error))
+
+    def _handle_workflow_confirm(self, item: dict, handle):
+        """Resume a waiting workflow with /confirm — persist + finalize."""
+        storage = self._get_workflow_storage()
+        storage.mark_expired_waiting()
+        scope_key = _scope_key_from_item(item)
+        record = storage.active_for_scope(scope_key)
+        if record is None or not record.is_waiting:
+            handle.deliver(
+                "当前会话没有等待确认的工作流。请先运行对应 workflow 命令。",
+                is_error=True,
+            )
+            return
+
+        skill_md = self.bot.command_policy.skills.get(record.skill_name)
+        if skill_md is None:
+            handle.deliver(
+                f"skill `{record.skill_name}` 已卸载，无法继续确认。",
+                is_error=True,
+            )
+            return
+
+        if record.skill_name not in ("plan", "memory-gc", "done"):
+            handle.deliver(
+                f"`{record.skill_name}` 的 /confirm 尚未实现。",
+                is_error=True,
+            )
+            return
+
+        from feishu_bridge.workflows import DoneWorkflow, MemoryGcWorkflow, PlanWorkflow
+        if record.skill_name == "plan":
+            workflow = PlanWorkflow(
+                skill_dir=skill_md.source_dir,
+                ttl_string=skill_md.ttl,
+            )
+        elif record.skill_name == "memory-gc":
+            workflow = MemoryGcWorkflow(
+                skill_dir=skill_md.source_dir,
+                ttl_string=skill_md.ttl,
+            )
+        else:
+            workflow = DoneWorkflow(
+                skill_dir=skill_md.source_dir,
+                ttl_string=skill_md.ttl,
+            )
+        ctx = self._build_workflow_ctx(item, skill_md, handle)
+        result = workflow.resume_confirm(ctx, record.payload)
+        self._journal_workflow_result(
+            ctx, command=f"/{record.skill_name}", action="confirm", result=result,
+        )
+        storage.update(
+            record.id,
+            state=result.state,
+            payload=result.payload,
+            last_error=result.error,
+        )
+        handle.deliver(result.user_message, is_error=bool(result.error))
+
+    def _cancel_waiting_workflow(self, item: dict) -> bool:
+        """If a waiting workflow exists for this scope, cancel it.
+
+        Called from the /stop handler so users can abort a pending /plan
+        draft without writing anything. Returns True iff a workflow was
+        cancelled.
+        """
+        try:
+            storage = self._get_workflow_storage()
+        except Exception:
+            log.warning("workflow storage unavailable", exc_info=True)
+            return False
+        scope_key = _scope_key_from_item(item)
+        record = storage.active_for_scope(scope_key)
+        if record is None or not record.is_waiting:
+            return False
+
+        from feishu_bridge.workflows import STATE_CANCELLED, WorkflowResult
+        result: WorkflowResult
+        skill_md = self.bot.command_policy.skills.get(record.skill_name)
+        if record.skill_name in ("plan", "memory-gc", "done") and skill_md is not None:
+            from feishu_bridge.workflows import (
+                DoneWorkflow,
+                MemoryGcWorkflow,
+                PlanWorkflow,
+            )
+            if record.skill_name == "plan":
+                workflow = PlanWorkflow(
+                    skill_dir=skill_md.source_dir,
+                    ttl_string=skill_md.ttl,
+                )
+            elif record.skill_name == "memory-gc":
+                workflow = MemoryGcWorkflow(
+                    skill_dir=skill_md.source_dir,
+                    ttl_string=skill_md.ttl,
+                )
+            else:
+                workflow = DoneWorkflow(
+                    skill_dir=skill_md.source_dir,
+                    ttl_string=skill_md.ttl,
+                )
+            ctx = self._build_workflow_ctx(item, skill_md, handle=None)
+            result = workflow.resume_cancel(ctx, record.payload)
+        else:
+            result = WorkflowResult(
+                state=STATE_CANCELLED,
+                user_message=f"已取消 `{record.skill_name}` 工作流。",
+                payload=record.payload,
+            )
+            ctx = (
+                self._build_workflow_ctx(item, skill_md, handle=None)
+                if skill_md else None
+            )
+        if ctx is not None:
+            self._journal_workflow_result(
+                ctx, command=f"/{record.skill_name}", action="cancel", result=result,
+            )
+        storage.update(
+            record.id, state=result.state, payload=result.payload,
+        )
+        return True
 
     def _handle_idle_compact(self, item: dict):
         """Silent proactive compact — no card to user."""
@@ -406,12 +741,19 @@ class BridgeCommandHandler:
         """Unified /status: context + cost + quota in one view."""
         key = (item["bot_id"], item["chat_id"], item.get("thread_id"))
         sid = self.bot.session_map.get(key)
+        workflow_lines = self._workflow_status_lines(item)
         if not sid:
-            handle.deliver("当前没有活跃会话。")
+            if workflow_lines:
+                handle.deliver("当前没有活跃会话。\n\n" + "\n".join(workflow_lines))
+            else:
+                handle.deliver("当前没有活跃会话。")
             return
         cost_info = self.bot._session_cost.get(sid)
         if not cost_info:
-            handle.deliver("暂无数据（首次消息后可用）。")
+            if workflow_lines:
+                handle.deliver("暂无数据（首次消息后可用）。\n\n" + "\n".join(workflow_lines))
+            else:
+                handle.deliver("暂无数据（首次消息后可用）。")
             return
 
         lines: list[str] = []
@@ -445,6 +787,10 @@ class BridgeCommandHandler:
         if cache_read and total_ctx:
             cache_pct = cache_read / total_ctx * 100
             lines.append(f"cache hit: {cache_read:,} ({cache_pct:.0f}%)")
+
+        if workflow_lines:
+            lines.append("")
+            lines.extend(workflow_lines)
 
         ledger = getattr(self.bot, "_ledger", None)
         if ledger is not None:
@@ -551,6 +897,51 @@ class BridgeCommandHandler:
             lines.append(f"- 7d: {su:.0f}%{s_reset}")
 
         handle.deliver("\n".join(lines))
+
+    def _workflow_status_lines(self, item: dict) -> list[str]:
+        """Return active workflow status lines for /status."""
+        try:
+            storage = self._get_workflow_storage()
+            storage.mark_expired_waiting()
+            record = storage.active_for_scope(_scope_key_from_item(item))
+        except Exception:
+            log.warning("workflow status unavailable", exc_info=True)
+            return []
+        if record is None:
+            return []
+
+        import time as _time
+
+        lines = ["**Workflow**"]
+        state = record.state
+        wf_id = record.id[:8]
+        step = record.payload.get("current_step") or (
+            "waiting for /confirm" if record.is_waiting else state
+        )
+        lines.append(
+            f"- `/{record.skill_name}` `{state}` id `{wf_id}` step `{step}`"
+        )
+        draft = record.payload.get("draft")
+        if isinstance(draft, dict) and draft.get("slug"):
+            lines.append(f"- change: `{draft['slug']}`")
+        expires_at = float(record.expires_at or 0.0)
+        if expires_at:
+            remaining = max(0, int(expires_at - _time.time()))
+            lines.append(f"- expires in: {self._format_duration(remaining)}")
+        if record.last_error:
+            lines.append(f"- last error: {record.last_error[:180]}")
+        return lines
+
+    def _format_duration(self, seconds: int) -> str:
+        seconds = max(0, int(seconds))
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        mins, _ = divmod(rem, 60)
+        if days:
+            return f"{days}d{hours:02d}h"
+        if hours:
+            return f"{hours}h{mins:02d}m"
+        return f"{mins}m"
 
     def _handle_feishu_tasks(self, item: dict, handle):
         if not self.bot.feishu_tasks:

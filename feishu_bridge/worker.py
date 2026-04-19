@@ -20,11 +20,34 @@ from feishu_bridge.quota import WINDOW_LABELS
 from feishu_bridge.runtime import (
     BaseRunner, SessionMap, pick_primary_model, resolve_context_window,
 )
+from feishu_bridge.session_journal import SessionJournal
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
 
 log = logging.getLogger("feishu-bridge")
 
 _MEDIA_MAX_AGE_SECS = 3600  # 1 hour
+
+# Phase 6.3: bridge-owned per-turn journal. Singleton by default; tests inject
+# their own instance via monkeypatch on the module attribute.
+_session_journal = SessionJournal()
+
+
+def _derive_runner_type(runner) -> str:
+    """Map runner class name → canonical runner_type string.
+
+    BaseRunner does not expose self.runner_type in Phase 6.3 (tracked as a
+    separate contract change). For now we derive from class name.
+    """
+    name = type(runner).__name__.lower()
+    if "claude" in name:
+        return "claude"
+    if name.startswith("pi"):
+        return "pi"
+    if "codex" in name:
+        return "codex"
+    if "local" in name:
+        return "local"
+    return name.replace("runner", "") or "unknown"
 
 # ---------------------------------------------------------------------------
 # Idle Auto-Compact: proactive compact before prompt cache TTL expires
@@ -1071,6 +1094,35 @@ def process_message(
         ).rstrip()
         if _text:
             result["result"] = _text
+
+        # Phase 6.3: append turn boundary to bridge journal.
+        # Runs AFTER the Status-line strip so the journal records the same
+        # assistant text that reaches the user (see review-6.3 finding #4).
+        # user_turn is unconditional — the user spoke regardless of runner
+        # success. assistant_turn is gated on success; error turns produce
+        # no assistant_turn entry.
+        # Best-effort; journal failures must never propagate into turn flow.
+        try:
+            runner_type = _derive_runner_type(runner)
+            runner_model = getattr(runner, "model", None)
+            _session_journal.append_user_turn(
+                bot_id, chat_id, thread_id,
+                text=text,
+                runner_type=runner_type,
+                model=runner_model,
+                session_id=effective_sid,
+            )
+            if not result.get("is_error"):
+                _session_journal.append_assistant_turn(
+                    bot_id, chat_id, thread_id,
+                    text=result.get("result", ""),
+                    runner_type=runner_type,
+                    model=runner_model,
+                    session_id=effective_sid,
+                )
+        except Exception:
+            log.warning("session_journal append failed for chat=%s",
+                        chat_id, exc_info=True)
 
         # --- Context health alert ---
         ctx_alert = None
