@@ -390,6 +390,46 @@ feishu-cli create-event --calendar-id xxx --summary "周会" \
   --start-time 2026-03-24T10:00:00+08:00 --end-time 2026-03-24T11:00:00+08:00
 ```
 
+### 后台任务
+
+`feishu-cli bg` 用于把耗时命令交给 bridge 后台执行，完成后由 bridge 注入一条 `bg_task_completion` 合成 turn 回到原会话。已启动的 wrapper 运行在独立 session；bridge 主进程崩溃或重启不会中断已经 launch 的任务，重启时 reconciler 会从 SQLite 和 manifest 补投完成通知。
+
+```bash
+feishu-cli bg enqueue \
+  --chat-id oc_xxx \
+  --session-id sess_xxx \
+  --on-done-prompt "done" \
+  -- sleep 10
+
+feishu-cli bg status <task_id>
+feishu-cli bg list --chat-id oc_xxx --state running
+feishu-cli bg cancel <task_id>
+```
+
+命令必须以 argv 形式传入：优先使用 `--` 分隔真实命令，或使用 `--cmd-json '["python3","script.py"]'`。bridge 始终用 `shell=False` 启动用户命令，不接受裸 shell 字符串；需要 shell 语义时显式写成 `-- bash -lc '...'`。
+
+运行状态保存在 `~/.feishu-bridge/bg_tasks.db`，任务文件保存在 `~/.feishu-bridge/bg_tasks/`。完成任务会写入 `completed/<task_id>/task.json.done`，manifest 主要字段如下：
+
+```json
+{
+  "schema_version": 2,
+  "task_id": "uuid4_hex",
+  "state": "completed",
+  "exit_code": 0,
+  "signal": null,
+  "duration_seconds": 1.2,
+  "command_argv": ["sleep", "10"],
+  "stdout_tail_b64": "",
+  "stderr_tail_b64": "",
+  "output_paths": [],
+  "on_done_prompt": "done",
+  "chat_id": "oc_xxx",
+  "session_id": "sess_xxx"
+}
+```
+
+升级到包含后台任务的版本后，首次启动会自动创建 `~/.feishu-bridge/`、`bg_tasks.db`、`wake.sock` 和 `bg_tasks/` 子目录；已有目录不会被覆盖。若 `bg_tasks.db` 损坏，启动 reconciler 会把旧文件重命名为 `bg_tasks.db.quarantine.<ts>`，再从已提交的 `task.json.done` manifest 重建可恢复行。
+
 ## 部署
 
 ```bash

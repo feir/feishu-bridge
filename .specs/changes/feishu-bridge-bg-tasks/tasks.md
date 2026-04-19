@@ -83,7 +83,7 @@
     - 新增 7 个 tests：3 个 enqueue_turn kind→bypass 映射（human=False / bg_task_completion=True / 未知 kind=False 防拼写）+ 4 个真 ChatTaskQueue 行为（默认 cap 强制 / bypass 跳过 cap / bypass 不泄漏到后续 human / 空 session bypass 仍走 immediate）。
     - 回归：193 bridge + 33 task_runner + 22 bg_supervisor + 23 bg_synthetic_turn = 271 passed。
     - Codex 跨模型评审本轮跳过（change 面小、有 4 个真-queue 行为测试兜底、API shape 与 5.1 review 的建议一致）。
-- [~] 5.4 Session resume fallback —— probe 契约
+- [x] 5.4 Session resume fallback —— probe 契约
     - `sessions_index`（in-memory dict + `~/.feishu-bridge/sessions.json` 持久化）记录 `{session_id: {last_active_at, chat_id}}`；bridge 每次处理 human turn 更新 last_active_at
     - enqueue_turn 发现 `now - last_active_at > 24h` → 启动 sentinel probe：`claude -p --resume <session_id> -p ":probe:"` 5s timeout；成功 → 正常 resume；失败（timeout/session not found） → fork 新 session + prepend `[NOTE: original session no longer resumable at <timestamp>, resuming in fresh context]` 到 prompt
     - 记录 `bg_runs.session_resume_status ∈ {'resumed', 'fresh_fallback', 'resume_failed'}`
@@ -94,7 +94,7 @@
         - 新增 26 个 tests：24 个 session_resume（SessionsIndex 持久化+并发 10 线程×20 sessions+损坏 JSON 恢复、4 种 probe 分类、resolve 6 种策略分支含 clock-rollback 未来时间戳兜底、probe 抛异常兜底为 resume_failed）+ 2 个 bridge（`_bg_session_id` 正向 round-trip + None 默认）。
         - 修复 code-reviewer 3 个 MAJOR：M1 `resolve_resume_status` 包 try/except 兜底 probe_fn 异常；M2 recency 检查要求 `0 <= age < threshold`（clock rollback 时 fail-closed 走 probe）；M3 补 `_bg_session_id` 到 protected keys 测试 + 新增 round-trip 测试。
         - 回归：558 unit passed（24 session_resume + 197 bridge + 其余）。1 pre-existing failure（`test_footer_no_model_no_workspace`）与本次无关。
-    - [~] 5.4b 集成进 worker + delivery watcher（拆两段 commit）
+    - [x] 5.4b 集成进 worker + delivery watcher（拆两段 commit）
         - [x] 5.4b-worker：worker post-turn `touch()` 接入（本次 commit）
             - `FeishuBot.__init__` 实例化 `SessionsIndex(~/.feishu-bridge/sessions.json)` 赋 `self._sessions_index`；ctor 失败降级 None 不阻塞启动
             - `enqueue_turn` item dict 加 `_sessions_index`（和 `_cost_store` / `_ledger` 同模式）；加入 extras protected keys
@@ -143,43 +143,44 @@
 
 ## 7. 测试
 
-- [ ] 7.1 单元测试 `tests/test_bg_tasks_db.py`：schema + 状态机 + repo CRUD + 并发写 + CAS claim + integrity_check + manifest replay
+- [x] 7.1 单元测试 `tests/test_bg_tasks_db.py`：schema + 状态机 + repo CRUD + 并发写 + CAS claim + integrity_check + manifest replay
     - Validate: pytest 跑通；覆盖率 ≥80%；CAS claim 并发测试用真 sqlite3 connection（不 mock）
-- [ ] 7.2 单元测试 `tests/test_task_runner.py`：wrapper 启动序列、cancel 信号转发、timeout monotonic clock、tail UTF-8 safe 截断、manifest atomic rename
+- [x] 7.2 单元测试 `tests/test_task_runner.py`：wrapper 启动序列、cancel 信号转发、timeout monotonic clock、tail UTF-8 safe 截断、manifest atomic rename
     - Validate: 覆盖所有终态；monotonic clock 测试用 `freezegun` 或 monotonic mock；UTF-8 fixture 含 emoji 跨边界
-- [ ] 7.3 单元测试 `tests/test_bg_supervisor.py`：launcher CAS / delivery watcher retry / wake listener bind 回退 / session fallback
+- [x] 7.3 单元测试 `tests/test_bg_supervisor.py`：launcher CAS / delivery watcher retry / wake listener bind 回退 / session fallback
     - Validate: 覆盖 delivery retry 上限；session 不可 resume fallback 路径
-- [ ] 7.4 集成测试 `tests/test_bg_tasks_e2e.py`：启动 bridge fixture → CLI enqueue → 真实 `sleep 1` 经 task-runner → 验证合成 turn 出现在 ChatTaskQueue
+- [x] 7.4 集成测试 `tests/test_bg_tasks_e2e.py`：启动 bridge fixture → CLI enqueue → 真实 `sleep 1` 经 task-runner → 验证合成 turn 出现在 ChatTaskQueue
     - Validate: 整条链路 <5s 完成；wrapper 是真进程（非 mock）；ChatTaskQueue assert 用 spy
-- [ ] 7.5 **Crash barrier 集成测试** `tests/test_bg_crash_windows.py`（关键新增）：
-    - [ ] `barrier=post_claim` crash → 重启后 launching 超时 → `failed, reason='launch_interrupted'`
-    - [ ] `barrier=post_spawn_pre_register`（R3 新增）kill wrapper 在 Phase S 单事务前 → child 已跑但 bg_runs.pid 为 NULL → 重启后用 runner_token 扫 `ps eww` → 找到则 reap，找不到则 `orphan, reason='wrapper_died_pre_register'`
-    - [ ] `barrier=post_spawn` kill bridge → wrapper 继续跑完 → 重启 bridge → delivery 补投
-    - [ ] `barrier=pre_rename` crash → 重启后 `orphan`
-    - [ ] `barrier=post_rename_pre_db` crash → 重启后从 manifest replay（Phase C 单事务未提交 → 仍 running + manifest 存在）
-    - [ ] `barrier=post_db_pre_enqueue` crash → 重启后 delivery outbox 补投
-    - [ ] `barrier=post_enqueue_send_fail` → `delivery_failed`, poller 重试
-    - [ ] `barrier=stuck_enqueued`（R3 新增）模拟 ChatTaskQueue consumer 吞掉 ack → delivery_state 卡 enqueued → 5min 后 poller 扫描回滚 pending + 重试 → 最终 sent
-    - [ ] `barrier=orphan_alive_bridge_reap`（R3 新增）SIGKILL wrapper 但保留 child 存活 → 设 cancel_requested_at → bridge reconciler 三元组验证 → `killpg(pgid, SIGTERM)` → 5s grace SIGKILL → 终态 cancelled + `reason='reaped_by_bridge_after_wrapper_death'`
+- [x] 7.5 **Crash barrier 集成测试** `tests/test_bg_crash_windows.py`（关键新增）：
+    - [x] `barrier=post_claim` crash → 重启后 launching 超时 → `failed, reason='launch_interrupted'`
+    - [x] `barrier=post_spawn_pre_register`（R3 新增）kill wrapper 在 Phase S 单事务前 → child 已跑但 bg_runs.pid 为 NULL → 重启后用 runner_token 扫 `ps eww` → 找到则 reap，找不到则 `orphan, reason='wrapper_died_pre_register'`
+    - [x] `barrier=post_spawn` kill bridge → wrapper 继续跑完 → 重启 bridge → delivery 补投
+    - [x] `barrier=pre_rename` crash → 重启后 `orphan`
+    - [x] `barrier=post_rename_pre_db` crash → 重启后从 manifest replay（Phase C 单事务未提交 → 仍 running + manifest 存在）
+    - [x] `barrier=post_db_pre_enqueue` crash → 重启后 delivery outbox 补投
+    - [x] `barrier=post_enqueue_send_fail` → `delivery_failed`, poller 重试
+    - [x] `barrier=stuck_enqueued`（R3 新增）模拟 ChatTaskQueue consumer 吞掉 ack → delivery_state 卡 enqueued → 5min 后 poller 扫描回滚 pending + 重试 → 最终 sent
+    - [x] `barrier=orphan_alive_bridge_reap`（R3 新增）SIGKILL wrapper 但保留 child 存活 → 设 cancel_requested_at → bridge reconciler 三元组验证 → `killpg(pgid, SIGTERM)` → 5s grace SIGKILL → 终态 cancelled + `reason='reaped_by_bridge_after_wrapper_death'`
     - Validate: 每个 barrier 都是真 kill（非 mock）；最终状态由 CLI `bg status` 断言，不看内部 state；新 barrier 验证 R3 所解决的 R2 评审 finding B1/B2
-- [ ] 7.6 **pid reuse 场景** `tests/test_pid_reuse.py`：kill wrapper → fork 无关进程占用相同 pid → 三元组 mismatch → reconciler 不发信号 + 标 orphan
+- [x] 7.6 **pid reuse 场景** `tests/test_pid_reuse.py`：kill wrapper → fork 无关进程占用相同 pid → 三元组 mismatch → reconciler 不发信号 + 标 orphan
     - Validate: 断言"从未调用 os.killpg"（spy）；最终 state='orphan'
-- [ ] 7.7 **DB 损坏恢复** `tests/test_db_recovery.py`：truncate bg_tasks.db 前 100 字节 → 启动 → quarantine + manifest replay
+- [x] 7.7 **DB 损坏恢复** `tests/test_db_recovery.py`：truncate bg_tasks.db 前 100 字节 → 启动 → quarantine + manifest replay
     - Validate: quarantined 文件保留；新 DB 行数 == manifest 数；日志含 `integrity_check failed`
-- [ ] 7.8 **SQLite BUSY 抗压** `tests/test_sqlite_busy.py`：CLI 开 transaction 持有 writer lock 4s → bridge 并发 enqueue → busy_timeout 后成功
+- [x] 7.8 **SQLite BUSY 抗压** `tests/test_sqlite_busy.py`：CLI 开 transaction 持有 writer lock 4s → bridge 并发 enqueue → busy_timeout 后成功
     - Validate: enqueue 5s 内返回；不吞错
-- [ ] 7.9 **Cancel 真路径** `tests/test_cancel.py`：queued cancel 立即 `cancelled`；running cancel 触发真 SIGTERM 5s grace 真 SIGKILL；≤10s 终态
+- [x] 7.9 **Cancel 真路径** `tests/test_cancel.py`：queued cancel 立即 `cancelled`；running cancel 触发真 SIGTERM 5s grace 真 SIGKILL；≤10s 终态
     - Validate: 信号通过 wrapper 转发到 user command；pgid 正确；SLO 用 monotonic 断言
-- [ ] 7.10 **回归**：运行现有 `tests/` 全部测试
+- [x] 7.10 **回归**：运行现有 `tests/` 全部测试
     - Validate: 零失败零新跳过；`enqueue_turn` 对人类消息的 golden 断言通过
+    - Evidence: `PYTHONPATH=/Users/feir/Library/Python/3.14/lib/python/site-packages python3 -m pytest tests -q` → 639 passed, 3 skipped, 6 warnings.
 
 ## 8. 文档与发布
 
-- [ ] 8.1 更新 `README.md`：新增 `bg` 子命令使用说明 + manifest 格式示例 + argv 用法（`--` 分隔）
+- [x] 8.1 更新 `README.md`：新增 `bg` 子命令使用说明 + manifest 格式示例 + argv 用法（`--` 分隔）
     - Validate: 包含最小例子 `feishu-bridge-cli bg enqueue --chat-id oc_xxx --on-done-prompt "done" -- sleep 10`；说明 bridge 崩溃不影响已 launch 任务完成
-- [ ] 8.2 更新 `CLAUDE.md`（项目级）：何时用 bg-task（任务预计 >90s 且需要汇报）vs fire-and-forget；argv 必须通过 `--` 分隔；安全说明 `shell=False` 强制
+- [x] 8.2 更新 `CLAUDE.md`（项目级）：何时用 bg-task（任务预计 >90s 且需要汇报）vs fire-and-forget；argv 必须通过 `--` 分隔；安全说明 `shell=False` 强制
     - Validate: 使用场景判断规则可执行（例子形式而非描述）
-- [ ] 8.3 migration 说明：现有用户升级到本版本 bridge 首次启动时会自动创建 `~/.feishu-bridge/`；`bg_tasks.db` 空库创建；已存在目录不被覆盖
+- [x] 8.3 migration 说明：现有用户升级到本版本 bridge 首次启动时会自动创建 `~/.feishu-bridge/`；`bg_tasks.db` 空库创建；已存在目录不被覆盖
     - Validate: 现有用户目录存在 → 不覆盖；空目录 → 创建预期文件树
 
 ## Review Report
