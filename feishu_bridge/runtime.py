@@ -42,6 +42,7 @@ def pick_primary_model(model_usage: dict, configured: str | None) -> str | None:
 
 
 DEFAULT_TIMEOUT = 300  # 5 minutes
+SILENT_TIMEOUT = 480   # 8 min — no assistant text output
 DEDUP_TTL = 43200  # 12 hours
 DEDUP_MAX = 5000
 QUEUE_MAX = 50
@@ -613,6 +614,7 @@ class BaseRunner(ABC):
                         on_agent_update=None) -> dict:
         state = StreamState(session_id=session_id)
         timed_out = False
+        silent_timed_out = False
         result_received = threading.Event()
         stderr_lines = []
         t0 = time.monotonic()
@@ -626,10 +628,9 @@ class BaseRunner(ABC):
 
         def _timeout_kill():
             nonlocal timed_out
-            if result_received.is_set():
-                return  # Result already received; don't flag as timeout.
+            if result_received.is_set() or silent_timed_out:
+                return
             timed_out = True
-            # Graceful kill spawns its own deferred SIGKILL Timer (15s).
             BaseRunner._kill_proc_tree(proc)
 
         # Idle timeout: resets on every stdout line from the CLI.
@@ -641,6 +642,30 @@ class BaseRunner(ABC):
             timer.cancel()
             timer = threading.Timer(self.timeout, _timeout_kill)
             timer.start()
+
+        # Silent timeout: resets only on assistant text output.
+        silent_limit = getattr(self, 'silent_timeout', SILENT_TIMEOUT)
+
+        def _silent_timeout_kill():
+            nonlocal silent_timed_out
+            if result_received.is_set() or timed_out:
+                return
+            log.warning(
+                "%s silent timeout: sid=%s no assistant text for %ds",
+                self.get_display_name(),
+                (session_id or "-")[:8], silent_limit,
+            )
+            silent_timed_out = True
+            BaseRunner._kill_proc_tree(proc)
+
+        silent_timer = threading.Timer(silent_limit, _silent_timeout_kill)
+        silent_timer.start()
+
+        def _reset_silent_timer():
+            nonlocal silent_timer
+            silent_timer.cancel()
+            silent_timer = threading.Timer(silent_limit, _silent_timeout_kill)
+            silent_timer.start()
 
         try:
             for line in proc.stdout:
@@ -660,6 +685,7 @@ class BaseRunner(ABC):
                     for text in state.pending_output:
                         on_output(text)
                     state.pending_output.clear()
+                    _reset_silent_timer()
 
                 # Drain pending_tool_status → on_tool_status callback
                 # Only send the last tool name (the one visually shown).
@@ -684,8 +710,16 @@ class BaseRunner(ABC):
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - t0
-            # Distinguish: idle timer kill (timed_out=True) vs proc.wait(30) hang.
-            if timed_out:
+            if silent_timed_out:
+                log.error(
+                    "%s silent timeout + proc.wait hang: sid=%s elapsed=%.0fs",
+                    self.get_display_name(),
+                    (state.session_id or session_id or "-")[:8], elapsed,
+                )
+                self._force_kill(proc)
+                proc.wait()
+                # Fall through to the silent_timed_out handler after finally.
+            elif timed_out:
                 # The idle timer fired, killed the process, stdout EOF'd,
                 # and now proc.wait(30) also timed out — unusual but possible.
                 log.error(
@@ -729,6 +763,7 @@ class BaseRunner(ABC):
             raise
         finally:
             timer.cancel()
+            silent_timer.cancel()
             stderr_thread.join(timeout=5)
             was_cancelled = self._cleanup_tag(tag)
 
@@ -738,6 +773,23 @@ class BaseRunner(ABC):
                 "session_id": state.session_id or session_id,
                 "is_error": False,
                 "cancelled": True,
+            }
+
+        if silent_timed_out:
+            elapsed = time.monotonic() - t0
+            log.error(
+                "%s silent timeout: sid=%s elapsed=%.0fs silent_limit=%ds",
+                self.get_display_name(),
+                (state.session_id or session_id or "-")[:8], elapsed, silent_limit,
+            )
+            warning = "\n\n⚠️ 长时间无文本输出（>%ds），自动中断恢复中…" % silent_limit
+            return {
+                "result": (state.accumulated_text + warning) if state.accumulated_text else warning.strip(),
+                "session_id": state.session_id or session_id,
+                "is_error": False,
+                "silent_timeout": True,
+                "peak_context_tokens": state.peak_context_tokens,
+                "compact_detected": state.compact_detected,
             }
 
         # Content-level result from subclass (checked BEFORE timed_out
