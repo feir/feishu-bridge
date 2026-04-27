@@ -360,71 +360,76 @@ def build_auth_card(verification_url: str, scopes: list[str],
     scope_list = "\n".join(f"- `{s}`" for s in scopes if s != "offline_access")
 
     return {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
+        "config": {"enable_forward": False},
         "header": {
             "title": {"tag": "plain_text", "content": "🔐 请授权以继续操作"},
             "template": "blue",
         },
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": (
-                    f"需要授权以下权限：\n{scope_list}\n\n"
-                    f"授权后，应用将能够以你的身份执行相关操作。"
-                ),
-            },
-            {
-                "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "前往授权"},
-                    "type": "primary",
-                    "multi_url": {
-                        "url": applink_url,
-                        "pc_url": applink_url,
-                        "android_url": applink_url,
-                        "ios_url": applink_url,
-                    },
-                }],
-            },
-            {
-                "tag": "markdown",
-                "content": f"<font color='grey'>授权链接将在 {expires_min} 分钟后失效</font>",
-            },
-        ],
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"需要授权以下权限：\n{scope_list}\n\n"
+                        f"授权后，应用将能够以你的身份执行相关操作。"
+                    ),
+                },
+                {
+                    "tag": "column_set",
+                    "flex_mode": "flow",
+                    "columns": [{"tag": "column", "width": "auto", "elements": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "前往授权"},
+                        "type": "primary_filled",
+                        "size": "medium",
+                        "multi_url": {
+                            "url": applink_url,
+                            "pc_url": applink_url,
+                            "android_url": applink_url,
+                            "ios_url": applink_url,
+                        },
+                    }]}],
+                },
+                {
+                    "tag": "markdown",
+                    "content": f"<font color='grey'>授权链接将在 {expires_min} 分钟后失效</font>",
+                },
+            ],
+        },
     }
 
 
 def build_auth_success_card() -> dict:
     """Green success card."""
     return {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
         "header": {
             "title": {"tag": "plain_text", "content": "✅ 授权成功"},
             "template": "green",
         },
-        "elements": [{
+        "body": {"elements": [{
             "tag": "markdown",
             "content": (
                 "飞书账号已成功授权，正在继续执行操作。\n\n"
                 "<font color='grey'>如需撤销授权，可告诉我「撤销飞书授权」。</font>"
             ),
-        }],
+        }]},
     }
 
 
 def build_auth_failed_card(reason: str = "授权链接已过期") -> dict:
     """Yellow warning card."""
     return {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
         "header": {
             "title": {"tag": "plain_text", "content": "⚠️ 授权未完成"},
             "template": "yellow",
         },
-        "elements": [{
+        "body": {"elements": [{
             "tag": "markdown",
             "content": f"{reason}\n\n请重新发起授权。",
-        }],
+        }]},
     }
 
 
@@ -472,34 +477,39 @@ def build_app_scope_missing_card(app_id: str, scopes: list[str]) -> dict:
     )
 
     return {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
+        "config": {"enable_forward": False},
         "header": {
             "title": {"tag": "plain_text", "content": "🔧 应用权限未开通"},
             "template": "orange",
         },
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": (
-                    f"应用尚未开通以下权限：\n{scope_list}\n\n"
-                    f"请前往飞书开放平台开通，**开通后重新发送命令**即可。"
-                ),
-            },
-            {
-                "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "前往开通"},
-                    "type": "primary",
-                    "multi_url": {
-                        "url": admin_url,
-                        "pc_url": admin_url,
-                        "android_url": admin_url,
-                        "ios_url": admin_url,
-                    },
-                }],
-            },
-        ],
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"应用尚未开通以下权限：\n{scope_list}\n\n"
+                        f"请前往飞书开放平台开通，**开通后重新发送命令**即可。"
+                    ),
+                },
+                {
+                    "tag": "column_set",
+                    "flex_mode": "flow",
+                    "columns": [{"tag": "column", "width": "auto", "elements": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "前往开通"},
+                        "type": "primary_filled",
+                        "size": "medium",
+                        "multi_url": {
+                            "url": admin_url,
+                            "pc_url": admin_url,
+                            "android_url": admin_url,
+                            "ios_url": admin_url,
+                        },
+                    }]}],
+                },
+            ],
+        },
     }
 
 
