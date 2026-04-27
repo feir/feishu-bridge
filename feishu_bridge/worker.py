@@ -397,6 +397,25 @@ def _write_auth_file(chat_id: str, sender_id: str, user_token: str | None) -> st
     return auth_path
 
 
+_SESSION_ENV_PATH = os.path.expanduser("~/.feishu-bridge/session.env")
+
+
+def _write_session_env(env_extra: dict[str, str]) -> None:
+    """Persist hook-visible env vars to a file.
+
+    Claude Code's SUBPROCESS_ENV_SCRUB strips env from hook subprocesses.
+    Hooks source this file to recover FEISHU_CHAT_ID etc.
+    """
+    lines = [f"{k}={v}" for k, v in env_extra.items() if v]
+    tmp = _SESSION_ENV_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, _SESSION_ENV_PATH)
+    except OSError:
+        pass
+
+
 def _cleanup_auth_card(feishu_mod, sender_id: str):
     """Best-effort cleanup of the OAuth auth card after result delivery."""
     if not feishu_mod or not sender_id:
@@ -933,6 +952,10 @@ def process_message(
                 env_extra["FEISHU_BOT_NAME"] = bot_config.get("name", "")
         except Exception:
             log.warning("Failed to create auth file for CLI", exc_info=True)
+
+        # Persist env vars to file so Claude Code hooks can read them
+        # (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB strips env from hook subprocesses)
+        _write_session_env(env_extra)
 
         # bg_task_completion items carry the Claude UUID the watcher already
         # resolved against the sessions_index; prefer it over session_map so
