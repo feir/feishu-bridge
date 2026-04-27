@@ -1647,7 +1647,7 @@ class FeishuBot:
             return _toast("error", "处理失败，请重试")
 
     def _handle_tool_approval(self, value: dict, sender_id: str):
-        from lark_oapi.api.interactive.v1 import (
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
             P2CardActionTriggerResponse, CallBackToast, CallBackCard,
         )
 
