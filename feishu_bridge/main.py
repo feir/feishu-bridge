@@ -1662,14 +1662,17 @@ class FeishuBot:
                 resp.card.data = card_json
             return resp
 
-        approval_id = value.get("approval_id", "")
+        session_id = value.get("session_id", "")
         decision = value.get("decision", "")
         cmd_prefix = value.get("cmd_prefix", "")
+        chat_id = value.get("chat_id", "")
+        bot_id = value.get("bot_id", "")
 
-        if approval_id in self._handled_approvals:
+        dedup_key = f"{session_id}:{decision}"
+        if dedup_key in self._handled_approvals:
             return _toast("warning", "已处理")
 
-        if not approval_id or decision not in ("allow_once", "allow_session", "allow_always", "deny"):
+        if not session_id or decision not in ("allow_once", "allow_session", "allow_always", "deny"):
             return _toast("error", "无效审批请求")
 
         import re as _re
@@ -1679,18 +1682,60 @@ class FeishuBot:
 
         approvals_dir = Path.home() / ".feishu-bridge" / "approvals"
         approvals_dir.mkdir(parents=True, exist_ok=True)
-        decision_file = approvals_dir / f"{approval_id}.decision"
 
-        if decision in ("allow_session", "allow_always"):
-            content = f"{decision}\n{cmd_prefix}\n"
+        if decision == "deny":
+            marker = approvals_dir / f"denied-{session_id}"
+            marker.write_text("denied\n")
         else:
-            content = f"{decision}\n"
+            marker = approvals_dir / f"approved-{session_id}"
+            marker.write_text("approved\n")
 
-        tmp_file = decision_file.with_suffix(".tmp")
-        tmp_file.write_text(content)
-        tmp_file.rename(decision_file)
+        if decision == "allow_session" and cmd_prefix:
+            import fcntl
+            sp = approvals_dir / f"session-{session_id}.allowed"
+            with open(sp, "a") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.write(cmd_prefix + "\n")
 
-        self._handled_approvals.add(approval_id)
+        if decision == "allow_always" and cmd_prefix:
+            settings_file = Path.home() / ".claude" / "settings.json"
+            if settings_file.exists():
+                import tempfile
+                pattern = f"Bash({cmd_prefix} *)"
+                try:
+                    import json as _json
+                    data = _json.loads(settings_file.read_text())
+                    allow_list = data.setdefault("permissions", {}).setdefault("allow", [])
+                    if pattern not in allow_list:
+                        allow_list.append(pattern)
+                        tmp = tempfile.NamedTemporaryFile(
+                            mode="w", dir=settings_file.parent,
+                            suffix=".tmp", delete=False,
+                        )
+                        tmp.write(_json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+                        tmp.close()
+                        Path(tmp.name).rename(settings_file)
+                        log.info("allow_always: added %s to settings.json", pattern)
+                except Exception:
+                    log.exception("Failed to update settings.json for allow_always")
+
+        self._handled_approvals.add(dedup_key)
+
+        if chat_id:
+            msg_key = SessionMap.format_key((bot_id, chat_id, None))
+            resume_prompt = ("继续执行被暂停的命令" if decision != "deny"
+                             else "用户拒绝了命令执行")
+            try:
+                self.enqueue_turn(
+                    chat_id=chat_id,
+                    session_key=msg_key,
+                    prompt=resume_prompt,
+                    kind="human",
+                    session_id=session_id,
+                    extras={"sender_id": sender_id, "_defer_resume": True},
+                )
+            except SessionQueueFull:
+                log.warning("Cannot enqueue defer resume: queue full for chat=%s", chat_id)
 
         decision_labels = {
             "allow_once": "✅ 已允许（本次）",
@@ -1705,7 +1750,7 @@ class FeishuBot:
             "schema": "2.0",
             "config": {"update_multi": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "🔐 命令审批"},
+                "title": {"tag": "plain_text", "content": "\U0001f510 命令审批"},
                 "template": template,
             },
             "body": {
@@ -1715,8 +1760,8 @@ class FeishuBot:
             },
         }
 
-        log.info("Tool approval: id=%s decision=%s prefix=%s by=%s",
-                 approval_id, decision, cmd_prefix, sender_id)
+        log.info("Tool approval v2: sid=%s decision=%s prefix=%s by=%s",
+                 session_id[:8], decision, cmd_prefix, sender_id)
 
         return _toast("info", status_text, card_json=card)
 

@@ -3,7 +3,9 @@
     "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "85"
   },
   "permissions": {
-    "allow": [],
+    "allow": [
+      "Bash(*)"
+    ],
     "deny": [
       "Bash(systemctl *feishu-bridge*)",
       "Bash(shutdown *)",

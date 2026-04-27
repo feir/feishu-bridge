@@ -48,6 +48,111 @@ def _derive_runner_type(runner) -> str:
     return name.replace("runner", "") or "unknown"
 
 # ---------------------------------------------------------------------------
+# Defer approval card
+# ---------------------------------------------------------------------------
+
+def _send_defer_approval_card(lark_client, chat_id, session_id,
+                               cmd_display, cmd_prefix_base, cwd="", bot_id=""):
+    """Send an interactive approval card for a deferred Bash command."""
+    try:
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest, CreateMessageRequestBody,
+        )
+        card = {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "\U0001f510 命令审批"},
+                "template": "orange",
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": (
+                            f"**命令：**\n```\n{cmd_display}\n```"
+                            + (f"\n**工作目录：** `{cwd}`" if cwd else "")
+                            + f"\n**命令类型：** `{cmd_prefix_base}`"
+                        ),
+                    },
+                    {
+                        "tag": "action",
+                        "actions": [
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "✅ 允许（仅本次）"},
+                                "type": "primary",
+                                "value": {
+                                    "action": "tool_approval",
+                                    "decision": "allow_once",
+                                    "session_id": session_id,
+                                    "cmd_prefix": cmd_prefix_base,
+                                    "chat_id": chat_id,
+                                    "bot_id": bot_id,
+                                },
+                            },
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "✅ 允许（本会话）"},
+                                "type": "default",
+                                "value": {
+                                    "action": "tool_approval",
+                                    "decision": "allow_session",
+                                    "session_id": session_id,
+                                    "cmd_prefix": cmd_prefix_base,
+                                    "chat_id": chat_id,
+                                    "bot_id": bot_id,
+                                },
+                            },
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "✅ 始终允许"},
+                                "type": "default",
+                                "value": {
+                                    "action": "tool_approval",
+                                    "decision": "allow_always",
+                                    "session_id": session_id,
+                                    "cmd_prefix": cmd_prefix_base,
+                                    "chat_id": chat_id,
+                                    "bot_id": bot_id,
+                                },
+                            },
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "❌ 拒绝"},
+                                "type": "danger",
+                                "value": {
+                                    "action": "tool_approval",
+                                    "decision": "deny",
+                                    "session_id": session_id,
+                                    "cmd_prefix": cmd_prefix_base,
+                                    "chat_id": chat_id,
+                                    "bot_id": bot_id,
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+        }
+        body = CreateMessageRequestBody.builder() \
+            .receive_id(chat_id) \
+            .msg_type("interactive") \
+            .content(json.dumps(card, ensure_ascii=False)) \
+            .build()
+        req = CreateMessageRequest.builder() \
+            .receive_id_type("chat_id") \
+            .request_body(body) \
+            .build()
+        resp = lark_client.im.v1.message.create(req)
+        if not resp.success():
+            log.error("Defer approval card send failed: code=%s msg=%s",
+                      resp.code, resp.msg)
+    except Exception:
+        log.exception("Failed to send defer approval card")
+
+
+# ---------------------------------------------------------------------------
 # Idle Auto-Compact: proactive compact before prompt cache TTL expires
 # ---------------------------------------------------------------------------
 
@@ -995,6 +1100,30 @@ def process_message(
             )
             if stale_notice and isinstance(result, dict) and not result.get("is_error"):
                 result["result"] = stale_notice + "\n\n" + (result.get("result") or "")
+
+        # --- Defer detection: send approval card and pause ---
+        if result.get("stop_reason") == "tool_deferred" and result.get("deferred_tool_use"):
+            deferred = result["deferred_tool_use"]
+            defer_sid = result.get("session_id") or existing_sid
+            if defer_sid:
+                session_map.put(key, defer_sid)
+            cmd_display = (deferred.get("input") or {}).get("command", "")
+            cmd_prefix = cmd_display.split()[0] if cmd_display else "unknown"
+            cmd_prefix_base = os.path.basename(cmd_prefix)
+            if len(cmd_display) > 500:
+                cmd_display = cmd_display[:500] + "..."
+            _send_defer_approval_card(
+                lark_client, chat_id, defer_sid or "",
+                cmd_display, cmd_prefix_base,
+                cwd=(deferred.get("input") or {}).get("description", ""),
+                bot_id=bot_id,
+            )
+            partial = result.get("result") or ""
+            if partial:
+                handle.stream_update(partial)
+            handle.deliver("🔐 命令需要审批，已发送审批卡片。", is_error=False)
+            log.info("Tool deferred: sid=%s cmd_prefix=%s", (defer_sid or "-")[:8], cmd_prefix_base)
+            return handle
 
         # --- Silent timeout: auto-continue (one retry) ---
         if result.get("silent_timeout") and not result.get("cancelled"):

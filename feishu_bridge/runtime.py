@@ -729,9 +729,9 @@ class BaseRunner(ABC):
                 )
                 self._force_kill(proc)
                 proc.wait()
-            elif state.done:
-                # Agent sent a result event (task completed!) but the process
-                # didn't exit within 30s. Treat as success, not timeout.
+            elif state.done or state.final_result:
+                # Agent sent a result event (task completed or deferred) but
+                # the process didn't exit within 30s. Treat as success.
                 log.warning(
                     "%s process hung after result event: sid=%s elapsed=%.0fs, force-killing",
                     self.get_display_name(),
@@ -871,7 +871,6 @@ class ClaudeRunner(BaseRunner):
             args.extend(self._extra_cli_args)
 
         args.extend([
-            "--dangerously-skip-permissions",
             "--settings", get_bridge_settings_path(),
         ])
         if self.model:
@@ -906,7 +905,11 @@ class ClaudeRunner(BaseRunner):
         etype = event.get("type", "")
         if etype == "result":
             state.final_result = event
-            state.done = True
+            # Don't break on tool_deferred results — Claude CLI may emit
+            # a second result event with the actual response text after
+            # internally restarting the deferred tool.
+            if event.get("stop_reason") != "tool_deferred":
+                state.done = True
         elif etype == "assistant":
             msg = event.get("message", {})
             msg_usage = msg.get("usage")
@@ -1028,7 +1031,10 @@ class ClaudeRunner(BaseRunner):
         if state.last_call_usage and result_usage.get("output_tokens"):
             state.last_call_usage["output_tokens"] = result_usage["output_tokens"]
 
-        if not fr.get("is_error", False) and not result_text:
+        stop_reason = fr.get("stop_reason")
+        deferred_tool = fr.get("deferred_tool_use")
+
+        if not fr.get("is_error", False) and not result_text and stop_reason != "tool_deferred":
             log.info(
                 "Claude returned empty streaming result (silent OK): sid=%s accumulated=%d",
                 (sid or "-")[:8],
@@ -1045,6 +1051,8 @@ class ClaudeRunner(BaseRunner):
                 "peak_context_tokens": state.peak_context_tokens,
                 "compact_detected": state.compact_detected,
                 "rate_limit_info": state.rate_limit_info,
+                "stop_reason": stop_reason,
+                "deferred_tool_use": deferred_tool,
             }
 
         if state.accumulated_text and not fr.get("result"):
@@ -1065,6 +1073,8 @@ class ClaudeRunner(BaseRunner):
             "peak_context_tokens": state.peak_context_tokens,
             "compact_detected": state.compact_detected,
             "rate_limit_info": state.rate_limit_info,
+            "stop_reason": stop_reason,
+            "deferred_tool_use": deferred_tool,
         }
 
     def get_session_not_found_signatures(self):
