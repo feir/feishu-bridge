@@ -58,82 +58,57 @@ def _send_defer_approval_card(lark_client, chat_id, session_id,
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest, CreateMessageRequestBody,
         )
+        action_value = {
+            "action": "tool_approval",
+            "session_id": session_id,
+            "cmd_prefix": cmd_prefix_base,
+            "chat_id": chat_id,
+            "bot_id": bot_id,
+        }
         card = {
-            "schema": "2.0",
-            "config": {"update_multi": True},
+            "config": {"wide_screen_mode": True},
             "header": {
                 "title": {"tag": "plain_text", "content": "\U0001f510 命令审批"},
                 "template": "orange",
             },
-            "body": {
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": (
-                            f"**命令：**\n```\n{cmd_display}\n```"
-                            + (f"\n**工作目录：** `{cwd}`" if cwd else "")
-                            + f"\n**命令类型：** `{cmd_prefix_base}`"
-                        ),
-                    },
-                    {
-                        "tag": "action",
-                        "actions": [
-                            {
-                                "tag": "button",
-                                "text": {"tag": "plain_text", "content": "✅ 允许（仅本次）"},
-                                "type": "primary",
-                                "value": {
-                                    "action": "tool_approval",
-                                    "decision": "allow_once",
-                                    "session_id": session_id,
-                                    "cmd_prefix": cmd_prefix_base,
-                                    "chat_id": chat_id,
-                                    "bot_id": bot_id,
-                                },
-                            },
-                            {
-                                "tag": "button",
-                                "text": {"tag": "plain_text", "content": "✅ 允许（本会话）"},
-                                "type": "default",
-                                "value": {
-                                    "action": "tool_approval",
-                                    "decision": "allow_session",
-                                    "session_id": session_id,
-                                    "cmd_prefix": cmd_prefix_base,
-                                    "chat_id": chat_id,
-                                    "bot_id": bot_id,
-                                },
-                            },
-                            {
-                                "tag": "button",
-                                "text": {"tag": "plain_text", "content": "✅ 始终允许"},
-                                "type": "default",
-                                "value": {
-                                    "action": "tool_approval",
-                                    "decision": "allow_always",
-                                    "session_id": session_id,
-                                    "cmd_prefix": cmd_prefix_base,
-                                    "chat_id": chat_id,
-                                    "bot_id": bot_id,
-                                },
-                            },
-                            {
-                                "tag": "button",
-                                "text": {"tag": "plain_text", "content": "❌ 拒绝"},
-                                "type": "danger",
-                                "value": {
-                                    "action": "tool_approval",
-                                    "decision": "deny",
-                                    "session_id": session_id,
-                                    "cmd_prefix": cmd_prefix_base,
-                                    "chat_id": chat_id,
-                                    "bot_id": bot_id,
-                                },
-                            },
-                        ],
-                    },
-                ],
-            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"**命令：**\n```\n{cmd_display}\n```"
+                        + (f"\n**命令类型：** `{cmd_prefix_base}`" if cmd_prefix_base else "")
+                    ),
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "✅ 允许（仅本次）"},
+                            "type": "primary",
+                            "value": {**action_value, "decision": "allow_once"},
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "✅ 允许（本会话）"},
+                            "type": "default",
+                            "value": {**action_value, "decision": "allow_session"},
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "✅ 始终允许"},
+                            "type": "default",
+                            "value": {**action_value, "decision": "allow_always"},
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "❌ 拒绝"},
+                            "type": "danger",
+                            "value": {**action_value, "decision": "deny"},
+                        },
+                    ],
+                },
+            ],
         }
         body = CreateMessageRequestBody.builder() \
             .receive_id(chat_id) \
