@@ -60,6 +60,10 @@ def materialize_data_files():
     _BRIDGE_SETTINGS_PATH = str(
         _resource_stack.enter_context(as_file(_DATA.joinpath("bridge-settings.json")))
     )
+    import shutil
+    dst = Path.home() / ".feishu-bridge" / "bridge-settings.json"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_BRIDGE_SETTINGS_PATH, dst)
 
 
 def get_bridge_settings_path() -> Optional[str]:

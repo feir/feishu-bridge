@@ -686,7 +686,10 @@ class BridgeCommandHandler:
                 state_dir = Path(self.bot.workspace) / "state" / "feishu-bridge"
                 state_dir.mkdir(parents=True, exist_ok=True)
                 restart_file = state_dir / f"restart-{self.bot.bot_id}.json"
-                restart_file.write_text(json.dumps({"message_id": msg_id}))
+                restart_file.write_text(json.dumps({
+                    "message_id": msg_id,
+                    "version": new_version,
+                }))
             else:
                 handle.deliver(
                     f"{prefix} v{new_version}（当前 v{cur_version}），正在重启……")

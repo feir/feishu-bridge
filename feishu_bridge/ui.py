@@ -382,8 +382,9 @@ def build_restart_card(message: str = "") -> dict:
     }
 
 
-def build_restart_complete_card() -> dict:
+def build_restart_complete_card(version: str = "") -> dict:
     """Green card patched after bridge restarts successfully."""
+    text = f"已更新到 v{version}" if version else "重启完成"
     return {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -392,7 +393,7 @@ def build_restart_complete_card() -> dict:
         },
         "elements": [{
             "tag": "div",
-            "text": {"content": "重启完成", "tag": "lark_md"},
+            "text": {"content": text, "tag": "lark_md"},
         }],
     }
 

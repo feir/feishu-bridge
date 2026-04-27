@@ -1926,7 +1926,7 @@ def _notify_restart_complete(bot):
         if mid:
             from feishu_bridge.ui import build_restart_complete_card
             from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
-            card = build_restart_complete_card()
+            card = build_restart_complete_card(version=data.get("version", ""))
             card_json = json.dumps(card, ensure_ascii=False)
             body = PatchMessageRequestBody.builder() \
                 .content(card_json).build()
