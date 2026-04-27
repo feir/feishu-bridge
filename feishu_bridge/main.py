@@ -679,6 +679,7 @@ class FeishuBot:
             self._group_owner = None
             self._group_overrides = {}
         self._session_cost: dict[str, dict] = {}  # sid -> last {usage, model_usage, total_cost_usd}
+        self._handled_approvals: set[str] = set()
         self._session_map_path = (
             Path(self.workspace) / "state" / "feishu-bridge" / f"sessions-{self.bot_id}.json"
         )
@@ -1603,6 +1604,11 @@ class FeishuBot:
             log.info("Card action: bot=%s chat=%s sender=%s label=%s",
                      bot_id, chat_id, sender_id, label)
 
+            # Tool approval cards bypass enqueue_turn — decision is
+            # written as a file for the hook to poll, not queued as a turn.
+            if value.get("action") == "tool_approval":
+                return self._handle_tool_approval(value, sender_id)
+
             # Route through the single enqueue_turn choke point so all
             # infra fields (_cost_store, _ledger, _sessions_index, …) stay
             # in sync with the _on_message path. Hand-rolling an item dict
@@ -1639,6 +1645,80 @@ class FeishuBot:
         except Exception:
             log.exception("on_card_action error")
             return _toast("error", "处理失败，请重试")
+
+    def _handle_tool_approval(self, value: dict, sender_id: str):
+        from lark_oapi.api.interactive.v1 import (
+            P2CardActionTriggerResponse, CallBackToast, CallBackCard,
+        )
+
+        def _toast(type_: str, content: str, card_json: dict | None = None):
+            resp = P2CardActionTriggerResponse()
+            resp.toast = CallBackToast()
+            resp.toast.type = type_
+            resp.toast.content = content
+            if card_json:
+                resp.card = CallBackCard()
+                resp.card.type = "raw"
+                resp.card.data = card_json
+            return resp
+
+        approval_id = value.get("approval_id", "")
+        decision = value.get("decision", "")
+        cmd_prefix = value.get("cmd_prefix", "")
+
+        if approval_id in self._handled_approvals:
+            return _toast("warning", "已处理")
+
+        if not approval_id or decision not in ("allow_once", "allow_session", "allow_always", "deny"):
+            return _toast("error", "无效审批请求")
+
+        import re as _re
+        if decision in ("allow_session", "allow_always"):
+            if not cmd_prefix or not _re.fullmatch(r"[A-Za-z0-9_./-]{1,64}", cmd_prefix):
+                return _toast("error", "无效命令前缀")
+
+        approvals_dir = Path.home() / ".feishu-bridge" / "approvals"
+        approvals_dir.mkdir(parents=True, exist_ok=True)
+        decision_file = approvals_dir / f"{approval_id}.decision"
+
+        if decision in ("allow_session", "allow_always"):
+            content = f"{decision}\n{cmd_prefix}\n"
+        else:
+            content = f"{decision}\n"
+
+        tmp_file = decision_file.with_suffix(".tmp")
+        tmp_file.write_text(content)
+        tmp_file.rename(decision_file)
+
+        self._handled_approvals.add(approval_id)
+
+        decision_labels = {
+            "allow_once": "✅ 已允许（本次）",
+            "allow_session": f"✅ 已允许（会话: {cmd_prefix}）",
+            "allow_always": f"✅ 已允许（始终: {cmd_prefix}）",
+            "deny": "❌ 已拒绝",
+        }
+        status_text = f"{decision_labels[decision]} by {sender_id}"
+        template = "green" if decision.startswith("allow") else "red"
+
+        card = {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "🔐 命令审批"},
+                "template": template,
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": status_text},
+                ]
+            },
+        }
+
+        log.info("Tool approval: id=%s decision=%s prefix=%s by=%s",
+                 approval_id, decision, cmd_prefix, sender_id)
+
+        return _toast("info", status_text, card_json=card)
 
     def _handle_bridge_command(self, item: dict):
         self._command_handler().handle_bridge_command(item)

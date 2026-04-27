@@ -920,19 +920,17 @@ def process_message(
             )
             text = "\n".join(prompt_parts)
 
-        # --- Auth file for feishu_cli.py ---
-        # Always create the auth file so feishu-cli is available.  The token
-        # may be None for first-time users — feishu-cli will trigger OAuth
-        # on-demand when it actually needs the token (not pre-emptively).
-        env_extra = None
+        # --- Env injection for hooks and feishu-cli ---
+        env_extra = {
+            "FEISHU_CHAT_ID": chat_id,
+            "FEISHU_BOT_ID": bot_id,
+        }
         try:
             if feishu_docs and runner.wants_auth_file():
                 cli_token = feishu_docs.get_cached_token(sender_id)
                 auth_file_path = _write_auth_file(chat_id, sender_id, cli_token)
-                env_extra = {
-                    "FEISHU_AUTH_FILE": auth_file_path,
-                    "FEISHU_BOT_NAME": bot_config.get("name", ""),
-                }
+                env_extra["FEISHU_AUTH_FILE"] = auth_file_path
+                env_extra["FEISHU_BOT_NAME"] = bot_config.get("name", "")
         except Exception:
             log.warning("Failed to create auth file for CLI", exc_info=True)
 
