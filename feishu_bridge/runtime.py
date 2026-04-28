@@ -43,6 +43,7 @@ def pick_primary_model(model_usage: dict, configured: str | None) -> str | None:
 
 DEFAULT_TIMEOUT = 300  # 5 minutes
 SILENT_TIMEOUT = 480   # 8 min — no assistant text output
+BG_AGENT_SILENT_TIMEOUT = 3600  # 1 hour — background agents (e.g. Codex review)
 DEDUP_TTL = 43200  # 12 hours
 DEDUP_MAX = 5000
 QUEUE_MAX = 50
@@ -119,6 +120,7 @@ class StreamState:
     pending_tool_status: list[str] = field(default_factory=list)
     pending_todo_update: list[dict] | None = None
     pending_agent_launches: list[dict] | None = None
+    bg_agent_running: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +686,10 @@ class BaseRunner(ABC):
 
                 self.parse_streaming_line(event, state)
 
+                if state.bg_agent_running and silent_limit < BG_AGENT_SILENT_TIMEOUT:
+                    silent_limit = BG_AGENT_SILENT_TIMEOUT
+                    _reset_silent_timer()
+
                 # Drain pending_output → on_output callback
                 if on_output and state.pending_output:
                     for text in state.pending_output:
@@ -955,7 +961,9 @@ class ClaudeRunner(BaseRunner):
                             state.pending_todo_update = todos
                     elif tool_name == "Agent":
                         ai = block.get("input", {})
-                        if not ai.get("run_in_background"):
+                        if ai.get("run_in_background"):
+                            state.bg_agent_running = True
+                        else:
                             launch = {
                                 "description": ai.get("description", ""),
                                 "name": ai.get("name"),
