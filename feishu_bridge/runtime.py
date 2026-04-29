@@ -702,6 +702,7 @@ class BaseRunner(ABC):
                 if on_tool_status and state.pending_tool_status:
                     on_tool_status(state.pending_tool_status[-1])
                     state.pending_tool_status.clear()
+                    _reset_silent_timer()
 
                 # Drain pending_todo_update → on_todo_update callback
                 if on_todo_update and state.pending_todo_update is not None:
