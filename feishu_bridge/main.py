@@ -1668,8 +1668,9 @@ class FeishuBot:
         chat_id = value.get("chat_id", "")
         bot_id = value.get("bot_id", "")
         tool_type = value.get("tool_type", "bash")
+        tool_use_id = value.get("tool_use_id", "")
 
-        dedup_key = f"{session_id}:{decision}"
+        dedup_key = f"{session_id}:{tool_use_id}:{decision}" if tool_use_id else f"{session_id}:{decision}"
         if dedup_key in self._handled_approvals:
             return _toast("warning", "已处理")
 
@@ -1679,6 +1680,8 @@ class FeishuBot:
         import re as _re
         if decision in ("allow_session", "allow_always"):
             if not cmd_prefix or not _re.fullmatch(r"[A-Za-z0-9_./-]{1,128}", cmd_prefix):
+                log.warning("Tool approval regex rejected: cmd_prefix=%r decision=%s tool_type=%s value=%r",
+                            cmd_prefix, decision, tool_type, value)
                 return _toast("error", "无效命令/工具名")
 
         approvals_dir = Path.home() / ".feishu-bridge" / "approvals"

@@ -53,7 +53,7 @@ def _derive_runner_type(runner) -> str:
 
 def _send_defer_approval_card(lark_client, chat_id, session_id,
                                cmd_display, cmd_prefix_base, cwd="", bot_id="",
-                               tool_type="bash"):
+                               tool_type="bash", tool_use_id=""):
     """Send an interactive approval card for a deferred tool call."""
     try:
         from lark_oapi.api.im.v1 import (
@@ -66,6 +66,7 @@ def _send_defer_approval_card(lark_client, chat_id, session_id,
             "chat_id": chat_id,
             "bot_id": bot_id,
             "tool_type": tool_type,
+            "tool_use_id": tool_use_id,
         }
         buttons = [
             {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 允许（仅本次）"},
@@ -1083,7 +1084,7 @@ def process_message(
             defer_sid = result.get("session_id") or existing_sid
             if defer_sid:
                 session_map.put(key, defer_sid)
-            tool_name = deferred.get("tool_name", "")
+            tool_name = deferred.get("name") or deferred.get("tool_name") or ""
             tool_input = deferred.get("input") or {}
             if tool_name == "Bash":
                 cmd_display = tool_input.get("command", "")
@@ -1102,6 +1103,7 @@ def process_message(
                 cwd=tool_input.get("description", "") if tool_name == "Bash" else "",
                 bot_id=bot_id,
                 tool_type=tool_type,
+                tool_use_id=deferred.get("id", ""),
             )
             partial = result.get("result") or ""
             if partial:
