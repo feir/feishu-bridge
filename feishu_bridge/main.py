@@ -1667,6 +1667,7 @@ class FeishuBot:
         cmd_prefix = value.get("cmd_prefix", "")
         chat_id = value.get("chat_id", "")
         bot_id = value.get("bot_id", "")
+        tool_type = value.get("tool_type", "bash")
 
         dedup_key = f"{session_id}:{decision}"
         if dedup_key in self._handled_approvals:
@@ -1677,8 +1678,8 @@ class FeishuBot:
 
         import re as _re
         if decision in ("allow_session", "allow_always"):
-            if not cmd_prefix or not _re.fullmatch(r"[A-Za-z0-9_./-]{1,64}", cmd_prefix):
-                return _toast("error", "无效命令前缀")
+            if not cmd_prefix or not _re.fullmatch(r"[A-Za-z0-9_./-]{1,128}", cmd_prefix):
+                return _toast("error", "无效命令/工具名")
 
         approvals_dir = Path.home() / ".feishu-bridge" / "approvals"
         approvals_dir.mkdir(parents=True, exist_ok=True)
@@ -1701,7 +1702,7 @@ class FeishuBot:
             settings_file = Path.home() / ".claude" / "settings.json"
             if settings_file.exists():
                 import tempfile
-                pattern = f"Bash({cmd_prefix} *)"
+                pattern = f"Bash({cmd_prefix} *)" if tool_type == "bash" else cmd_prefix
                 try:
                     import json as _json
                     data = _json.loads(settings_file.read_text())

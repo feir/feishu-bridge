@@ -52,8 +52,9 @@ def _derive_runner_type(runner) -> str:
 # ---------------------------------------------------------------------------
 
 def _send_defer_approval_card(lark_client, chat_id, session_id,
-                               cmd_display, cmd_prefix_base, cwd="", bot_id=""):
-    """Send an interactive approval card for a deferred Bash command."""
+                               cmd_display, cmd_prefix_base, cwd="", bot_id="",
+                               tool_type="bash"):
+    """Send an interactive approval card for a deferred tool call."""
     try:
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest, CreateMessageRequestBody,
@@ -64,6 +65,7 @@ def _send_defer_approval_card(lark_client, chat_id, session_id,
             "cmd_prefix": cmd_prefix_base,
             "chat_id": chat_id,
             "bot_id": bot_id,
+            "tool_type": tool_type,
         }
         buttons = [
             {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 允许（仅本次）"},
@@ -83,7 +85,7 @@ def _send_defer_approval_card(lark_client, chat_id, session_id,
             "schema": "2.0",
             "config": {"enable_forward": False},
             "header": {
-                "title": {"tag": "plain_text", "content": "\U0001f510 命令审批"},
+                "title": {"tag": "plain_text", "content": "\U0001f510 命令审批" if tool_type == "bash" else "\U0001f510 工具审批"},
                 "template": "orange",
             },
             "body": {
@@ -91,8 +93,10 @@ def _send_defer_approval_card(lark_client, chat_id, session_id,
                     {
                         "tag": "markdown",
                         "content": (
-                            f"**命令：**\n```\n{cmd_display}\n```"
-                            + (f"\n**命令类型：** `{cmd_prefix_base}`" if cmd_prefix_base else "")
+                            (f"**命令：**\n```\n{cmd_display}\n```"
+                             + (f"\n**命令类型：** `{cmd_prefix_base}`" if cmd_prefix_base else ""))
+                            if tool_type == "bash" else
+                            f"**工具：** `{cmd_prefix_base}`\n**参数：**\n```json\n{cmd_display}\n```"
                         ),
                     },
                     {
@@ -1079,22 +1083,31 @@ def process_message(
             defer_sid = result.get("session_id") or existing_sid
             if defer_sid:
                 session_map.put(key, defer_sid)
-            cmd_display = (deferred.get("input") or {}).get("command", "")
-            cmd_prefix = cmd_display.split()[0] if cmd_display else "unknown"
-            cmd_prefix_base = os.path.basename(cmd_prefix)
+            tool_name = deferred.get("tool_name", "")
+            tool_input = deferred.get("input") or {}
+            if tool_name == "Bash":
+                cmd_display = tool_input.get("command", "")
+                cmd_prefix = cmd_display.split()[0] if cmd_display else "unknown"
+                cmd_prefix_base = os.path.basename(cmd_prefix)
+                tool_type = "bash"
+            else:
+                cmd_prefix_base = tool_name
+                cmd_display = json.dumps(tool_input, ensure_ascii=False, indent=2)
+                tool_type = "tool"
             if len(cmd_display) > 500:
                 cmd_display = cmd_display[:500] + "..."
             _send_defer_approval_card(
                 lark_client, chat_id, defer_sid or "",
                 cmd_display, cmd_prefix_base,
-                cwd=(deferred.get("input") or {}).get("description", ""),
+                cwd=tool_input.get("description", "") if tool_name == "Bash" else "",
                 bot_id=bot_id,
+                tool_type=tool_type,
             )
             partial = result.get("result") or ""
             if partial:
                 handle.stream_update(partial)
-            handle.deliver("🔐 命令需要审批，已发送审批卡片。", is_error=False)
-            log.info("Tool deferred: sid=%s cmd_prefix=%s", (defer_sid or "-")[:8], cmd_prefix_base)
+            handle.deliver("🔐 工具调用需要审批，已发送审批卡片。", is_error=False)
+            log.info("Tool deferred: sid=%s tool=%s", (defer_sid or "-")[:8], cmd_prefix_base)
             return handle
 
         # --- Silent timeout: auto-continue (one retry) ---
