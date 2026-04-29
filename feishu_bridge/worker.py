@@ -904,8 +904,8 @@ def process_message(
         def on_stream(text_so_far):
             handle.stream_update(text_so_far)
 
-        def on_tool_status(tool_name):
-            handle.tool_status_update(tool_name)
+        def on_tool_status(tool_calls):
+            handle.tool_status_update(tool_calls)
 
         def on_todo_update(todos):
             handle.todo_list_update(todos)

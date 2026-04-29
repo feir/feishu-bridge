@@ -117,10 +117,26 @@ class StreamState:
     is_error: bool = False
     done: bool = False
     pending_output: list[str] = field(default_factory=list)
-    pending_tool_status: list[str] = field(default_factory=list)
+    pending_tool_status: list = field(default_factory=list)
     pending_todo_update: list[dict] | None = None
     pending_agent_launches: list[dict] | None = None
     bg_agent_running: bool = False
+
+
+def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
+    """Extract minimal hint string from tool input (avoids holding large dicts)."""
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        return cmd.split(maxsplit=1)[0] if cmd else ""
+    if tool_name in ("Read", "Write", "Edit"):
+        return tool_input.get("file_path", "")
+    if tool_name == "Agent":
+        return (tool_input.get("description") or "")[:40]
+    if tool_name == "Skill":
+        return tool_input.get("skill", "")
+    if tool_name == "Grep":
+        return (tool_input.get("pattern") or "")[:30]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -698,11 +714,11 @@ class BaseRunner(ABC):
                     _reset_silent_timer()
 
                 # Drain pending_tool_status → on_tool_status callback
-                # Only send the last tool name (the one visually shown).
-                if on_tool_status and state.pending_tool_status:
-                    on_tool_status(state.pending_tool_status[-1])
+                if state.pending_tool_status:
+                    if on_tool_status:
+                        on_tool_status(list(state.pending_tool_status))
+                        _reset_silent_timer()
                     state.pending_tool_status.clear()
-                    _reset_silent_timer()
 
                 # Drain pending_todo_update → on_todo_update callback
                 if on_todo_update and state.pending_todo_update is not None:
@@ -950,12 +966,16 @@ class ClaudeRunner(BaseRunner):
                         state.peak_context_tokens, ctx_tokens)
                 if ctx_tokens > state.peak_context_tokens:
                     state.peak_context_tokens = ctx_tokens
-            # Extract tool-use names for progress feedback.
+            # Extract tool-use metadata for progress feedback.
             for block in msg.get("content", []):
                 if block.get("type") == "tool_use":
                     tool_name = block.get("name", "")
                     if tool_name:
-                        state.pending_tool_status.append(tool_name)
+                        state.pending_tool_status.append({
+                            "name": tool_name,
+                            "hint_data": _extract_hint_data(
+                                tool_name, block.get("input") or {}),
+                        })
                     if tool_name == "TodoWrite":
                         todos = block.get("input", {}).get("todos")
                         if isinstance(todos, list):

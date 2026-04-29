@@ -3,12 +3,14 @@
 import copy
 import json
 import logging
+import os.path
 import re
 import subprocess
 import threading
 import time
 import urllib.parse
 import uuid
+from collections import deque
 from typing import Optional
 
 from lark_oapi.api.cardkit.v1 import (
@@ -967,6 +969,7 @@ class ResponseHandle:
         self._runner_tag: Optional[str] = None
         self._last_todos: list[dict] | None = None
         self._active_agents: list[dict] = []
+        self._tool_history: deque[dict] = deque(maxlen=8)
 
     def _next_seq(self) -> int:
         with self._seq_lock:
@@ -1177,23 +1180,62 @@ class ResponseHandle:
         "NotebookEdit": "编辑笔记",
     }
 
-    def tool_status_update(self, tool_name: str):
-        """Update CardKit summary and card body to reflect current tool."""
-        if self._terminated:
+    @staticmethod
+    def _format_tool_hint(tool_name: str, hint_data: str) -> str:
+        if not hint_data:
+            return ""
+        if tool_name in ("Bash", "Read", "Write", "Edit"):
+            return os.path.basename(hint_data)
+        return hint_data
+
+    @staticmethod
+    def _mcp_display_name(tool_name: str) -> str:
+        parts = tool_name.split("__", 2)
+        if len(parts) >= 3:
+            server = parts[1].replace("_", " ").title()
+            return f"{server}: {parts[2]}"
+        return tool_name
+
+    def tool_status_update(self, tool_calls: list):
+        """Update tool history and render progress."""
+        if self._terminated or self._summary_updated:
             return
-        # Once text output has started, summary is already "输入中...", don't revert.
-        if self._summary_updated:
-            return
-        # Create card eagerly so we can show progress during tool-only phases.
         if not self.card_message_id:
             if not self._ensure_card():
                 return
         if not self._cardkit_card_id:
             return
-        label = self._TOOL_STATUS_MAP.get(tool_name, tool_name)
-        self._update_summary(f"{label}...")
-        # Also update card body so the user sees progress inside the card.
-        self._update_tool_body(label)
+
+        for tc in tool_calls:
+            if isinstance(tc, str):
+                name, hint_data = tc, ""
+            else:
+                name = tc.get("name", "")
+                hint_data = tc.get("hint_data", "")
+
+            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage"):
+                continue
+
+            if name.startswith("mcp__"):
+                label = self._mcp_display_name(name)
+                hint = ""
+            else:
+                label = self._TOOL_STATUS_MAP.get(name, name)
+                hint = self._format_tool_hint(name, hint_data)
+
+            if self._tool_history:
+                last = self._tool_history[-1]
+                if last["label"] == label and last["hint"] == hint:
+                    last["count"] += 1
+                    continue
+
+            self._tool_history.append({"label": label, "hint": hint, "count": 1})
+
+        if self._tool_history:
+            latest = self._tool_history[-1]
+            self._update_summary(f"{latest['label']}...")
+
+        self._render_progress()
 
     def _update_summary(self, text: str):
         """Update CardKit card summary text."""
@@ -1245,10 +1287,6 @@ class ResponseHandle:
             log.debug("Element update error (%s)", element_id, exc_info=True)
             return False
 
-    def _update_tool_body(self, label: str):
-        """Update card body element with tool progress indicator."""
-        self._update_element(CARDKIT_ELEMENT_ID, f"*{label}...*")
-
     @staticmethod
     def _format_todos(todos: list[dict]) -> str:
         """Format TodoWrite todos list as markdown for card display."""
@@ -1272,10 +1310,22 @@ class ResponseHandle:
         self._update_element(CARDKIT_LOADING_ELEMENT_ID, "")
 
     def _render_progress(self):
-        """Render combined agent + todo progress to the todo element."""
+        """Render combined tool history + agent + todo progress."""
         if not self._cardkit_card_id:
             return
         parts = []
+
+        for entry in self._tool_history:
+            label = entry["label"]
+            hint = entry["hint"]
+            count = entry["count"]
+            line = f"▸ {label}"
+            if hint:
+                line += f" `{hint}`"
+            if count > 1:
+                line += f" ×{count}"
+            parts.append(line)
+
         for a in self._active_agents:
             desc = a.get("description", "")
             atype = a.get("subagent_type", "")
@@ -1284,10 +1334,12 @@ class ResponseHandle:
                 parts.append(f"~~☑ {desc}{suffix}~~")
             else:
                 parts.append(f"◉ **{desc}{suffix}**")
+
         if self._last_todos:
             if parts:
                 parts.append("")
             parts.append(self._format_todos(self._last_todos))
+
         self._clear_loading_icon()
         self._update_element(CARDKIT_TODO_ELEMENT_ID, "\n".join(parts))
 
@@ -1326,6 +1378,9 @@ class ResponseHandle:
 
     def _perform_flush(self, text: str):
         if self._use_cardkit and self._cardkit_card_id:
+            if self._tool_history:
+                self._tool_history.clear()
+                self._render_progress()
             self._mark_agents_completed()
             self._update_summary_to_typing()
             text = strip_action_markers(text)
