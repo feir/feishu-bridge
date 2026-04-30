@@ -1025,6 +1025,7 @@ def process_message(
         env_extra = {
             "FEISHU_CHAT_ID": chat_id,
             "FEISHU_BOT_ID": bot_id,
+            "FEISHU_THREAD_ID": thread_id or "",
         }
         try:
             if feishu_docs and runner.wants_auth_file():
