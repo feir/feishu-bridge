@@ -56,8 +56,10 @@ _BRIDGE_SETTINGS_PATH: Optional[str] = None
 
 
 def materialize_data_files():
-    """Call once at startup. Extracts data files and holds them for process lifetime."""
+    """Extract data files and hold them for process lifetime. Idempotent."""
     global _BRIDGE_SETTINGS_PATH
+    if _BRIDGE_SETTINGS_PATH is not None:
+        return
     _BRIDGE_SETTINGS_PATH = str(
         _resource_stack.enter_context(as_file(_DATA.joinpath("bridge-settings.json")))
     )
@@ -67,8 +69,10 @@ def materialize_data_files():
     shutil.copy2(_BRIDGE_SETTINGS_PATH, dst)
 
 
-def get_bridge_settings_path() -> Optional[str]:
-    """Return materialized bridge-settings.json path."""
+def get_bridge_settings_path() -> str:
+    """Return materialized bridge-settings.json path, initializing on first call."""
+    if _BRIDGE_SETTINGS_PATH is None:
+        materialize_data_files()
     return _BRIDGE_SETTINGS_PATH
 
 EMPTY_RESULT_MESSAGE = "Claude 本次未返回任何内容，请稍后重试。"
