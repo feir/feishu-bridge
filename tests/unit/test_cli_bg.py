@@ -1,4 +1,4 @@
-"""Unit tests for `feishu-cli bg ...` subcommands (Task 3.1-3.4)."""
+"""Unit tests for `bridge-cli bg ...` subcommands (Task 3.1-3.4)."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _run_cli(args, env_overrides=None, expect_ok=False):
         env.update(env_overrides)
     # HOME is the knob — child inherits via env.
     proc = subprocess.run(
-        [sys.executable, "-m", "feishu_bridge.cli", *args],
+        [sys.executable, "-m", "feishu_bridge.cli_bridge", *args],
         capture_output=True, text=True, env=env, timeout=20,
     )
     if expect_ok:

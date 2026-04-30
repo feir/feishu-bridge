@@ -440,18 +440,18 @@ feishu-cli create-event --calendar-id xxx --summary "周会" \
 
 ### 后台任务
 
-`feishu-cli bg` 用于把耗时命令交给 bridge 后台执行，完成后由 bridge 注入一条 `bg_task_completion` 合成 turn 回到原会话。已启动的 wrapper 运行在独立 session；bridge 主进程崩溃或重启不会中断已经 launch 的任务，重启时 reconciler 会从 SQLite 和 manifest 补投完成通知。
+`bridge-cli bg` 用于把耗时命令交给 bridge 后台执行，完成后由 bridge 注入一条 `bg_task_completion` 合成 turn 回到原会话。已启动的 wrapper 运行在独立 session；bridge 主进程崩溃或重启不会中断已经 launch 的任务，重启时 reconciler 会从 SQLite 和 manifest 补投完成通知。
 
 ```bash
-feishu-cli bg enqueue \
+bridge-cli bg enqueue \
   --chat-id oc_xxx \
   --session-id sess_xxx \
   --on-done-prompt "done" \
   -- sleep 10
 
-feishu-cli bg status <task_id>
-feishu-cli bg list --chat-id oc_xxx --state running
-feishu-cli bg cancel <task_id>
+bridge-cli bg status <task_id>
+bridge-cli bg list --chat-id oc_xxx --state running
+bridge-cli bg cancel <task_id>
 ```
 
 命令必须以 argv 形式传入：优先使用 `--` 分隔真实命令，或使用 `--cmd-json '["python3","script.py"]'`。bridge 始终用 `shell=False` 启动用户命令，不接受裸 shell 字符串；需要 shell 语义时显式写成 `-- bash -lc '...'`。

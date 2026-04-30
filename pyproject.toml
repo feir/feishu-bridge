@@ -35,6 +35,7 @@ dev = ["pytest", "python-dotenv"]
 [project.scripts]
 feishu-bridge = "feishu_bridge.main:main"
 feishu-cli = "feishu_bridge.cli:main"
+bridge-cli = "feishu_bridge.cli_bridge:main"
 task-runner = "feishu_bridge.task_runner:main"
 
 [tool.hatch.build.targets.wheel]
