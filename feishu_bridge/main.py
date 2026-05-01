@@ -299,6 +299,9 @@ def resolve_agent_env(agent_cfg: dict, agent_type: str) -> dict[str, str]:
     """Resolve fixed environment overrides for an agent type."""
     env = dict(_normalize_agent_env(agent_cfg).get(agent_type, {}))
     env.update(_provider_profile(agent_cfg).get("env_by_type", {}).get(agent_type, {}))
+    # Force all background execution through the PreToolUse hook (bg-task-redirect.sh)
+    # so bridge-cli bg enqueue can track progress and report back to Feishu.
+    env.setdefault("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
     return env
 
 
