@@ -117,12 +117,12 @@ def _walk_property_elements(elements: list, parts: list) -> None:
         if "elements" in prop:
             _walk_property_elements(prop["elements"], parts)
         # List items
-        if "items" in prop:
+        if isinstance(prop.get("items"), list):
             for item in prop["items"]:
                 if isinstance(item, dict) and "elements" in item:
                     _walk_property_elements(item["elements"], parts)
         # Table rows
-        if "rows" in prop:
+        if isinstance(prop.get("rows"), list):
             # Use declared column order from metadata; fall back to sorted keys.
             col_order = [c["name"] for c in prop.get("columns", [])
                          if isinstance(c, dict) and "name" in c]
@@ -130,7 +130,8 @@ def _walk_property_elements(elements: list, parts: list) -> None:
                 if not isinstance(row, dict):
                     continue
                 keys = col_order if col_order else sorted(
-                    row.keys(), key=lambda k: int(k) if k.isdigit() else k)
+                    row.keys(),
+                    key=lambda k: (0, int(k)) if k.isdigit() else (1, k))
                 row_parts: list[str] = []
                 for col_key in keys:
                     cell = row.get(col_key)
