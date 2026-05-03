@@ -484,6 +484,81 @@ def test_parse_interactive_content_legacy_card():
     assert result == "Legacy content"
 
 
+def test_parse_interactive_content_property_table():
+    """parse_interactive_content extracts table rows from property format."""
+    card = {"json_card": json.dumps({
+        "body": {"property": {"elements": [
+            {"tag": "heading", "property": {"elements": [
+                {"tag": "plain_text", "property": {"content": "Results"}}
+            ], "level": 3}},
+            {"tag": "table", "property": {
+                "columns": [
+                    {"displayName": "Step", "name": "0"},
+                    {"displayName": "Status", "name": "1"},
+                ],
+                "rows": [
+                    {"0": {"data": {"property": {"elements": [
+                        {"tag": "plain_text", "property": {"content": "Login"}}
+                    ]}, "tag": "markdown"}},
+                     "1": {"data": {"property": {"elements": [
+                        {"tag": "plain_text", "property": {"content": "PASS"}}
+                    ]}, "tag": "markdown"}}},
+                    {"0": {"data": {"property": {"elements": [
+                        {"tag": "plain_text", "property": {"content": "Submit"}}
+                    ]}, "tag": "markdown"}},
+                     "1": {"data": {"property": {"elements": [
+                        {"tag": "plain_text", "property": {"content": "FAIL"}}
+                    ]}, "tag": "markdown"}}},
+                ],
+                "pageSize": 10,
+                "freezeFirstColumn": False,
+                "headerStyle": {"bold": True},
+            }},
+        ]}, "tag": "body"},
+    })}
+    result = bridge_parsers.parse_interactive_content(card)
+    assert "Results" in result
+    assert "Login | PASS" in result
+    assert "Submit | FAIL" in result
+
+
+def test_parse_interactive_content_property_list():
+    """parse_interactive_content extracts list items from property format."""
+    card = {"json_card": json.dumps({
+        "body": {"property": {"elements": [
+            {"tag": "list", "property": {"items": [
+                {"elements": [
+                    {"tag": "plain_text", "property": {"content": "First item"}}
+                ], "level": 0, "order": 1, "type": "ol"},
+                {"elements": [
+                    {"tag": "plain_text", "property": {"content": "Second item"}}
+                ], "level": 0, "order": 2, "type": "ol"},
+            ]}},
+        ]}, "tag": "body"},
+    })}
+    result = bridge_parsers.parse_interactive_content(card)
+    assert "First item" in result
+    assert "Second item" in result
+
+
+def test_parse_interactive_content_property_br_hr():
+    """parse_interactive_content handles br and hr elements."""
+    card = {"json_card": json.dumps({
+        "body": {"property": {"elements": [
+            {"tag": "plain_text", "property": {"content": "Before"}},
+            {"tag": "br", "property": {}},
+            {"tag": "plain_text", "property": {"content": "After"}},
+            {"tag": "hr", "property": {}},
+            {"tag": "plain_text", "property": {"content": "End"}},
+        ]}, "tag": "body"},
+    })}
+    result = bridge_parsers.parse_interactive_content(card)
+    assert "Before" in result
+    assert "After" in result
+    assert "---" in result
+    assert "End" in result
+
+
 def test_worker_preserves_quote_context_on_card_refetch():
     """When a card message has a quote, re-fetch replaces only the placeholder."""
     captured = {}

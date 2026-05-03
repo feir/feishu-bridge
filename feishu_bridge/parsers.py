@@ -92,21 +92,60 @@ def _walk_property_elements(elements: list, parts: list) -> None:
 
     CardKit raw format wraps every element in a ``property`` dict:
     ``element.property.content`` for leaf text, ``element.property.elements``
-    for nested containers.  This is the structure returned by Feishu API
-    for cross-bot forwarded cards (via ``json_card``).
+    for nested containers.  Also handles ``property.items`` (lists) and
+    ``property.rows`` (tables).
     """
     for el in elements:
         if not isinstance(el, dict):
             continue
+        tag = el.get("tag", "")
         prop = el.get("property", {})
         if not isinstance(prop, dict):
             continue
-        # Leaf text
+
+        if tag == "br":
+            parts.append("")
+            continue
+        if tag == "hr":
+            parts.append("---")
+            continue
+
+        # Leaf text (plain_text, code_span, etc.)
         if "content" in prop:
             parts.append(prop["content"])
-        # Nested container
+        # Nested container (heading, markdown, etc.)
         if "elements" in prop:
             _walk_property_elements(prop["elements"], parts)
+        # List items
+        if "items" in prop:
+            for item in prop["items"]:
+                if isinstance(item, dict) and "elements" in item:
+                    _walk_property_elements(item["elements"], parts)
+        # Table rows
+        if "rows" in prop:
+            for row in prop["rows"]:
+                if not isinstance(row, dict):
+                    continue
+                row_parts: list[str] = []
+                for col_key in sorted(row.keys()):
+                    cell = row[col_key]
+                    if not isinstance(cell, dict):
+                        continue
+                    data = cell.get("data", {})
+                    if isinstance(data, dict):
+                        cell_parts: list[str] = []
+                        cell_prop = data.get("property", {})
+                        if isinstance(cell_prop, dict):
+                            if "content" in cell_prop:
+                                cell_parts.append(cell_prop["content"])
+                            if "elements" in cell_prop:
+                                _walk_property_elements(
+                                    cell_prop["elements"], cell_parts)
+                        if cell_parts:
+                            row_parts.append(
+                                " ".join(p for p in cell_parts if p))
+                if row_parts:
+                    parts.append(" | ".join(row_parts))
 
 
 def parse_interactive_content(content: dict) -> Optional[str]:
