@@ -522,6 +522,37 @@ def test_parse_interactive_content_property_table():
     assert "Submit | FAIL" in result
 
 
+def test_parse_interactive_content_property_table_column_order():
+    """Column order follows columns metadata, not lexicographic key sort.
+
+    Regression test: with 11 columns, lexicographic sort gives 0,1,10,2,...
+    The fix reads column order from prop["columns"][*]["name"].
+    """
+    cols = [{"displayName": f"C{i}", "name": str(i)} for i in range(11)]
+    row = {
+        str(i): {"data": {"property": {"elements": [
+            {"tag": "plain_text", "property": {"content": f"v{i}"}}
+        ]}, "tag": "markdown"}}
+        for i in range(11)
+    }
+    card = {"json_card": json.dumps({
+        "body": {"property": {"elements": [
+            {"tag": "table", "property": {
+                "columns": cols,
+                "rows": [row],
+                "pageSize": 20,
+                "freezeFirstColumn": False,
+                "headerStyle": {},
+            }},
+        ]}, "tag": "body"},
+    })}
+    result = bridge_parsers.parse_interactive_content(card)
+    # Correct order: v0 | v1 | v2 | ... | v10
+    assert "v0 | v1 | v2 | v3 | v4 | v5 | v6 | v7 | v8 | v9 | v10" in result
+    # Lexicographic wrong order would produce v0 | v1 | v10 | v2 | ...
+    assert "v1 | v10 | v2" not in result
+
+
 def test_parse_interactive_content_property_list():
     """parse_interactive_content extracts list items from property format."""
     card = {"json_card": json.dumps({
@@ -542,7 +573,7 @@ def test_parse_interactive_content_property_list():
 
 
 def test_parse_interactive_content_property_br_hr():
-    """parse_interactive_content handles br and hr elements."""
+    """br emits a blank line; hr emits '---'."""
     card = {"json_card": json.dumps({
         "body": {"property": {"elements": [
             {"tag": "plain_text", "property": {"content": "Before"}},
@@ -553,10 +584,11 @@ def test_parse_interactive_content_property_br_hr():
         ]}, "tag": "body"},
     })}
     result = bridge_parsers.parse_interactive_content(card)
-    assert "Before" in result
-    assert "After" in result
+    # br produces a blank line between Before and After
+    assert "Before\n\nAfter" in result
+    # hr produces a --- separator
     assert "---" in result
-    assert "End" in result
+    assert result.endswith("End")
 
 
 def test_worker_preserves_quote_context_on_card_refetch():

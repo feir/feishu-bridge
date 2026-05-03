@@ -123,12 +123,17 @@ def _walk_property_elements(elements: list, parts: list) -> None:
                     _walk_property_elements(item["elements"], parts)
         # Table rows
         if "rows" in prop:
+            # Use declared column order from metadata; fall back to sorted keys.
+            col_order = [c["name"] for c in prop.get("columns", [])
+                         if isinstance(c, dict) and "name" in c]
             for row in prop["rows"]:
                 if not isinstance(row, dict):
                     continue
+                keys = col_order if col_order else sorted(
+                    row.keys(), key=lambda k: int(k) if k.isdigit() else k)
                 row_parts: list[str] = []
-                for col_key in sorted(row.keys()):
-                    cell = row[col_key]
+                for col_key in keys:
+                    cell = row.get(col_key)
                     if not isinstance(cell, dict):
                         continue
                     data = cell.get("data", {})
@@ -195,7 +200,9 @@ def parse_interactive_content(content: dict) -> Optional[str]:
         if prop_elements:
             parts: list[str] = []
             _walk_property_elements(prop_elements, parts)
-            text_result = "\n".join(p for p in parts if p)
+            # Keep empty strings (br sentinels) to preserve blank lines;
+            # strip leading/trailing whitespace only.
+            text_result = "\n".join(parts).strip()
             if text_result:
                 return text_result
 
