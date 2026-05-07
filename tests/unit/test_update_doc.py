@@ -1,73 +1,15 @@
-"""Tests for update-doc: CLI validation (P1) + FeishuDocs.update() payload."""
+"""Tests for update-doc: CLI validation + FeishuDocs.update() payload."""
 
 import json
-import subprocess
-import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from feishu_bridge.api.docs import FeishuDocs
 
 
-# ---------------------------------------------------------------------------
-# Helper: run feishu-cli as subprocess to test argparse validation
-# ---------------------------------------------------------------------------
-
-def _run_cli(*args):
-    """Run feishu-cli with given args, return (returncode, stdout, stderr)."""
-    result = subprocess.run(
-        [sys.executable, "-m", "feishu_bridge.cli", *args],
-        capture_output=True, text=True, timeout=10,
-    )
-    return result.returncode, result.stdout, result.stderr
-
-
 # ===========================================================================
-# CLI argparse-level validation
-# ===========================================================================
-
-class TestUpdateDocCLIValidation:
-    """Test argparse-level validation for update-doc command."""
-
-    def test_mode_required(self):
-        """--mode is required (no default)."""
-        rc, out, err = _run_cli("update-doc", "--token", "tok", "--markdown", "x")
-        assert rc != 0
-        assert "required" in err.lower() or "mode" in err.lower()
-
-    def test_mode_choices_reject_typo(self):
-        """Invalid mode is rejected by argparse choices."""
-        rc, out, err = _run_cli(
-            "update-doc", "--token", "tok", "--markdown", "x",
-            "--mode", "overwriteX",
-        )
-        assert rc != 0
-        assert "invalid choice" in err.lower()
-
-    def test_mode_choices_accept_all_valid(self):
-        """All 7 valid modes pass argparse (may fail later at auth)."""
-        valid_modes = [
-            "overwrite", "append", "replace_range", "replace_all",
-            "insert_before", "insert_after", "delete_range",
-        ]
-        for mode in valid_modes:
-            extra = []
-            if mode in ("replace_range", "insert_before", "insert_after", "delete_range"):
-                extra = ["--selection", "some...text"]
-            if mode not in ("delete_range", "replace_all"):
-                extra += ["--markdown", "content"]
-            rc, out, err = _run_cli(
-                "update-doc", "--token", "tok", "--mode", mode, *extra,
-            )
-            # Should NOT fail at argparse level (will fail at config/auth)
-            if rc != 0:
-                assert "invalid choice" not in err.lower(), f"mode '{mode}' rejected by argparse"
-
-
-# ===========================================================================
-# CLI handler-level validation (requires env setup to reach handler)
-# We test these via direct function invocation by patching
+# CLI handler-level validation
 # ===========================================================================
 
 class TestUpdateDocHandlerValidation:

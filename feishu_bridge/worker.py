@@ -749,7 +749,7 @@ def process_message(
                         # Wiki links need doc token for node resolution
                         if not feishu_docs or not _doc_token:
                             fetched_parts.append(
-                                f"[飞书链接 wiki/{url_token}: 未授权，使用 feishu-cli 命令时将自动触发授权]"
+                                f"[飞书链接 wiki/{url_token}: 未授权，使用 lark docs +fetch --doc {url_token} 查看]"
                             )
                             continue
                         try:
@@ -773,7 +773,7 @@ def process_message(
                             # Redirect to sheets handler
                             if not feishu_sheets or not _sheet_token:
                                 fetched_parts.append(
-                                    f"[飞书表格 {url_token}: 未授权，使用 feishu-cli 命令时将自动触发授权]"
+                                    f"[飞书表格 {url_token}: 未授权，使用 lark sheets +read --token {url_token} 查看]"
                                 )
                                 continue
                             result = feishu_sheets.info(
@@ -801,7 +801,7 @@ def process_message(
                         if not md:
                             md = result.get("text", str(result))
                         header = f"[飞书文档: {title}]" if title else f"[飞书文档 {url_token}]"
-                        cli_hint = f"feishu-cli read-doc --token {obj_token}"
+                        cli_hint = f"lark docs +fetch --doc {obj_token}"
                         if _doc_url_count >= 2 and len(md) > 200:
                             preview = md[:200].rstrip()
                             fetched_parts.append(
@@ -818,7 +818,7 @@ def process_message(
                     if url_type in ("doc", "docx"):
                         if not feishu_docs or not _doc_token:
                             fetched_parts.append(
-                                f"[飞书链接 {url_type}/{url_token}: 未授权，使用 feishu-cli 命令时将自动触发授权]"
+                                f"[飞书链接 {url_type}/{url_token}: 未授权，使用 lark docs +fetch --doc {url_token} 查看]"
                             )
                             continue
                         result = feishu_docs.fetch(
@@ -830,7 +830,7 @@ def process_message(
                         if not md:
                             md = result.get("text", str(result))
                         header = f"[飞书文档: {title}]" if title else f"[飞书文档 {url_token}]"
-                        cli_hint = f"feishu-cli read-doc --token {url_token}"
+                        cli_hint = f"lark docs +fetch --doc {url_token}"
                         if _doc_url_count >= 2 and len(md) > 200:
                             preview = md[:200].rstrip()
                             fetched_parts.append(
@@ -846,7 +846,7 @@ def process_message(
                     elif url_type == "sheets":
                         if not feishu_sheets or not _sheet_token:
                             fetched_parts.append(
-                                f"[飞书链接 sheets/{url_token}: 未授权，使用 feishu-cli 命令时将自动触发授权]"
+                                f"[飞书链接 sheets/{url_token}: 未授权，使用 lark sheets +read --token {url_token} 查看]"
                             )
                             continue
                         result = feishu_sheets.info(
@@ -1021,7 +1021,7 @@ def process_message(
             )
             text = "\n".join(prompt_parts)
 
-        # --- Env injection for hooks and feishu-cli ---
+        # --- Env injection for hooks and CLI tools ---
         env_extra = {
             "FEISHU_CHAT_ID": chat_id,
             "FEISHU_BOT_ID": bot_id,

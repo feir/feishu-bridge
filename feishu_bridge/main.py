@@ -78,10 +78,6 @@ from feishu_bridge.api.tasks import FeishuTasks
 from feishu_bridge.api.docs import FeishuDocs
 from feishu_bridge.api.sheets import FeishuSheets
 from feishu_bridge.api.bitable import FeishuBitable
-from feishu_bridge.api.wiki import FeishuWiki
-from feishu_bridge.api.comments import FeishuComments
-from feishu_bridge.api.calendar import FeishuCalendar
-from feishu_bridge.api.search import FeishuSearch
 
 _FEISHU_SERVICES_OK = True  # All deps are declared in pyproject.toml
 
@@ -758,19 +754,11 @@ class FeishuBot:
             self.feishu_docs = FeishuDocs(*_args)
             self.feishu_sheets = FeishuSheets(*_args)
             self.feishu_bitable = FeishuBitable(*_args)
-            self.feishu_wiki = FeishuWiki(*_args)
-            self.feishu_comments = FeishuComments(*_args)
-            self.feishu_calendar = FeishuCalendar(*_args)
-            self.feishu_search = FeishuSearch(*_args)
         else:
             self.feishu_tasks = None
             self.feishu_docs = None
             self.feishu_sheets = None
             self.feishu_bitable = None
-            self.feishu_wiki = None
-            self.feishu_comments = None
-            self.feishu_calendar = None
-            self.feishu_search = None
             log.warning("Feishu API services unavailable (missing dependencies)")
 
     def switch_provider(self, provider_name: str) -> tuple[bool, str]:
