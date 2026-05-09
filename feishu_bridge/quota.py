@@ -166,6 +166,7 @@ class QuotaPoller:
         self._org_uuid = org_uuid
         self._session_key: str | None = None
         self._session_key_expires: float = 0.0
+        self._cookie_mtime: float = 0.0
         self._snapshot = QuotaSnapshot()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -191,6 +192,10 @@ class QuotaPoller:
             log.warning("No sessionKey in %s — quota poller disabled",
                         self._cookie_path)
             return
+        try:
+            self._cookie_mtime = self._cookie_path.stat().st_mtime
+        except OSError:
+            self._cookie_mtime = 0.0
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run, name="quota-poller", daemon=True,
@@ -205,6 +210,7 @@ class QuotaPoller:
 
     def force_refresh(self) -> QuotaSnapshot:
         """Synchronous one-shot refresh (for /status command)."""
+        self._maybe_reload_cookie()
         if not self._session_key:
             self._session_key, self._session_key_expires = _load_session_key(self._cookie_path)
         snap = self._fetch()
@@ -222,7 +228,22 @@ class QuotaPoller:
                 break
             self._poll_once()
 
+    def _maybe_reload_cookie(self):
+        """Reload session key if the cookie file was modified on disk."""
+        try:
+            mtime = self._cookie_path.stat().st_mtime
+        except OSError:
+            return
+        if mtime > self._cookie_mtime:
+            old_expires = self._session_key_expires
+            self._session_key, self._session_key_expires = _load_session_key(self._cookie_path)
+            self._cookie_mtime = mtime
+            if self._session_key_expires != old_expires:
+                log.info("Cookie file changed — reloaded sessionKey (expires %s)",
+                         time.strftime("%Y-%m-%d %H:%M", time.localtime(self._session_key_expires)))
+
     def _poll_once(self):
+        self._maybe_reload_cookie()
         snap = self._fetch()
         with self._lock:
             self._snapshot = snap
