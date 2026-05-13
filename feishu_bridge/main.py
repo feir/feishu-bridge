@@ -1372,6 +1372,7 @@ class FeishuBot:
                 key = (self.bot_id, chat_id, thread_id)
                 tag = SessionMap.format_key(key)
                 self.runner.cancel(tag)
+                self._chat_queue.drain(tag)
                 # Session delete deferred to worker under chat lock
             elif cmd in ("/stop", "/cancel"):
                 # Owner guard: destructive command in group chat
