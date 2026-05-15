@@ -3846,6 +3846,9 @@ def test_process_message_stale_local_sid():
         def supports_compact(self):
             return False
 
+        def supports_auto_compact(self):
+            return False
+
         def get_session_not_found_signatures(self):
             return []
 
@@ -3899,6 +3902,9 @@ def test_cost_store_no_ops_for_local():
             return False
 
         def supports_compact(self):
+            return False
+
+        def supports_auto_compact(self):
             return False
 
         def get_session_not_found_signatures(self):

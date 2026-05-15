@@ -56,6 +56,7 @@ from feishu_bridge.runtime import (
     materialize_data_files,
     _resource_stack,
 )
+from feishu_bridge.runtime_alma import AlmaRunner
 from feishu_bridge.runtime_pi import PiRunner
 
 
@@ -134,6 +135,7 @@ _RUNNER_CLASSES: dict[str, type[BaseRunner]] = {
     "claude": ClaudeRunner,
     "codex": CodexRunner,
     "pi": PiRunner,
+    "alma": AlmaRunner,
 }
 
 
@@ -478,15 +480,24 @@ def load_config(config_path: str, bot_name: str) -> dict:
     except ConfigError as e:
         log.error("Invalid agent config: %s", e)
         sys.exit(1)
-    resolved_cmd, agent_cmd = resolve_effective_agent_command(agent_cfg, agent_type)
-    if not resolved_cmd:
-        log.error(
-            "Agent command '%s' not found in PATH. "
-            "Set absolute path in config or update PATH.", agent_cmd
-        )
-        sys.exit(1)
-    agent_cfg["_resolved_command"] = resolved_cmd
-    log.info("Agent CLI (%s): %s", agent_type, resolved_cmd)
+    if agent_type == "alma":
+        agent_cfg["command"] = None
+        agent_cfg["_resolved_command"] = None
+        ok, preflight_msg = AlmaRunner.preflight_check()
+        if not ok:
+            log.error("Alma preflight failed: %s", preflight_msg)
+            sys.exit(1)
+        log.info("Agent type: alma (WS API, no CLI binary)")
+    else:
+        resolved_cmd, agent_cmd = resolve_effective_agent_command(agent_cfg, agent_type)
+        if not resolved_cmd:
+            log.error(
+                "Agent command '%s' not found in PATH. "
+                "Set absolute path in config or update PATH.", agent_cmd
+            )
+            sys.exit(1)
+        agent_cfg["_resolved_command"] = resolved_cmd
+        log.info("Agent CLI (%s): %s", agent_type, resolved_cmd)
 
     # ------------------------------------------------------------------
     # group_policy validation
@@ -576,6 +587,18 @@ def create_runner(agent_cfg: dict, bot_cfg: dict,
     prompt_cfg = resolve_prompt_config(agent_cfg)
     profile = _provider_profile(agent_cfg)
     workspace = profile.get("workspace") or bot_cfg["workspace"]
+
+    if agent_type == "alma":
+        return runner_cls(
+            model=model,
+            workspace=workspace,
+            timeout=agent_cfg.get("timeout_seconds", DEFAULT_TIMEOUT),
+            bot_id=bot_cfg["name"],
+            max_budget_usd=agent_cfg.get("max_budget_usd"),
+            extra_system_prompts=extra_prompts,
+            safety_prompt_mode=str(prompt_cfg.get("safety", "full")),
+        )
+
     kwargs = dict(
         command=agent_cfg["_resolved_command"],
         model=model,
@@ -763,6 +786,8 @@ class FeishuBot:
 
     def switch_provider(self, provider_name: str) -> tuple[bool, str]:
         """Hot-swap the active provider profile for the current agent."""
+        if self.agent_config.get("type") == "alma":
+            return False, "当前使用 Alma，请用 `/agent` 切换 runner。"
         target = (provider_name or "").strip().lower()
         profiles = self.agent_config.get("providers", {"default": {}})
         if target not in profiles:
@@ -839,6 +864,12 @@ class FeishuBot:
                 self.agent_config.get("_resolved_command"),
             )
 
+        # Preflight gate for Alma
+        if target_type == "alma":
+            ok, msg = AlmaRunner.preflight_check()
+            if not ok:
+                return False, msg, None
+
         next_cfg = dict(self.agent_config)
         next_cfg["type"] = target_type
         next_cfg["commands"] = _normalize_agent_commands(next_cfg)
@@ -849,16 +880,22 @@ class FeishuBot:
         except ConfigError as e:
             return False, f"Agent 切换失败: {e}", None
 
-        resolved_cmd, configured_cmd = resolve_effective_agent_command(next_cfg, target_type)
-        if not resolved_cmd:
-            return (
-                False,
-                f"Agent 命令 `{configured_cmd}` 未在 PATH 中找到，无法切换到 `{target_type}`。",
-                None,
-            )
-
-        next_cfg["command"] = configured_cmd
-        next_cfg["_resolved_command"] = resolved_cmd
+        resolved_cmd = None
+        configured_cmd = None
+        if target_type == "alma":
+            next_cfg["command"] = None
+            next_cfg["_resolved_command"] = None
+            resolved_cmd = "alma (WS)"
+        else:
+            resolved_cmd, configured_cmd = resolve_effective_agent_command(next_cfg, target_type)
+            if not resolved_cmd:
+                return (
+                    False,
+                    f"Agent 命令 `{configured_cmd}` 未在 PATH 中找到，无法切换到 `{target_type}`。",
+                    None,
+                )
+            next_cfg["command"] = configured_cmd
+            next_cfg["_resolved_command"] = resolved_cmd
 
         # Agent type changed → re-normalize prompt block with new type,
         # using the raw user-supplied prompt to avoid leaking materialized

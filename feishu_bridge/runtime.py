@@ -373,7 +373,7 @@ class BaseRunner(ABC):
         "NEVER restart, stop, or reload feishu-bridge itself."
     )
 
-    def __init__(self, command: str, model: Optional[str], workspace: str, timeout: int,
+    def __init__(self, command: Optional[str], model: Optional[str], workspace: str, timeout: int,
                  max_budget_usd: Optional[float] = None,
                  extra_system_prompts: Optional[list[str]] = None,
                  extra_cli_args: Optional[list[str]] = None,
@@ -442,6 +442,10 @@ class BaseRunner(ABC):
     def supports_compact(self) -> bool:
         """是否支持 /compact 命令。"""
         return True
+
+    def supports_auto_compact(self) -> bool:
+        """Whether IdleCompactManager should track this runner's sessions."""
+        return self.supports_compact()
 
     def has_session(self, session_id: str) -> bool:
         """Whether this runner holds state for the given session_id.

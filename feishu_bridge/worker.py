@@ -1228,7 +1228,7 @@ def process_message(
                 )
 
             # --- Idle auto-compact timer ---
-            if not result["is_error"] and runner.supports_compact():
+            if not result["is_error"] and runner.supports_auto_compact():
                 _usage = result.get("last_call_usage") or result.get("usage") or {}
                 _total_ctx = (_usage.get("input_tokens", 0)
                               + _usage.get("cache_read_input_tokens", 0)
