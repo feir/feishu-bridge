@@ -117,6 +117,32 @@ class TestEventConsumption:
         assert result["is_error"] is False
         assert outputs == ["Hello ", "Hello world"]
 
+    def test_deltas_array_format(self, runner):
+        """Alma sends data.deltas[] (array), not data.delta (singular)."""
+        events = [
+            {"type": "message_delta", "data": {
+                "threadId": "t1",
+                "messageId": "m1",
+                "deltas": [
+                    {"type": "text_append", "text": "Hello ",
+                     "partIndex": 1, "partType": "text", "seq": 1},
+                ],
+            }},
+            {"type": "message_delta", "data": {
+                "threadId": "t1",
+                "messageId": "m1",
+                "deltas": [
+                    {"type": "text_append", "text": "world",
+                     "partIndex": 1, "partType": "text", "seq": 2},
+                ],
+            }},
+            {"type": "generation_completed", "data": {"threadId": "t1"}},
+        ]
+        result, outputs, _ = self._run_consume(runner, events)
+        assert result["result"] == "Hello world"
+        assert result["is_error"] is False
+        assert outputs == ["Hello ", "Hello world"]
+
     def test_tool_invocation_tracking(self, runner):
         events = [
             {"type": "message_delta", "data": {

@@ -536,40 +536,47 @@ class AlmaRunner(BaseRunner):
                 }
 
             if etype == "message_delta":
-                delta = (event.get("data") or {}).get("delta") or {}
-                dt = delta.get("type", "")
+                data_obj = event.get("data") or {}
+                deltas = data_obj.get("deltas") or []
+                if not deltas:
+                    delta = data_obj.get("delta") or {}
+                    if delta:
+                        deltas = [delta]
 
-                if dt == "text_append":
-                    accumulated += delta.get("text", "")
-                    if on_output:
-                        on_output(accumulated)
+                for delta in deltas:
+                    dt = delta.get("type", "")
 
-                elif dt == "part_add":
-                    part = delta.get("part") or {}
-                    if part.get("type") == "tool-invocation":
-                        tcid = part.get("toolCallId", "")
-                        raw_name = part.get("toolName", "")
-                        name = _TOOL_NAME_MAP.get(
-                            raw_name.lower(), raw_name.title()
-                        )
-                        hint = _extract_hint_data(name, part.get("args") or {})
-                        idx = len(tool_status)
-                        tool_calls[tcid] = idx
-                        tool_status.append({
-                            "name": name,
-                            "hint_data": hint,
-                            "status": "running",
-                        })
-                        if on_tool_status:
-                            on_tool_status(list(tool_status))
+                    if dt == "text_append":
+                        accumulated += delta.get("text", "")
+                        if on_output:
+                            on_output(accumulated)
 
-                elif dt == "tool_output_set":
-                    tcid = delta.get("toolCallId", "")
-                    idx = tool_calls.get(tcid)
-                    if idx is not None and idx < len(tool_status):
-                        tool_status[idx]["status"] = "done"
-                        if on_tool_status:
-                            on_tool_status(list(tool_status))
+                    elif dt == "part_add":
+                        part = delta.get("part") or {}
+                        if part.get("type") == "tool-invocation":
+                            tcid = part.get("toolCallId", "")
+                            raw_name = part.get("toolName", "")
+                            name = _TOOL_NAME_MAP.get(
+                                raw_name.lower(), raw_name.title()
+                            )
+                            hint = _extract_hint_data(name, part.get("args") or {})
+                            idx = len(tool_status)
+                            tool_calls[tcid] = idx
+                            tool_status.append({
+                                "name": name,
+                                "hint_data": hint,
+                                "status": "running",
+                            })
+                            if on_tool_status:
+                                on_tool_status(list(tool_status))
+
+                    elif dt == "tool_output_set":
+                        tcid = delta.get("toolCallId", "")
+                        idx = tool_calls.get(tcid)
+                        if idx is not None and idx < len(tool_status):
+                            tool_status[idx]["status"] = "done"
+                            if on_tool_status:
+                                on_tool_status(list(tool_status))
 
             elif etype == "context_usage_update":
                 d = event.get("data") or {}
@@ -580,7 +587,8 @@ class AlmaRunner(BaseRunner):
                 log.info("Alma context: %d/%d (%.0f%%)", used, total, pct)
 
             elif etype == "generation_completed":
-                # Handle tool-only responses without text content
+                log.info("Alma generation_completed: accumulated=%d chars, tools=%d",
+                         len(accumulated), len(tool_status))
                 result_text = accumulated
                 if not result_text.strip() and tool_status:
                     # Generate a meaningful message for tool-only responses
