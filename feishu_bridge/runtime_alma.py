@@ -77,8 +77,8 @@ def _is_alma_running() -> bool:
         return False
 
 
-def _create_alma_thread() -> str:
-    resp = _alma_http("POST", "/api/threads", {})
+def _create_alma_thread(title: str = "feishu-bridge") -> str:
+    resp = _alma_http("POST", "/api/threads", {"title": title})
     thread_id = resp.get("id") or resp.get("threadId")
     if not thread_id:
         raise RuntimeError(f"Alma create-thread returned no ID: {resp}")
