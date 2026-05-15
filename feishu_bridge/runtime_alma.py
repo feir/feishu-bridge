@@ -580,8 +580,18 @@ class AlmaRunner(BaseRunner):
                 log.info("Alma context: %d/%d (%.0f%%)", used, total, pct)
 
             elif etype == "generation_completed":
+                # Handle tool-only responses without text content
+                result_text = accumulated
+                if not result_text.strip() and tool_status:
+                    # Generate a meaningful message for tool-only responses
+                    tool_names = [t["name"] for t in tool_status]
+                    if len(tool_names) == 1:
+                        result_text = f"✓ 已执行 {tool_names[0]}"
+                    else:
+                        result_text = f"✓ 已执行 {len(tool_names)} 个工具: {', '.join(tool_names)}"
+                
                 return {
-                    "result": accumulated,
+                    "result": result_text,
                     "session_id": session_id,
                     "is_error": False,
                     "total_cost_usd": None,
