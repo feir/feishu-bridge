@@ -77,6 +77,33 @@ def _is_alma_running() -> bool:
         return False
 
 
+def _generate_thread_title(prompt: str) -> str:
+    """Generate a meaningful thread title from user prompt."""
+    # Clean the prompt
+    clean_prompt = prompt.strip()
+    
+    # Remove common command prefixes
+    prefixes_to_remove = ["/", "请", "帮我", "你能", "可以", "能不能", "help", "please"]
+    for prefix in prefixes_to_remove:
+        if clean_prompt.lower().startswith(prefix.lower()):
+            clean_prompt = clean_prompt[len(prefix):].strip()
+    
+    # Take first meaningful sentence/phrase (max 50 chars)
+    lines = clean_prompt.split('\n')
+    first_line = lines[0].strip()
+    
+    if len(first_line) <= 50:
+        return first_line if first_line else "新对话"
+    else:
+        # Truncate at word boundary or punctuation
+        truncated = first_line[:47]
+        # Find last space, comma, or period within the limit
+        for i in range(46, 20, -1):
+            if truncated[i] in ' ，。！？,.:!?':
+                return truncated[:i+1].rstrip()
+        return truncated + "..."
+
+
 def _create_alma_thread(title: str = "feishu-bridge") -> str:
     resp = _alma_http("POST", "/api/threads", {"title": title})
     thread_id = resp.get("id") or resp.get("threadId")
@@ -384,7 +411,8 @@ class AlmaRunner(BaseRunner):
 
     # ── thread mapping ──
 
-    def _resolve_thread(self, session_key: str, *, force_new: bool = False) -> str:
+    def _resolve_thread(self, session_key: str, *, force_new: bool = False, 
+                       prompt: Optional[str] = None) -> str:
         if not force_new:
             thread_id = self._thread_map.get(session_key)
             if thread_id:
@@ -393,10 +421,16 @@ class AlmaRunner(BaseRunner):
                 log.warning("Alma thread %s gone; creating replacement",
                             thread_id)
 
-        thread_id = _create_alma_thread()
+        # Generate a meaningful title from the prompt
+        if prompt:
+            title = _generate_thread_title(prompt)
+        else:
+            title = "feishu-bridge"
+        
+        thread_id = _create_alma_thread(title)
         self._thread_map.put(session_key, thread_id)
-        log.info("Created Alma thread %s for session %s",
-                 thread_id, session_key[:24])
+        log.info("Created Alma thread %s for session %s with title: %s",
+                 thread_id, session_key[:24], title)
         return thread_id
 
     def clear_thread(self, session_key: str):
@@ -456,7 +490,8 @@ class AlmaRunner(BaseRunner):
 
         force_new = not resume
         try:
-            thread_id = self._resolve_thread(session_key, force_new=force_new)
+            thread_id = self._resolve_thread(session_key, force_new=force_new, 
+                                           prompt=prompt if force_new else None)
         except (ConnectionError, RuntimeError) as e:
             return {
                 "result": f"Alma thread 创建失败: {e}",
