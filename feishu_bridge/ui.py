@@ -1394,6 +1394,8 @@ class ResponseHandle:
             text = optimize_markdown_style(text)
             # 流式阶段超长时只显示尾部，防止CardKit API静默失败
             if len(text) > MAX_DIV_CHARS:
+                log.warning("Streaming text truncated: %d chars -> %d chars (prevent CardKit failure)",
+                           len(text), COMPACT_MAX_CHARS + 10)  # +10 for prefix
                 text = "…（前文已省略）\n\n" + text[-COMPACT_MAX_CHARS:]
             self._update_element(CARDKIT_ELEMENT_ID, text)
         elif self.card_message_id:
