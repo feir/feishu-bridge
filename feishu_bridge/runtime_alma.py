@@ -273,7 +273,7 @@ class AlmaWSManager:
                 time.sleep(0.1)
                 continue
             try:
-                ws.settimeout(1.0)
+                ws.settimeout(30.0)  # 增加到30秒，防止长时间思考时事件丢失
                 data = ws.recv()
                 if not data:
                     continue

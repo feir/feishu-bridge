@@ -357,7 +357,7 @@ CARDKIT_TODO_ELEMENT_ID = "todo_progress"
 CARDKIT_THROTTLE_MS = 100
 PATCH_THROTTLE_MS = 1500
 GAP_THRESHOLD_MS = 2000
-BATCH_AFTER_GAP_MS = 300
+BATCH_AFTER_GAP_MS = 100  # 降低gap后的恢复延迟，从300ms减少到100ms
 
 # Bot display name (fetched from Feishu API at startup)
 _bot_display_name = "Claude Code"
@@ -494,6 +494,8 @@ class FlushController:
         self._timer: Optional[threading.Timer] = None
         self._card_ready = False
         self._closed = False
+        self._consecutive_failures = 0
+        self._FAILURE_THRESHOLD = 5
 
     def set_card_ready(self):
         with self._lock:
@@ -582,7 +584,12 @@ class FlushController:
     def _do_flush(self, text: str):
         try:
             self._flush_fn(text)
+            self._consecutive_failures = 0  # 成功重置计数
         except Exception:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._FAILURE_THRESHOLD:
+                log.error("FlushController: %d consecutive failures, streaming may be stalled",
+                          self._consecutive_failures)
             log.exception("FlushController flush error")
         finally:
             with self._lock:
@@ -1385,6 +1392,9 @@ class ResponseHandle:
             self._update_summary_to_typing()
             text = strip_action_markers(text)
             text = optimize_markdown_style(text)
+            # 流式阶段超长时只显示尾部，防止CardKit API静默失败
+            if len(text) > MAX_DIV_CHARS:
+                text = "…（前文已省略）\n\n" + text[-COMPACT_MAX_CHARS:]
             self._update_element(CARDKIT_ELEMENT_ID, text)
         elif self.card_message_id:
             self._try_patch(self.card_message_id, build_streaming_card(text))
