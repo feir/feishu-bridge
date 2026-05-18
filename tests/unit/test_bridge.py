@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import threading
 import types
 
 import pytest
@@ -3102,6 +3103,7 @@ def test_context_command_unknown_window_message(tmp_path):
 
 def _make_model_command_bot(model_aliases, initial_model):
     from feishu_bridge.commands import BridgeCommandHandler  # noqa: F401
+    from feishu_bridge.runtime_state import RuntimeState
 
     bot = object.__new__(bridge.FeishuBot)
     bot.bot_id = "b1"
@@ -3109,6 +3111,11 @@ def _make_model_command_bot(model_aliases, initial_model):
     bot.session_map = {}
     bot.model_aliases = dict(model_aliases)
     bot.runner = types.SimpleNamespace(model=initial_model)
+    bot.bot_config = {"model": initial_model}
+    bot.agent_config = {"type": "claude", "provider": "default", "providers": {"default": {}}}
+    bot._state_lock = threading.RLock()
+    bot._runtime_state = RuntimeState()
+    bot._runtime_state_path = bridge.Path("/tmp/_test_runtime_state.json")
     return bot
 
 
@@ -3141,21 +3148,21 @@ def test_model_command_alias_switches_runner_model(monkeypatch):
     assert bot.runner.model == "claude-opus-4-7"
     assert "claude-opus-4-7" in captured[-1]
 
-    # Exact full-name match → stays, no passthrough label
+    # Exact full-name match → stays
     handler.handle_bridge_command({
         "chat_id": "c1", "bot_id": "b1",
         "_bridge_command": "model", "_cmd_arg": "claude-sonnet-4-6",
     })
     assert bot.runner.model == "claude-sonnet-4-6"
-    assert "未识别" not in captured[-1]
+    assert "claude-sonnet-4-6" in captured[-1]
 
-    # Unknown name → passthrough to CLI with warning label
+    # Unknown name → passthrough (set_model treats as passthrough)
     handler.handle_bridge_command({
         "chat_id": "c1", "bot_id": "b1",
         "_bridge_command": "model", "_cmd_arg": "gpt-5",
     })
     assert bot.runner.model == "gpt-5"
-    assert "未识别" in captured[-1]
+    assert "gpt-5" in captured[-1]
 
 
 def test_model_command_display_cli_default_when_no_model(monkeypatch):
@@ -3185,6 +3192,8 @@ def test_model_command_display_cli_default_when_no_model(monkeypatch):
 
 def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path):
     """Bot-level agent switch rebuilds runner and clears incompatible sessions."""
+    from feishu_bridge.runtime_state import RuntimeState
+
     bot = object.__new__(bridge.FeishuBot)
     bot.bot_id = "test-bot"
     bot.bot_config = {"workspace": "/tmp", "model": "claude-opus-4-6"}
@@ -3210,6 +3219,9 @@ def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path)
     )
     bot._extra_prompts = []
     bot._session_cost = {"sid-old": {"usage": {}}}
+    bot._state_lock = threading.RLock()
+    bot._runtime_state = RuntimeState()
+    bot._runtime_state_path = tmp_path / "runtime-state.json"
     bot._session_map_path = tmp_path / "sessions.json"
     bot._session_map_path.write_text(json.dumps({
         "_agent_type": "claude",
@@ -3244,6 +3256,8 @@ def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path)
 
 def test_switch_provider_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path):
     """Provider switch rebuilds runner and clears incompatible sessions."""
+    from feishu_bridge.runtime_state import RuntimeState
+
     bot = object.__new__(bridge.FeishuBot)
     bot.bot_id = "test-bot"
     bot.bot_config = {"workspace": "/tmp", "model": "claude-opus-4-6"}
@@ -3271,6 +3285,9 @@ def test_switch_provider_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_pa
     )
     bot._extra_prompts = []
     bot._session_cost = {"sid-old": {"usage": {}}}
+    bot._state_lock = threading.RLock()
+    bot._runtime_state = RuntimeState()
+    bot._runtime_state_path = tmp_path / "runtime-state.json"
     bot._session_map_path = tmp_path / "sessions.json"
     bot._session_map_path.write_text(json.dumps({
         "_agent_type": "claude",

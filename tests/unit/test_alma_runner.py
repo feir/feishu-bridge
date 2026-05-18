@@ -457,7 +457,10 @@ class TestIntegration:
 
     def test_switch_agent_to_alma_success(self, tmp_path, monkeypatch):
         """switch_agent('alma') succeeds and returns 'alma (WS)' as resolved cmd."""
+        import threading
+
         import feishu_bridge.main as bridge
+        from feishu_bridge.runtime_state import RuntimeState
 
         bot = object.__new__(bridge.FeishuBot)
         bot.bot_id = "test-bot"
@@ -476,6 +479,9 @@ class TestIntegration:
         bot.runner = mock.MagicMock()
         bot._extra_prompts = []
         bot._session_cost = {}
+        bot._state_lock = threading.RLock()
+        bot._runtime_state = RuntimeState()
+        bot._runtime_state_path = tmp_path / "runtime-state.json"
         bot._session_map_path = tmp_path / "sessions.json"
         bot.session_map = mock.MagicMock()
 

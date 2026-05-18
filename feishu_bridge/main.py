@@ -58,6 +58,7 @@ from feishu_bridge.runtime import (
 )
 from feishu_bridge.runtime_alma import AlmaRunner
 from feishu_bridge.runtime_pi import PiRunner
+from feishu_bridge.runtime_state import RuntimeState
 
 
 class ConfigError(ValueError):
@@ -578,12 +579,22 @@ def load_config(config_path: str, bot_name: str) -> dict:
             "workflow": workflow_cfg,
             "all_bot_names": all_bot_names}
 
+def _effective_default_model(agent_cfg: dict, bot_cfg: dict) -> str | None:
+    """Resolve the effective model when no override is active.
+
+    Fallback chain: provider profile model → bot-level model → None (CLI default).
+    Shared by create_runner() and set_model("default").
+    """
+    return resolve_agent_model(agent_cfg, agent_cfg["type"]) or bot_cfg.get("model")
+
+
 def create_runner(agent_cfg: dict, bot_cfg: dict,
-                  extra_prompts: list[str]) -> BaseRunner:
+                  extra_prompts: list[str], *,
+                  model_override: str | None = None) -> BaseRunner:
     """Factory: create the appropriate Runner based on agent.type."""
     agent_type = agent_cfg["type"]
     runner_cls = _RUNNER_CLASSES[agent_type]  # validated in load_config()
-    model = resolve_agent_model(agent_cfg, agent_type) or bot_cfg.get("model")
+    model = model_override or _effective_default_model(agent_cfg, bot_cfg)
     prompt_cfg = resolve_prompt_config(agent_cfg)
     profile = _provider_profile(agent_cfg)
     workspace = profile.get("workspace") or bot_cfg["workspace"]
@@ -702,8 +713,12 @@ class FeishuBot:
             self._group_overrides = {}
         self._session_cost: dict[str, dict] = {}  # sid -> last {usage, model_usage, total_cost_usd}
         self._handled_approvals: set[str] = set()
+        self._state_lock = threading.RLock()
         self._session_map_path = (
             Path(self.workspace) / "state" / "feishu-bridge" / f"sessions-{self.bot_id}.json"
+        )
+        self._runtime_state_path = (
+            Path(self.workspace) / "state" / "feishu-bridge" / f"runtime-state-{self.bot_id}.json"
         )
         try:
             from .ledger import Ledger
@@ -727,6 +742,12 @@ class FeishuBot:
             log.warning("sessions_index disabled (open failed)", exc_info=True)
             self._sessions_index = None
 
+        # Runtime state — load persisted overrides, reconcile with config
+        raw_state = RuntimeState.load(self._runtime_state_path)
+        provider_profiles = _normalize_provider_profiles(self.agent_config)
+        self._runtime_state = raw_state.validate(_RUNNER_CLASSES, provider_profiles)
+        self._reconcile_startup_config(self._runtime_state)
+
         # Components
         self.dedup = MessageDedup(
             ttl=self.dedup_config.get("ttl_seconds", DEDUP_TTL),
@@ -740,6 +761,7 @@ class FeishuBot:
         self.runner = create_runner(
             self.agent_config, self.bot_config,
             self._extra_prompts,
+            model_override=self._runtime_state.model_override,
         )
         self.model_aliases = resolve_model_aliases(self.agent_config)
         self.command_handler = BridgeCommandHandler(self)
@@ -784,6 +806,179 @@ class FeishuBot:
             self.feishu_bitable = None
             log.warning("Feishu API services unavailable (missing dependencies)")
 
+    def _reconcile_startup_config(self, state: RuntimeState) -> None:
+        """If runtime-state overrides type or provider, re-normalize agent_cfg."""
+        cfg = self.agent_config
+        next_cfg = dict(cfg)
+        changed = False
+
+        if state.agent_type and state.agent_type != cfg.get("type"):
+            next_cfg["type"] = state.agent_type
+            changed = True
+        if state.provider and state.provider != resolve_provider_name(cfg):
+            next_cfg["provider"] = state.provider
+            changed = True
+
+        if state.agent_type == "alma":
+            ok, msg = AlmaRunner.preflight_check()
+            if not ok:
+                log.warning("runtime-state: alma preflight failed (%s); discarding agent_type override", msg)
+                next_cfg["type"] = cfg["type"]
+                state.agent_type = None
+                changed = next_cfg.get("provider") != resolve_provider_name(cfg)
+
+        if changed:
+            log.info("Reconciling startup config from runtime-state: type=%s, provider=%s",
+                     next_cfg["type"], resolve_provider_name(next_cfg))
+            try:
+                built_cfg, prompts, runner, _, _ = self._build_config(
+                    dict(next_cfg), model_override=state.model_override)
+                self.agent_config = built_cfg
+                self._extra_prompts = prompts
+                self.runner = runner
+                self.model_aliases = resolve_model_aliases(built_cfg)
+                self.session_map = SessionMap(
+                    self._session_map_path,
+                    agent_type=session_identity(built_cfg),
+                )
+            except ConfigError:
+                log.warning(
+                    "runtime-state reconcile failed (type=%s, provider=%s); "
+                    "discarding overrides, booting on config defaults",
+                    state.agent_type, state.provider, exc_info=True,
+                )
+                state.agent_type = None
+                state.provider = None
+                try:
+                    state.save(self._runtime_state_path)
+                except OSError:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Config change helpers (shared by switch_agent / switch_provider)
+    # ------------------------------------------------------------------
+
+    def _build_config(self, next_cfg: dict, *, model_override: str | None = None
+                      ) -> tuple[dict, list[str], BaseRunner, str | None, str | None]:
+        """Normalize cfg + build runner. No side effects on self.
+
+        Returns (next_cfg, next_prompts, next_runner, resolved_cmd, configured_cmd).
+        Raises ConfigError on normalization/resolution failure.
+        """
+        target_type = next_cfg["type"]
+
+        next_cfg["commands"] = _normalize_agent_commands(next_cfg)
+        next_cfg["args_by_type"] = _normalize_agent_args(next_cfg)
+        next_cfg["env_by_type"] = _normalize_agent_env(next_cfg)
+        next_cfg["providers"] = _normalize_provider_profiles(next_cfg)
+
+        resolved_cmd = configured_cmd = None
+        if target_type == "alma":
+            next_cfg["command"] = None
+            next_cfg["_resolved_command"] = None
+            resolved_cmd = "alma (WS)"
+        else:
+            resolved_cmd, configured_cmd = resolve_effective_agent_command(next_cfg, target_type)
+            if not resolved_cmd:
+                raise ConfigError(f"Agent 命令 `{configured_cmd}` 未在 PATH 中找到")
+            next_cfg["command"] = configured_cmd
+            next_cfg["_resolved_command"] = resolved_cmd
+
+        raw_prompt = next_cfg.get("_prompt_raw") or {}
+        next_cfg["prompt"] = _normalize_prompt_config(
+            raw_prompt, fill_defaults=True, agent_type=target_type,
+        )
+
+        next_bot_cfg = dict(self.bot_config)
+        next_prompts = build_extra_prompts(next_cfg)
+        next_runner = create_runner(
+            next_cfg, next_bot_cfg, next_prompts,
+            model_override=model_override,
+        )
+
+        return next_cfg, next_prompts, next_runner, resolved_cmd, configured_cmd
+
+    def _apply_config_change(self, next_cfg: dict) -> tuple[str | None, str | None]:
+        """Build → persist → activate. Thread-safe via _state_lock.
+
+        Returns (resolved_cmd, configured_cmd). Caller handles guards.
+        Raises ConfigError on build failure.
+        """
+        with self._state_lock:
+            next_cfg, next_prompts, next_runner, resolved_cmd, configured_cmd = \
+                self._build_config(next_cfg, model_override=self._runtime_state.model_override)
+
+            next_state = RuntimeState(
+                agent_type=next_cfg["type"],
+                provider=resolve_provider_name(next_cfg),
+                model_override=self._runtime_state.model_override,
+            )
+            try:
+                next_state.save(self._runtime_state_path)
+            except OSError:
+                log.warning("runtime-state save failed; in-memory state will diverge from disk",
+                            exc_info=True)
+
+            self._runtime_state = next_state
+            self.agent_config = next_cfg
+            self._extra_prompts = next_prompts
+            self.runner = next_runner
+            self.model_aliases = resolve_model_aliases(next_cfg)
+            self.session_map = SessionMap(
+                self._session_map_path,
+                agent_type=session_identity(next_cfg),
+            )
+            self._session_cost.clear()
+
+        return resolved_cmd, configured_cmd
+
+    # ------------------------------------------------------------------
+    # Model management
+    # ------------------------------------------------------------------
+
+    def get_model_status(self) -> tuple[str, bool]:
+        """Return current effective model and whether an override is active."""
+        override = self._runtime_state.model_override
+        if override:
+            return override, True
+        effective = _effective_default_model(self.agent_config, self.bot_config)
+        return effective or "(CLI 默认)", False
+
+    def set_model(self, raw_input: str) -> tuple[str, bool]:
+        """Set or clear model override. Thread-safe via _state_lock.
+
+        Returns (effective_model_display, is_cleared).
+        """
+        if raw_input.strip().lower() == "default":
+            resolved = None
+        elif raw_input in self.model_aliases:
+            resolved = self.model_aliases[raw_input]
+        elif raw_input in self.model_aliases.values():
+            resolved = raw_input
+        else:
+            resolved = raw_input
+
+        with self._state_lock:
+            if resolved is None:
+                effective = _effective_default_model(self.agent_config, self.bot_config)
+                self.runner.model = effective
+                self._runtime_state.model_override = None
+            else:
+                self.runner.model = resolved
+                self._runtime_state.model_override = resolved
+                effective = resolved
+
+            try:
+                self._runtime_state.save(self._runtime_state_path)
+            except OSError:
+                log.warning("runtime-state save failed after model change", exc_info=True)
+
+        return effective or "(CLI 默认)", resolved is None
+
+    # ------------------------------------------------------------------
+    # Provider / Agent switching
+    # ------------------------------------------------------------------
+
     def switch_provider(self, provider_name: str) -> tuple[bool, str]:
         """Hot-swap the active provider profile for the current agent."""
         if self.agent_config.get("type") == "alma":
@@ -800,46 +995,13 @@ class FeishuBot:
 
         next_cfg = dict(self.agent_config)
         next_cfg["provider"] = target
-        next_cfg["commands"] = _normalize_agent_commands(next_cfg)
-        next_cfg["args_by_type"] = _normalize_agent_args(next_cfg)
-        next_cfg["env_by_type"] = _normalize_agent_env(next_cfg)
-        target_type = next_cfg["type"]
         try:
-            next_cfg["providers"] = _normalize_provider_profiles(next_cfg)
+            resolved_cmd, _ = self._apply_config_change(next_cfg)
         except ConfigError as e:
             return False, f"Provider 切换失败: {e}"
-        resolved_cmd, configured_cmd = resolve_effective_agent_command(next_cfg, target_type)
-        if not resolved_cmd:
-            return (
-                False,
-                f"Agent 命令 `{configured_cmd}` 未在 PATH 中找到，无法切换到 `{target}` provider。",
-            )
-        next_cfg["command"] = configured_cmd
-        next_cfg["_resolved_command"] = resolved_cmd
-
-        # Re-normalize prompt block from the *raw* user-supplied block rather
-        # than the currently materialized dict, avoiding leak of agent-specific
-        # defaults across type-crossing provider switches.
-        raw_prompt = next_cfg.get("_prompt_raw") or {}
-        try:
-            next_cfg["prompt"] = _normalize_prompt_config(
-                raw_prompt, fill_defaults=True, agent_type=target_type,
-            )
-        except ConfigError as e:
-            return False, f"Provider 切换失败: {e}"
-        next_bot_cfg = dict(self.bot_config)
-        next_prompts = build_extra_prompts(next_cfg)
-        next_runner = create_runner(next_cfg, next_bot_cfg, next_prompts)
-
-        self.agent_config = next_cfg
-        self._extra_prompts = next_prompts
-        self.runner = next_runner
-        self.model_aliases = resolve_model_aliases(next_cfg)
-        self.session_map = SessionMap(self._session_map_path, agent_type=session_identity(next_cfg))
-        self._session_cost.clear()
 
         log.info("Switched provider for bot %s: %s -> %s (%s/%s)",
-                 self.bot_id, current, target, target_type, resolved_cmd)
+                 self.bot_id, current, target, next_cfg["type"], resolved_cmd)
         return True, f"Provider 已切换为 `{target}`。"
 
     def switch_agent(self, agent_type: str) -> tuple[bool, str, str | None]:
@@ -864,7 +1026,6 @@ class FeishuBot:
                 self.agent_config.get("_resolved_command"),
             )
 
-        # Preflight gate for Alma
         if target_type == "alma":
             ok, msg = AlmaRunner.preflight_check()
             if not ok:
@@ -872,51 +1033,10 @@ class FeishuBot:
 
         next_cfg = dict(self.agent_config)
         next_cfg["type"] = target_type
-        next_cfg["commands"] = _normalize_agent_commands(next_cfg)
-        next_cfg["args_by_type"] = _normalize_agent_args(next_cfg)
-        next_cfg["env_by_type"] = _normalize_agent_env(next_cfg)
         try:
-            next_cfg["providers"] = _normalize_provider_profiles(next_cfg)
+            resolved_cmd, configured_cmd = self._apply_config_change(next_cfg)
         except ConfigError as e:
             return False, f"Agent 切换失败: {e}", None
-
-        resolved_cmd = None
-        configured_cmd = None
-        if target_type == "alma":
-            next_cfg["command"] = None
-            next_cfg["_resolved_command"] = None
-            resolved_cmd = "alma (WS)"
-        else:
-            resolved_cmd, configured_cmd = resolve_effective_agent_command(next_cfg, target_type)
-            if not resolved_cmd:
-                return (
-                    False,
-                    f"Agent 命令 `{configured_cmd}` 未在 PATH 中找到，无法切换到 `{target_type}`。",
-                    None,
-                )
-            next_cfg["command"] = configured_cmd
-            next_cfg["_resolved_command"] = resolved_cmd
-
-        # Agent type changed → re-normalize prompt block with new type,
-        # using the raw user-supplied prompt to avoid leaking materialized
-        # defaults from the previous agent type.
-        raw_prompt = next_cfg.get("_prompt_raw") or {}
-        try:
-            next_cfg["prompt"] = _normalize_prompt_config(
-                raw_prompt, fill_defaults=True, agent_type=target_type,
-            )
-        except ConfigError as e:
-            return False, f"Agent 切换失败: {e}", None
-        next_bot_cfg = dict(self.bot_config)
-        next_prompts = build_extra_prompts(next_cfg)
-        next_runner = create_runner(next_cfg, next_bot_cfg, next_prompts)
-
-        self.agent_config = next_cfg
-        self._extra_prompts = next_prompts
-        self.runner = next_runner
-        self.model_aliases = resolve_model_aliases(next_cfg)
-        self.session_map = SessionMap(self._session_map_path, agent_type=session_identity(next_cfg))
-        self._session_cost.clear()
 
         log.info("Switched agent for bot %s: %s -> %s (%s)",
                  self.bot_id, current_type, target_type, resolved_cmd or configured_cmd)

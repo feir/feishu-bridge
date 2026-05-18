@@ -194,29 +194,23 @@ class BridgeCommandHandler:
                 handle.deliver("上下文已压缩。")
 
         elif cmd == "model":
-            aliases = self.bot.model_aliases
             if not arg:
-                model_display = self.bot.runner.model or "(CLI 默认)"
+                model_display, has_override = self.bot.get_model_status()
+                override_note = " *(override)*" if has_override else ""
+                aliases = self.bot.model_aliases
                 if aliases:
                     alias_list = " / ".join(f"`{a}`" for a in aliases)
                     handle.deliver(
-                        f"当前模型: `{model_display}`\n可选: {alias_list}"
+                        f"当前模型: `{model_display}`{override_note}\n可选: {alias_list} / `default`"
                     )
                 else:
-                    handle.deliver(f"当前模型: `{model_display}`")
-            elif arg in aliases:
-                self.bot.runner.model = aliases[arg]
-
-                handle.deliver(f"模型已切换为 `{aliases[arg]}`")
-            elif arg in aliases.values():
-                self.bot.runner.model = arg
-
-                handle.deliver(f"模型已切换为 `{arg}`")
+                    handle.deliver(f"当前模型: `{model_display}`{override_note}")
             else:
-                # Passthrough unknown model name (allows new models)
-                self.bot.runner.model = arg
-
-                handle.deliver(f"模型已设置为 `{arg}`（未识别的名称，将直接传递给 CLI）")
+                effective, is_cleared = self.bot.set_model(arg)
+                if is_cleared:
+                    handle.deliver(f"模型 override 已清除，回到默认: `{effective}`")
+                else:
+                    handle.deliver(f"模型已切换为 `{effective}`")
 
         elif cmd == "agent":
             self._handle_agent(arg, handle)
