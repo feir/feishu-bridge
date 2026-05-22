@@ -869,6 +869,13 @@ class FeishuBot:
         """
         target_type = next_cfg["type"]
 
+        # Prevent stale global "command" from polluting a dynamically-switched type.
+        # "command" belongs to the config-file type; if type was overridden at runtime,
+        # _normalize_agent_commands would incorrectly bind it to the new type.
+        orig_cmd = next_cfg.get("command")
+        if orig_cmd and target_type not in (next_cfg.get("commands") or {}):
+            next_cfg.pop("command", None)
+
         next_cfg["commands"] = _normalize_agent_commands(next_cfg)
         next_cfg["args_by_type"] = _normalize_agent_args(next_cfg)
         next_cfg["env_by_type"] = _normalize_agent_env(next_cfg)
