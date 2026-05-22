@@ -57,6 +57,7 @@ from feishu_bridge.runtime import (
     _resource_stack,
 )
 from feishu_bridge.runtime_alma import AlmaRunner
+from feishu_bridge.runtime_omp import OmpRpcRunner
 from feishu_bridge.runtime_pi import PiRunner
 from feishu_bridge.runtime_state import RuntimeState
 
@@ -136,6 +137,7 @@ _RUNNER_CLASSES: dict[str, type[BaseRunner]] = {
     "claude": ClaudeRunner,
     "codex": CodexRunner,
     "pi": PiRunner,
+    "omp": OmpRpcRunner,
     "alma": AlmaRunner,
 }
 
@@ -922,7 +924,13 @@ class FeishuBot:
             self._runtime_state = next_state
             self.agent_config = next_cfg
             self._extra_prompts = next_prompts
+            old_runner = self.runner
             self.runner = next_runner
+            if hasattr(old_runner, "shutdown"):
+                try:
+                    old_runner.shutdown()
+                except Exception:
+                    log.warning("old runner shutdown failed", exc_info=True)
             self.model_aliases = resolve_model_aliases(next_cfg)
             self.session_map = SessionMap(
                 self._session_map_path,
@@ -2195,6 +2203,12 @@ def main():
                 sup.stop()
             except Exception:
                 log.warning("bg-supervisor stop failed", exc_info=True)
+        runner = getattr(bot, "runner", None)
+        if runner is not None and hasattr(runner, "shutdown"):
+            try:
+                runner.shutdown()
+            except Exception:
+                log.warning("runner shutdown failed", exc_info=True)
 
 
 if __name__ == "__main__":
