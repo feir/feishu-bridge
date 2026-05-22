@@ -406,27 +406,28 @@ class OmpRpcRunner(BaseRunner):
             if not prompt_acked:
                 continue
 
-            if msg_type == "event":
-                event = msg.get("event") or msg
-                done = self._handle_event(event, state, on_output, on_tool_status)
-                if on_output and state.pending_output:
-                    for text in state.pending_output:
-                        on_output(text)
-                    state.pending_output.clear()
-                    silent_deadline = time.monotonic() + SILENT_TIMEOUT
-                if on_tool_status and state.pending_tool_status:
-                    on_tool_status(list(state.pending_tool_status))
-                    state.pending_tool_status.clear()
-                    silent_deadline = time.monotonic() + SILENT_TIMEOUT
-                if done:
-                    break
-
-            elif msg_type == "error":
+            if msg_type == "error":
                 error_msg = msg.get("message") or msg.get("error") or "Unknown RPC error"
                 state.accumulated_text = self._format_error(str(error_msg))
                 state.is_error = True
                 if on_output:
                     on_output(state.accumulated_text)
+                break
+
+            if msg_type in ("response", "extension_ui_request"):
+                continue
+
+            done = self._handle_event(msg, state, on_output, on_tool_status)
+            if on_output and state.pending_output:
+                for text in state.pending_output:
+                    on_output(text)
+                state.pending_output.clear()
+                silent_deadline = time.monotonic() + SILENT_TIMEOUT
+            if on_tool_status and state.pending_tool_status:
+                on_tool_status(list(state.pending_tool_status))
+                state.pending_tool_status.clear()
+                silent_deadline = time.monotonic() + SILENT_TIMEOUT
+            if done:
                 break
 
         usage = state.last_call_usage or {}
@@ -474,6 +475,17 @@ class OmpRpcRunner(BaseRunner):
         if etype == "turn_end":
             message = event.get("message") or {}
             self._update_usage(message.get("usage"), state)
+            stop_reason = message.get("stopReason")
+            if stop_reason == "error":
+                error_msg = message.get("errorMessage") or "Unknown error"
+                state.accumulated_text = self._format_error(str(error_msg))
+                state.is_error = True
+                state.pending_output.append(state.accumulated_text)
+            elif stop_reason and stop_reason != "toolUse":
+                text = self._message_text(message)
+                if text and text != state.accumulated_text:
+                    state.accumulated_text = text
+                    state.pending_output.append(state.accumulated_text)
             return False
 
         if etype == "agent_end":
@@ -519,6 +531,19 @@ class OmpRpcRunner(BaseRunner):
             tool_call = update.get("toolCall") or {}
             if isinstance(tool_call, dict) and tool_call.get("name"):
                 state.pending_tool_status.append(str(tool_call["name"]))
+
+    @staticmethod
+    def _message_text(message: dict) -> str:
+        content = message.get("content") or []
+        if not isinstance(content, list):
+            return ""
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
 
     # ── Abort + drain ──
 
