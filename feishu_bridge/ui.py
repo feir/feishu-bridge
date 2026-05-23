@@ -1199,8 +1199,20 @@ class ResponseHandle:
     def _format_tool_hint(tool_name: str, hint_data: str) -> str:
         if not hint_data:
             return ""
-        if tool_name in ("Bash", "Read", "Write", "Edit"):
+        if tool_name in ("Read", "Write", "Edit"):
             return os.path.basename(hint_data)
+        if tool_name == "WebFetch":
+            from urllib.parse import urlparse
+            try:
+                parsed = urlparse(hint_data)
+                path = parsed.path.rstrip("/")
+                host = parsed.hostname or ""
+                if path and path != "/":
+                    short_path = path if len(path) <= 25 else "…" + path[-24:]
+                    return f"{host}{short_path}"
+                return host
+            except Exception:
+                return hint_data[:40]
         return hint_data
 
     @staticmethod

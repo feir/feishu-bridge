@@ -131,7 +131,12 @@ def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
     """Extract minimal hint string from tool input (avoids holding large dicts)."""
     if tool_name == "Bash":
         cmd = tool_input.get("command", "")
-        return cmd.split(maxsplit=1)[0] if cmd else ""
+        if not cmd:
+            return ""
+        desc = tool_input.get("description", "")
+        if desc:
+            return desc[:50]
+        return cmd[:60]
     if tool_name in ("Read", "Write", "Edit"):
         return tool_input.get("file_path", "")
     if tool_name == "Agent":
@@ -140,6 +145,10 @@ def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
         return tool_input.get("skill", "")
     if tool_name == "Grep":
         return (tool_input.get("pattern") or "")[:30]
+    if tool_name == "WebSearch":
+        return (tool_input.get("query") or "")[:40]
+    if tool_name == "WebFetch":
+        return (tool_input.get("url") or "")[:60]
     return ""
 
 
