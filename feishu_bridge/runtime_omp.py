@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from feishu_bridge.runtime import BaseRunner, StreamState
+from feishu_bridge.runtime import BaseRunner, StreamState, _extract_hint_data, BG_AGENT_SILENT_TIMEOUT
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +113,8 @@ class OmpRpcRunner(BaseRunner):
                 rpc, session_id, tag,
                 on_output=on_output,
                 on_tool_status=on_tool_status,
+                on_todo_update=on_todo_update,
+                on_agent_update=on_agent_update,
             )
         except _ProcessDead as e:
             self._evict(session_id)
@@ -346,7 +348,8 @@ class OmpRpcRunner(BaseRunner):
 
     def _stream_events(self, rpc: _RpcProcess, session_id: Optional[str],
                        tag: Optional[str], *,
-                       on_output=None, on_tool_status=None) -> dict:
+                       on_output=None, on_tool_status=None,
+                       on_todo_update=None, on_agent_update=None) -> dict:
         state = StreamState(session_id=session_id)
         prompt_acked = False
         idle_deadline = time.monotonic() + self.timeout
@@ -417,7 +420,9 @@ class OmpRpcRunner(BaseRunner):
             if msg_type in ("response", "extension_ui_request"):
                 continue
 
-            done = self._handle_event(msg, state, on_output, on_tool_status)
+            done, reset_silent = self._handle_event(msg, state, on_output, on_tool_status)
+            if state.bg_agent_running:
+                silent_deadline = max(silent_deadline, time.monotonic() + BG_AGENT_SILENT_TIMEOUT)
             if on_output and state.pending_output:
                 for text in state.pending_output:
                     on_output(text)
@@ -427,6 +432,14 @@ class OmpRpcRunner(BaseRunner):
                 on_tool_status(list(state.pending_tool_status))
                 state.pending_tool_status.clear()
                 silent_deadline = time.monotonic() + SILENT_TIMEOUT
+            if reset_silent:
+                silent_deadline = time.monotonic() + SILENT_TIMEOUT
+            if on_todo_update and state.pending_todo_update is not None:
+                on_todo_update(state.pending_todo_update)
+                state.pending_todo_update = None
+            if on_agent_update and state.pending_agent_launches is not None:
+                on_agent_update(state.pending_agent_launches)
+                state.pending_agent_launches = None
             if done:
                 break
 
@@ -453,24 +466,34 @@ class OmpRpcRunner(BaseRunner):
         }
 
     def _handle_event(self, event: dict, state: StreamState,
-                      on_output, on_tool_status) -> bool:
+                      on_output, on_tool_status):
+        """Handle a single RPC event. Returns (done, reset_silent)."""
         etype = event.get("type")
 
         if etype == "message_update":
             self._handle_message_update(event, state)
-            return False
+            return False, False
 
         if etype == "tool_execution_start":
             tool_name = event.get("toolName")
             if tool_name:
-                state.pending_tool_status.append(str(tool_name))
-            return False
+                args = event.get("args")
+                if not isinstance(args, dict):
+                    args = {}
+                state.pending_tool_status.append({
+                    "name": str(tool_name),
+                    "hint_data": _extract_hint_data(str(tool_name), args),
+                })
+            return False, False
 
         if etype == "tool_execution_end":
             tool_name = event.get("toolName")
             if tool_name:
-                state.pending_tool_status.append(str(tool_name))
-            return False
+                state.pending_tool_status.append({
+                    "name": str(tool_name),
+                    "hint_data": "",
+                })
+            return False, False
 
         if etype == "turn_end":
             message = event.get("message") or {}
@@ -486,10 +509,17 @@ class OmpRpcRunner(BaseRunner):
                 if text and text != state.accumulated_text:
                     state.accumulated_text = text
                     state.pending_output.append(state.accumulated_text)
-            return False
+            return False, False
+
+        if etype == "auto_compaction_start":
+            state.compact_detected = True
+            return False, True
+
+        if etype == "auto_compaction_end":
+            return False, True
 
         if etype == "agent_end":
-            return True
+            return True, False
 
         if etype == "error":
             raw = (
@@ -503,9 +533,9 @@ class OmpRpcRunner(BaseRunner):
             state.accumulated_text = self._format_error(str(raw))
             state.is_error = True
             state.pending_output.append(state.accumulated_text)
-            return True
+            return True, False
 
-        return False
+        return False, False
 
     def _handle_message_update(self, event: dict, state: StreamState) -> None:
         update = event.get("assistantMessageEvent") or {}
@@ -527,11 +557,59 @@ class OmpRpcRunner(BaseRunner):
             self._update_usage(partial.get("usage"), state)
             return
 
-        if utype in {"toolcall_start", "toolcall_end"}:
-            tool_call = update.get("toolCall") or {}
-            if isinstance(tool_call, dict) and tool_call.get("name"):
-                state.pending_tool_status.append(str(tool_call["name"]))
+        if utype == "thinking_delta":
+            return
 
+        if utype in {"toolcall_start", "toolcall_end"}:
+            tool_call = self._resolve_tool_call(update)
+            if not tool_call:
+                return
+            name = tool_call.get("name", "")
+            if not name:
+                return
+            arguments = tool_call.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            state.pending_tool_status.append({
+                "name": str(name),
+                "hint_data": _extract_hint_data(str(name), arguments),
+            })
+            if name == "TodoWrite":
+                todos = arguments.get("todos")
+                if isinstance(todos, list):
+                    state.pending_todo_update = todos
+            elif name == "Agent":
+                if arguments.get("run_in_background"):
+                    state.bg_agent_running = True
+                else:
+                    launch = {
+                        "description": arguments.get("description", ""),
+                        "name": arguments.get("name"),
+                        "subagent_type": arguments.get("subagent_type", ""),
+                    }
+                    if state.pending_agent_launches is None:
+                        state.pending_agent_launches = []
+                    state.pending_agent_launches.append(launch)
+            return
+
+
+
+    @staticmethod
+    def _resolve_tool_call(update: dict) -> dict | None:
+        """Resolve tool call from direct toolCall field or partial fallback."""
+        tc = update.get("toolCall")
+        if isinstance(tc, dict) and tc.get("name"):
+            return tc
+        # Fallback: scan partial.content for type=="toolCall" blocks
+        partial = update.get("partial") or {}
+        content = partial.get("content") or []
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "toolCall" and item.get("name"):
+                    return item
+        return None
     @staticmethod
     def _message_text(message: dict) -> str:
         content = message.get("content") or []
