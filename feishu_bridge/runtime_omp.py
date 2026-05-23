@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import signal
 import subprocess
 import threading
 import time
+import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -80,7 +82,33 @@ class OmpRpcRunner(BaseRunner):
         self._proc_lock = threading.Lock()
         self._reaper_started = False
         self._shutting_down = False
+        self._resolved_model: Optional[str] = None
 
+    @property
+    def resolved_model(self) -> str:
+        """Return the model name for display, resolving from omp config if needed."""
+        if self.model:
+            return self.model
+        if self._resolved_model is None:
+            self._resolved_model = self._read_omp_default_model()
+        return self._resolved_model or "(cli-default)"
+
+    @staticmethod
+    def _read_omp_default_model() -> Optional[str]:
+        """Read modelRoles.default from ~/.omp/agent/config.yml."""
+        config_path = Path.home() / ".omp" / "agent" / "config.yml"
+        try:
+            with open(config_path) as f:
+                config = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError) as e:
+            log.debug("Cannot read omp config for default model: %s", e)
+            return None
+        if not isinstance(config, dict):
+            return None
+        model_roles = config.get("modelRoles")
+        if isinstance(model_roles, dict):
+            return model_roles.get("default")
+        return None
     # ── Abstract method stubs (not used — run() is fully overridden) ──
 
     def build_args(self, prompt, session_id, resume, streaming, *,
@@ -471,7 +499,7 @@ class OmpRpcRunner(BaseRunner):
                 break
 
         usage = state.last_call_usage or {}
-        model_name = self.model or "(cli-default)"
+        model_name = self.resolved_model
 
         return {
             "result": state.accumulated_text or "OMP 未返回任何内容。",
