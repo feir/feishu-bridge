@@ -47,6 +47,33 @@ class OmpRpcRunner(BaseRunner):
 
     ALWAYS_STREAMING = True
 
+    _TOOL_NAME_MAP = {
+        "bash": "Bash",
+        "read": "Read",
+        "write": "Write",
+        "edit": "Edit",
+        "grep": "Grep",
+        "search": "Grep",
+        "eval": "Eval",
+        "find": "Find",
+        "glob": "Glob",
+        "lsp": "Lsp",
+        "python": "Python",
+        "notebook_edit": "NotebookEdit",
+        "inspect_image": "InspectImage",
+        "browser": "Browser",
+        "task": "Task",
+        "todo_write": "TodoWrite",
+        "web_search": "WebSearch",
+        "web_fetch": "WebFetch",
+        "ask": "Ask",
+        "agent": "Agent",
+    }
+
+    @classmethod
+    def _normalize_tool_name(cls, raw_name: str) -> str:
+        return cls._TOOL_NAME_MAP.get(raw_name.lower(), raw_name.title())
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._processes: dict[str, _RpcProcess] = {}
@@ -421,8 +448,6 @@ class OmpRpcRunner(BaseRunner):
                 continue
 
             done, reset_silent = self._handle_event(msg, state, on_output, on_tool_status)
-            if state.bg_agent_running:
-                silent_deadline = max(silent_deadline, time.monotonic() + BG_AGENT_SILENT_TIMEOUT)
             if on_output and state.pending_output:
                 for text in state.pending_output:
                     on_output(text)
@@ -434,6 +459,8 @@ class OmpRpcRunner(BaseRunner):
                 silent_deadline = time.monotonic() + SILENT_TIMEOUT
             if reset_silent:
                 silent_deadline = time.monotonic() + SILENT_TIMEOUT
+            if state.bg_agent_running:
+                silent_deadline = max(silent_deadline, time.monotonic() + BG_AGENT_SILENT_TIMEOUT)
             if on_todo_update and state.pending_todo_update is not None:
                 on_todo_update(state.pending_todo_update)
                 state.pending_todo_update = None
@@ -471,28 +498,13 @@ class OmpRpcRunner(BaseRunner):
         etype = event.get("type")
 
         if etype == "message_update":
-            self._handle_message_update(event, state)
-            return False, False
+            reset_silent = self._handle_message_update(event, state)
+            return False, reset_silent
 
         if etype == "tool_execution_start":
-            tool_name = event.get("toolName")
-            if tool_name:
-                args = event.get("args")
-                if not isinstance(args, dict):
-                    args = {}
-                state.pending_tool_status.append({
-                    "name": str(tool_name),
-                    "hint_data": _extract_hint_data(str(tool_name), args),
-                })
             return False, False
 
         if etype == "tool_execution_end":
-            tool_name = event.get("toolName")
-            if tool_name:
-                state.pending_tool_status.append({
-                    "name": str(tool_name),
-                    "hint_data": "",
-                })
             return False, False
 
         if etype == "turn_end":
@@ -537,7 +549,7 @@ class OmpRpcRunner(BaseRunner):
 
         return False, False
 
-    def _handle_message_update(self, event: dict, state: StreamState) -> None:
+    def _handle_message_update(self, event: dict, state: StreamState) -> bool:
         update = event.get("assistantMessageEvent") or {}
         utype = update.get("type")
 
@@ -546,7 +558,7 @@ class OmpRpcRunner(BaseRunner):
             if delta:
                 state.accumulated_text += str(delta)
                 state.pending_output.append(state.accumulated_text)
-            return
+            return False
 
         if utype == "text_end":
             content = update.get("content") or ""
@@ -555,25 +567,28 @@ class OmpRpcRunner(BaseRunner):
                 state.pending_output.append(state.accumulated_text)
             partial = update.get("partial") or {}
             self._update_usage(partial.get("usage"), state)
-            return
+            return False
 
         if utype == "thinking_delta":
-            return
+            return True
 
         if utype in {"toolcall_start", "toolcall_end"}:
             tool_call = self._resolve_tool_call(update)
             if not tool_call:
-                return
-            name = tool_call.get("name", "")
-            if not name:
-                return
+                return False
+            raw_name = tool_call.get("name", "")
+            if not raw_name:
+                return False
+            name = self._normalize_tool_name(raw_name)
             arguments = tool_call.get("arguments")
             if not isinstance(arguments, dict):
                 arguments = {}
-            state.pending_tool_status.append({
-                "name": str(name),
-                "hint_data": _extract_hint_data(str(name), arguments),
-            })
+            # Only append to tool history on start, not end (avoids double-counting)
+            if utype == "toolcall_start":
+                state.pending_tool_status.append({
+                    "name": name,
+                    "hint_data": _extract_hint_data(name, arguments),
+                })
             if name == "TodoWrite":
                 todos = arguments.get("todos")
                 if isinstance(todos, list):
@@ -590,7 +605,16 @@ class OmpRpcRunner(BaseRunner):
                     if state.pending_agent_launches is None:
                         state.pending_agent_launches = []
                     state.pending_agent_launches.append(launch)
-            return
+            elif name == "Task":
+                launch = {
+                    "description": arguments.get("description", ""),
+                    "name": arguments.get("name"),
+                    "subagent_type": arguments.get("subagent_type", ""),
+                }
+                if state.pending_agent_launches is None:
+                    state.pending_agent_launches = []
+                state.pending_agent_launches.append(launch)
+            return False
 
 
 

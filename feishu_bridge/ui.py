@@ -1177,14 +1177,22 @@ class ResponseHandle:
         "Edit": "编辑文件",
         "Grep": "搜索代码",
         "Glob": "查找文件",
+        "Find": "查找文件",
         "WebFetch": "抓取网页",
         "WebSearch": "搜索网页",
+        "Lsp": "代码分析",
+        "Python": "执行 Python",
+        "Eval": "执行代码",
+        "NotebookEdit": "编辑笔记",
+        "InspectImage": "分析图片",
+        "Browser": "浏览器操作",
         "Agent": "分发子任务",
+        "Task": "分发子任务",
         "TeamCreate": "创建团队",
         "SendMessage": "团队通信",
         "Skill": "执行技能",
         "TodoWrite": "更新任务",
-        "NotebookEdit": "编辑笔记",
+        "Ask": "询问用户",
     }
 
     @staticmethod
@@ -1220,7 +1228,7 @@ class ResponseHandle:
                 name = tc.get("name", "")
                 hint_data = tc.get("hint_data", "")
 
-            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage"):
+            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task"):
                 continue
 
             if name.startswith("mcp__"):
