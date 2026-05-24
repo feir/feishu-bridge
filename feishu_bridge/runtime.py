@@ -965,8 +965,8 @@ class ClaudeRunner(BaseRunner):
                 # subsequent cache_read-only turns look like a drop.  Peak
                 # tracks the actual context the model has been carrying
                 # (new input + prior cache read).
-                ctx_tokens = (msg_usage.get("input_tokens", 0)
-                              + msg_usage.get("cache_read_input_tokens", 0))
+                ctx_tokens = ((msg_usage.get("input_tokens", 0) or 0)
+                              + (msg_usage.get("cache_read_input_tokens", 0) or 0))
                 # Detect auto-compact via large token drop from peak.
                 # Tightened from the earlier 30% heuristic: drop must be
                 # >50%, and prior peak must be substantial (>=50K tokens)
@@ -1262,10 +1262,10 @@ class CodexRunner(BaseRunner):
             if usage:
                 # Normalize Codex usage keys to match Claude convention
                 state.last_call_usage = {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "cache_read_input_tokens": usage.get("cached_input_tokens", 0),
+                    "input_tokens": (usage.get("input_tokens", 0) or 0),
+                    "cache_read_input_tokens": (usage.get("cached_input_tokens", 0) or 0),
                     "cache_creation_input_tokens": 0,
-                    "output_tokens": usage.get("output_tokens", 0),
+                    "output_tokens": (usage.get("output_tokens", 0) or 0),
                 }
                 ctx_tokens = (
                     state.last_call_usage["input_tokens"]
@@ -1308,10 +1308,10 @@ class CodexRunner(BaseRunner):
             model_usage = {
                 self.model: {
                     "contextWindow": 0,
-                    "inputTokens": usage.get("input_tokens", 0),
-                    "outputTokens": usage.get("output_tokens", 0),
-                    "cacheReadInputTokens": usage.get("cache_read_input_tokens", 0),
-                    "cacheCreationInputTokens": usage.get("cache_creation_input_tokens", 0),
+                    "inputTokens": (usage.get("input_tokens", 0) or 0),
+                    "outputTokens": (usage.get("output_tokens", 0) or 0),
+                    "cacheReadInputTokens": (usage.get("cache_read_input_tokens", 0) or 0),
+                    "cacheCreationInputTokens": (usage.get("cache_creation_input_tokens", 0) or 0),
                 },
             }
 

@@ -737,10 +737,10 @@ def _format_usage_footer(usage: dict) -> str:
         "12.3k in (85% ⚡) · 1.2k out"    — cache hit
         "12.3k in · 1.2k out"              — no cache / cold start
     """
-    inp = usage.get("input_tokens", 0)
-    cache_read = usage.get("cache_read_input_tokens", 0)
-    cache_create = usage.get("cache_creation_input_tokens", 0)
-    out = usage.get("output_tokens", 0)
+    inp = (usage.get("input_tokens", 0) or 0)
+    cache_read = (usage.get("cache_read_input_tokens", 0) or 0)
+    cache_create = (usage.get("cache_creation_input_tokens", 0) or 0)
+    out = (usage.get("output_tokens", 0) or 0)
     total_in = inp + cache_read + cache_create
 
     parts = []

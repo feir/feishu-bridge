@@ -386,9 +386,9 @@ def _context_health_alert(result: dict, quota_snapshot=None, runner=None) -> str
     usage = result.get("last_call_usage") or result.get("usage")
     if not usage:
         return rate_alert or None
-    total_ctx = (usage.get("input_tokens", 0)
-                 + usage.get("cache_read_input_tokens", 0)
-                 + usage.get("cache_creation_input_tokens", 0))
+    total_ctx = ((usage.get("input_tokens", 0) or 0)
+                 + (usage.get("cache_read_input_tokens", 0) or 0)
+                 + (usage.get("cache_creation_input_tokens", 0) or 0))
     if total_ctx == 0:
         return rate_alert or None
 
@@ -1230,9 +1230,9 @@ def process_message(
             # --- Idle auto-compact timer ---
             if not result["is_error"] and runner.supports_auto_compact():
                 _usage = result.get("last_call_usage") or result.get("usage") or {}
-                _total_ctx = (_usage.get("input_tokens", 0)
-                              + _usage.get("cache_read_input_tokens", 0)
-                              + _usage.get("cache_creation_input_tokens", 0))
+                _total_ctx = ((_usage.get("input_tokens", 0) or 0)
+                              + (_usage.get("cache_read_input_tokens", 0) or 0)
+                              + (_usage.get("cache_creation_input_tokens", 0) or 0))
                 idle_compact_mgr.touch(
                     session_id=effective_sid,
                     session_key=SessionMap.format_key(key),

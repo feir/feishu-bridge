@@ -756,9 +756,9 @@ class BridgeCommandHandler:
         # --- Section 1: Context ---
         usage = cost_info.get("last_call_usage") or cost_info.get("usage") or {}
         model_usage = cost_info.get("model_usage", {})
-        inp = usage.get("input_tokens", 0)
-        cache_read = usage.get("cache_read_input_tokens", 0)
-        cache_create = usage.get("cache_creation_input_tokens", 0)
+        inp = (usage.get("input_tokens", 0) or 0)
+        cache_read = (usage.get("cache_read_input_tokens", 0) or 0)
+        cache_create = (usage.get("cache_creation_input_tokens", 0) or 0)
         total_ctx = inp + cache_read + cache_create
 
         max_ctx = 0
@@ -815,7 +815,7 @@ class BridgeCommandHandler:
         if not is_subscription:
             session_cost = cost_info.get("session_cost_usd", 0)
             turn_cost = cost_info.get("turn_cost_usd", 0)
-            out_tokens = usage.get("output_tokens", 0)
+            out_tokens = (usage.get("output_tokens", 0) or 0)
 
             if session_cost and session_cost > 0:
                 lines.append("")

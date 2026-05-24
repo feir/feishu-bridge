@@ -132,12 +132,12 @@ class PiRunner(BaseRunner):
             "modelUsage": {
                 model_name: {
                     "contextWindow": 0,
-                    "inputTokens": usage.get("input_tokens", 0),
-                    "outputTokens": usage.get("output_tokens", 0),
-                    "cacheReadInputTokens": usage.get("cache_read_input_tokens", 0),
-                    "cacheCreationInputTokens": usage.get(
+                    "inputTokens": (usage.get("input_tokens", 0) or 0),
+                    "outputTokens": (usage.get("output_tokens", 0) or 0),
+                    "cacheReadInputTokens": (usage.get("cache_read_input_tokens", 0) or 0),
+                    "cacheCreationInputTokens": (usage.get(
                         "cache_creation_input_tokens", 0
-                    ),
+                    ) or 0),
                 },
             },
             "peak_context_tokens": state.peak_context_tokens,
