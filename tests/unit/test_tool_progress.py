@@ -8,8 +8,12 @@ from feishu_bridge.runtime import _extract_hint_data
 
 class TestExtractHintData:
     # ── Bash ──
-    def test_bash_returns_command(self):
-        assert _extract_hint_data("Bash", {"command": "git status"}) == "git status"
+    def test_bash_returns_basename_only(self):
+        """Only executable basename is shown — never full args (may contain secrets)."""
+        assert _extract_hint_data("Bash", {"command": "git status"}) == "git"
+
+    def test_bash_path_command_returns_basename(self):
+        assert _extract_hint_data("Bash", {"command": "/usr/bin/env python3 -m pytest"}) == "env"
 
     def test_bash_prefers_description(self):
         assert _extract_hint_data("Bash", {
@@ -17,9 +21,12 @@ class TestExtractHintData:
             "description": "Installing deps",
         }) == "Installing deps"
 
-    def test_bash_truncates_long_command(self):
-        cmd = "x" * 100
-        assert _extract_hint_data("Bash", {"command": cmd}) == cmd[:60]
+    def test_bash_prefers_intent_over_command(self):
+        """OMP _i is preferred over raw command basename."""
+        assert _extract_hint_data("Bash", {
+            "command": "curl -H 'Authorization: Bearer sk-...'",
+            "_i": "Fetching API data",
+        }) == "Fetching API data"
 
     def test_bash_empty_command_returns_empty(self):
         assert _extract_hint_data("Bash", {"command": ""}) == ""

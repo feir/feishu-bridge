@@ -138,10 +138,13 @@ def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
         cmd = tool_input.get("command", "")
         if not cmd:
             return (tool_input.get("_i") or "")[:50]
-        desc = tool_input.get("description", "")
+        # Prefer safe descriptors over raw command (may contain secrets)
+        desc = tool_input.get("description") or tool_input.get("_i") or ""
         if desc:
             return desc[:50]
-        return cmd[:60]
+        # Fallback: executable basename only — never expose full args
+        first = cmd.split(maxsplit=1)[0]
+        return os.path.basename(first)
     if tool_name in ("Read", "Write", "Edit"):
         # Alma uses "file_path", OMP uses "path"
         return tool_input.get("file_path") or tool_input.get("path") or ""
