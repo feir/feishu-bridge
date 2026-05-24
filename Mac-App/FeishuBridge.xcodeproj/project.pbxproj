@@ -1,0 +1,494 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		02C82AE19EA64C6C1A0E8C00 /* ConfigManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B40D482634CA77852C4A13B9 /* ConfigManagerTests.swift */; };
+		0AEDC575FD70E54A31B8FBC0 /* ProcessManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89318667ADD53B00161F7097 /* ProcessManager.swift */; };
+		170C2C55176CEA84F74DAC46 /* LaunchctlHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = E849CDBB3F06BA0F41675D6B /* LaunchctlHelper.swift */; };
+		1CED7244E7C0F5F8BA51FA51 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5055C7874386C817D8086129 /* App.swift */; };
+		5279C5294DE72A8C553AEDB2 /* MenuBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88DF5FF3BCCEEA70B774497E /* MenuBarView.swift */; };
+		623F4FB42677B45C085582C6 /* ConfigManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3528722BC95A2938788091D1 /* ConfigManager.swift */; };
+		66976CB4DF02A6A1B17A61F8 /* LogViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA6D67CF5CF3A8A806C5D6B3 /* LogViewer.swift */; };
+		7062BB42CE47CFEC47828545 /* UnixSocketTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24D4188DE1CDCF02F8424A87 /* UnixSocketTransport.swift */; };
+		831CC3BB62BEDA77E214621B /* BridgeStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3190982110C3A261A8EB1FAF /* BridgeStatus.swift */; };
+		9606128C53A6B3007A175CBC /* StatusPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0BEE3010D09319420B18CE4 /* StatusPoller.swift */; };
+		989C2B456098AA2410703C14 /* ControlClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 718FDCD7483E138E0B60D0E6 /* ControlClient.swift */; };
+		9A9387C47F31D6E542B41679 /* OnboardingWizard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3191D89466131E8E5158622E /* OnboardingWizard.swift */; };
+		9DAD71B259516B32ABFB21F4 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D61E164524D928A87DDA4EE5 /* SettingsView.swift */; };
+		CB32D17A33BE5127F0A0AB36 /* CredentialValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12E743C55286E60B15605E76 /* CredentialValidator.swift */; };
+		D9529AB0F6201FD2FEB5E532 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 10E76E81E5460348B2A07C72 /* Assets.xcassets */; };
+		F42DB47ED102047218D6D3A5 /* StatusPollerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD62F7B4D4B57CE893356D1E /* StatusPollerTests.swift */; };
+		F88E611A5B2F0EF9F25AF5A8 /* BridgeStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A61A002E72417D0FBA129188 /* BridgeStatusTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		CEA1365C9106CFA7A145E40F /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 7B19B30BE0524054F209626F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 29252D3E2A9080DE8063ED12;
+			remoteInfo = FeishuBridge;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		10E76E81E5460348B2A07C72 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		12E743C55286E60B15605E76 /* CredentialValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CredentialValidator.swift; sourceTree = "<group>"; };
+		24D4188DE1CDCF02F8424A87 /* UnixSocketTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnixSocketTransport.swift; sourceTree = "<group>"; };
+		3190982110C3A261A8EB1FAF /* BridgeStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeStatus.swift; sourceTree = "<group>"; };
+		3191D89466131E8E5158622E /* OnboardingWizard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingWizard.swift; sourceTree = "<group>"; };
+		3528722BC95A2938788091D1 /* ConfigManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigManager.swift; sourceTree = "<group>"; };
+		5055C7874386C817D8086129 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
+		57AA0A7D3D9F5928804A5326 /* FeishuBridgeTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FeishuBridgeTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		718FDCD7483E138E0B60D0E6 /* ControlClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlClient.swift; sourceTree = "<group>"; };
+		88DF5FF3BCCEEA70B774497E /* MenuBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarView.swift; sourceTree = "<group>"; };
+		89318667ADD53B00161F7097 /* ProcessManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessManager.swift; sourceTree = "<group>"; };
+		A61A002E72417D0FBA129188 /* BridgeStatusTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeStatusTests.swift; sourceTree = "<group>"; };
+		AD62F7B4D4B57CE893356D1E /* StatusPollerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusPollerTests.swift; sourceTree = "<group>"; };
+		B0BEE3010D09319420B18CE4 /* StatusPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusPoller.swift; sourceTree = "<group>"; };
+		B40D482634CA77852C4A13B9 /* ConfigManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigManagerTests.swift; sourceTree = "<group>"; };
+		BA6D67CF5CF3A8A806C5D6B3 /* LogViewer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogViewer.swift; sourceTree = "<group>"; };
+		D61E164524D928A87DDA4EE5 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		E036E1899503ADB60FF916C7 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		E069E44B4C440E6980435811 /* FeishuBridge.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FeishuBridge.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		E849CDBB3F06BA0F41675D6B /* LaunchctlHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchctlHelper.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		099EF3C8DBAE6D7FEE9EE4DD /* Utilities */ = {
+			isa = PBXGroup;
+			children = (
+				E849CDBB3F06BA0F41675D6B /* LaunchctlHelper.swift */,
+				24D4188DE1CDCF02F8424A87 /* UnixSocketTransport.swift */,
+			);
+			path = Utilities;
+			sourceTree = "<group>";
+		};
+		3BF54D023174C0355928D720 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				3190982110C3A261A8EB1FAF /* BridgeStatus.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		3DAA3804E16147239244621F /* FeishuBridgeTests */ = {
+			isa = PBXGroup;
+			children = (
+				A61A002E72417D0FBA129188 /* BridgeStatusTests.swift */,
+				B40D482634CA77852C4A13B9 /* ConfigManagerTests.swift */,
+				AD62F7B4D4B57CE893356D1E /* StatusPollerTests.swift */,
+			);
+			path = FeishuBridgeTests;
+			sourceTree = "<group>";
+		};
+		553B2C694435C6D720624BB6 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				E069E44B4C440E6980435811 /* FeishuBridge.app */,
+				57AA0A7D3D9F5928804A5326 /* FeishuBridgeTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		9D9A980D05EE2F1C614E6F59 = {
+			isa = PBXGroup;
+			children = (
+				CE6C45537320E333494F83AC /* FeishuBridge */,
+				3DAA3804E16147239244621F /* FeishuBridgeTests */,
+				553B2C694435C6D720624BB6 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		B76F2E1DA0998CA2FE1416C9 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				BA6D67CF5CF3A8A806C5D6B3 /* LogViewer.swift */,
+				88DF5FF3BCCEEA70B774497E /* MenuBarView.swift */,
+				3191D89466131E8E5158622E /* OnboardingWizard.swift */,
+				D61E164524D928A87DDA4EE5 /* SettingsView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		CE6C45537320E333494F83AC /* FeishuBridge */ = {
+			isa = PBXGroup;
+			children = (
+				5055C7874386C817D8086129 /* App.swift */,
+				10E76E81E5460348B2A07C72 /* Assets.xcassets */,
+				E036E1899503ADB60FF916C7 /* Info.plist */,
+				3BF54D023174C0355928D720 /* Models */,
+				E6D81F7A2CBEDFAA291D2F1B /* Services */,
+				099EF3C8DBAE6D7FEE9EE4DD /* Utilities */,
+				B76F2E1DA0998CA2FE1416C9 /* Views */,
+			);
+			path = FeishuBridge;
+			sourceTree = "<group>";
+		};
+		E6D81F7A2CBEDFAA291D2F1B /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				3528722BC95A2938788091D1 /* ConfigManager.swift */,
+				718FDCD7483E138E0B60D0E6 /* ControlClient.swift */,
+				12E743C55286E60B15605E76 /* CredentialValidator.swift */,
+				89318667ADD53B00161F7097 /* ProcessManager.swift */,
+				B0BEE3010D09319420B18CE4 /* StatusPoller.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		29252D3E2A9080DE8063ED12 /* FeishuBridge */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AC6D8CD711569784E3A8A6B9 /* Build configuration list for PBXNativeTarget "FeishuBridge" */;
+			buildPhases = (
+				3DAC4406D4D7721778054C72 /* Sources */,
+				60CE4D3F3920AEE1EBB337EB /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = FeishuBridge;
+			packageProductDependencies = (
+			);
+			productName = FeishuBridge;
+			productReference = E069E44B4C440E6980435811 /* FeishuBridge.app */;
+			productType = "com.apple.product-type.application";
+		};
+		7A41F7F7F1C5847102F29A2E /* FeishuBridgeTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 9B82D07481CDC488D1A5030E /* Build configuration list for PBXNativeTarget "FeishuBridgeTests" */;
+			buildPhases = (
+				C3B419BC86A54FC7489F8922 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				CA6381D72221678EC0606CE7 /* PBXTargetDependency */,
+			);
+			name = FeishuBridgeTests;
+			packageProductDependencies = (
+			);
+			productName = FeishuBridgeTests;
+			productReference = 57AA0A7D3D9F5928804A5326 /* FeishuBridgeTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		7B19B30BE0524054F209626F /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 2640;
+				TargetAttributes = {
+					29252D3E2A9080DE8063ED12 = {
+						ProvisioningStyle = Manual;
+					};
+					7A41F7F7F1C5847102F29A2E = {
+						ProvisioningStyle = Manual;
+					};
+				};
+			};
+			buildConfigurationList = B1A8850BEBA90F9B1B661FFE /* Build configuration list for PBXProject "FeishuBridge" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 9D9A980D05EE2F1C614E6F59;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 553B2C694435C6D720624BB6 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				29252D3E2A9080DE8063ED12 /* FeishuBridge */,
+				7A41F7F7F1C5847102F29A2E /* FeishuBridgeTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		60CE4D3F3920AEE1EBB337EB /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D9529AB0F6201FD2FEB5E532 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		3DAC4406D4D7721778054C72 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1CED7244E7C0F5F8BA51FA51 /* App.swift in Sources */,
+				831CC3BB62BEDA77E214621B /* BridgeStatus.swift in Sources */,
+				623F4FB42677B45C085582C6 /* ConfigManager.swift in Sources */,
+				989C2B456098AA2410703C14 /* ControlClient.swift in Sources */,
+				CB32D17A33BE5127F0A0AB36 /* CredentialValidator.swift in Sources */,
+				170C2C55176CEA84F74DAC46 /* LaunchctlHelper.swift in Sources */,
+				66976CB4DF02A6A1B17A61F8 /* LogViewer.swift in Sources */,
+				5279C5294DE72A8C553AEDB2 /* MenuBarView.swift in Sources */,
+				9A9387C47F31D6E542B41679 /* OnboardingWizard.swift in Sources */,
+				0AEDC575FD70E54A31B8FBC0 /* ProcessManager.swift in Sources */,
+				9DAD71B259516B32ABFB21F4 /* SettingsView.swift in Sources */,
+				9606128C53A6B3007A175CBC /* StatusPoller.swift in Sources */,
+				7062BB42CE47CFEC47828545 /* UnixSocketTransport.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C3B419BC86A54FC7489F8922 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F88E611A5B2F0EF9F25AF5A8 /* BridgeStatusTests.swift in Sources */,
+				02C82AE19EA64C6C1A0E8C00 /* ConfigManagerTests.swift in Sources */,
+				F42DB47ED102047218D6D3A5 /* StatusPollerTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		CA6381D72221678EC0606CE7 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 29252D3E2A9080DE8063ED12 /* FeishuBridge */;
+			targetProxy = CEA1365C9106CFA7A145E40F /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		20AC916D205B5539AAFEBABD /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.feishu-bridge.app";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		40E44CEEC28F1CEF641BF413 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.feishu-bridge.tests";
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Feishu Bridge.app/Contents/MacOS/Feishu Bridge";
+			};
+			name = Release;
+		};
+		9A8297BEA5B72620C034AE76 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = FeishuBridge/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				PRODUCT_MODULE_NAME = FeishuBridge;
+				PRODUCT_NAME = "Feishu Bridge";
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		D3DCFE7D756B00EE689C1B8B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.feishu-bridge.tests";
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Feishu Bridge.app/Contents/MacOS/Feishu Bridge";
+			};
+			name = Debug;
+		};
+		F51F890A6D381503DBB9E3C7 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = FeishuBridge/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				PRODUCT_MODULE_NAME = FeishuBridge;
+				PRODUCT_NAME = "Feishu Bridge";
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		F87420F7CDB60DBD3857E317 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.feishu-bridge.app";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		9B82D07481CDC488D1A5030E /* Build configuration list for PBXNativeTarget "FeishuBridgeTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D3DCFE7D756B00EE689C1B8B /* Debug */,
+				40E44CEEC28F1CEF641BF413 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		AC6D8CD711569784E3A8A6B9 /* Build configuration list for PBXNativeTarget "FeishuBridge" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9A8297BEA5B72620C034AE76 /* Debug */,
+				F51F890A6D381503DBB9E3C7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		B1A8850BEBA90F9B1B661FFE /* Build configuration list for PBXProject "FeishuBridge" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				20AC916D205B5539AAFEBABD /* Debug */,
+				F87420F7CDB60DBD3857E317 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 7B19B30BE0524054F209626F /* Project object */;
+}

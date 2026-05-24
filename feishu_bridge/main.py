@@ -1126,8 +1126,9 @@ class FeishuBot:
 
     def start(self):
         """Start worker threads and WebSocket connection (blocking)."""
-        # Record startup time — used to skip replayed events after restart
-        self._startup_ms = str(int(time.time() * 1000))
+        # Record startup time for uptime calculation + skip replayed events
+        self._start_time = time.time()
+        self._startup_ms = str(int(self._start_time * 1000))
         log.info("Bridge startup timestamp: %s", self._startup_ms)
 
         # Start workers
@@ -1189,6 +1190,21 @@ class FeishuBot:
             log.warning("bg-supervisor failed to start — bridge continues "
                         "without background-task support", exc_info=True)
             self._bg_supervisor = None
+        # Start Control API (Unix socket JSON-RPC)
+        from feishu_bridge.control_api import ControlAPI
+        self._control_api = None
+        try:
+            ctrl_sock = bg_root / f"control-{self.bot_id}.sock"
+            ctrl_token = bg_root / f"control-{self.bot_id}.token"
+            ctrl_log_buffer = getattr(self, "_log_ring_buffer", None)
+            self._control_api = ControlAPI(
+                self, ctrl_sock, ctrl_token, log_buffer=ctrl_log_buffer,
+            )
+            self._control_api.start()
+        except Exception:
+            log.warning("Control API failed to start", exc_info=True)
+            self._control_api = None
+
 
         log.info("Connecting to Feishu WebSocket (bot=%s)...", self.bot_id)
         ws_client.start()  # Blocks forever
@@ -2142,6 +2158,16 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Install log ring buffer for Control API
+    from feishu_bridge.log_buffer import LogRingBuffer
+    _log_ring_buffer = LogRingBuffer(capacity=2000)
+    _log_ring_buffer.setFormatter(logging.Formatter(
+        "%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.getLogger().addHandler(_log_ring_buffer)
+
+
     # Materialize packaged data files (bridge-settings.json, cli_prompt.md)
     import atexit
     materialize_data_files()
@@ -2154,6 +2180,7 @@ def main():
 
     # Create bot and run startup tasks in parallel
     bot = FeishuBot(config)
+    bot._log_ring_buffer = _log_ring_buffer
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from feishu_bridge.ui import set_bot_display_name
@@ -2202,6 +2229,13 @@ def main():
     except KeyboardInterrupt:
         log.info("Shutting down")
     finally:
+        # Stop Control API
+        ctrl = getattr(bot, "_control_api", None)
+        if ctrl is not None:
+            try:
+                ctrl.stop()
+            except Exception:
+                log.warning("control-api stop failed", exc_info=True)
         # Graceful shutdown of the bg-task supervisor so wake.sock is
         # unlinked and threads exit cleanly on next boot.
         sup = getattr(bot, "_bg_supervisor", None)

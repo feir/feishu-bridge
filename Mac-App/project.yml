@@ -1,0 +1,52 @@
+name: FeishuBridge
+options:
+  bundleIdPrefix: com.feishu-bridge
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "26.4"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ENABLE_APP_SANDBOX: false
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    PRODUCT_BUNDLE_IDENTIFIER: com.feishu-bridge.app
+
+targets:
+  FeishuBridge:
+    type: application
+    platform: macOS
+    sources:
+      - FeishuBridge
+    settings:
+      base:
+        INFOPLIST_FILE: FeishuBridge/Info.plist
+        PRODUCT_NAME: "Feishu Bridge"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+        PRODUCT_MODULE_NAME: FeishuBridge
+    info:
+      path: FeishuBridge/Info.plist
+      properties:
+        LSUIElement: true
+        CFBundleDisplayName: "Feishu Bridge"
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "14.0"
+
+  FeishuBridgeTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - FeishuBridgeTests
+    dependencies:
+      - target: FeishuBridge
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.feishu-bridge.tests
+        GENERATE_INFOPLIST_FILE: true
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Feishu Bridge.app/Contents/MacOS/Feishu Bridge"
+        BUNDLE_LOADER: "$(TEST_HOST)"
