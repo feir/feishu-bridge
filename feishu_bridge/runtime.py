@@ -128,28 +128,75 @@ class StreamState:
 
 
 def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
-    """Extract minimal hint string from tool input (avoids holding large dicts)."""
+    """Extract minimal hint string from tool input (avoids holding large dicts).
+
+    Supports both Claude Code (Alma) param names (file_path, command) and
+    OMP param names (path, command, _i).  Falls back to OMP's ``_i`` intent
+    field when no tool-specific key is found.
+    """
     if tool_name == "Bash":
         cmd = tool_input.get("command", "")
         if not cmd:
-            return ""
+            return (tool_input.get("_i") or "")[:50]
         desc = tool_input.get("description", "")
         if desc:
             return desc[:50]
         return cmd[:60]
     if tool_name in ("Read", "Write", "Edit"):
-        return tool_input.get("file_path", "")
-    if tool_name == "Agent":
+        # Alma uses "file_path", OMP uses "path"
+        return tool_input.get("file_path") or tool_input.get("path") or ""
+    if tool_name in ("Agent", "Task"):
         return (tool_input.get("description") or "")[:40]
     if tool_name == "Skill":
         return tool_input.get("skill", "")
-    if tool_name == "Grep":
+    if tool_name in ("Grep", "Search"):
         return (tool_input.get("pattern") or "")[:30]
     if tool_name == "WebSearch":
         return (tool_input.get("query") or "")[:40]
     if tool_name == "WebFetch":
         return (tool_input.get("url") or "")[:60]
-    return ""
+    if tool_name == "Find":
+        paths = tool_input.get("paths")
+        if isinstance(paths, list) and paths:
+            first = str(paths[0])[:40]
+            return f"{first} +{len(paths)-1}" if len(paths) > 1 else first
+        return (tool_input.get("_i") or "")[:50]
+    if tool_name == "Lsp":
+        action = tool_input.get("action", "")
+        target = tool_input.get("file") or tool_input.get("symbol") or ""
+        if action and target:
+            return f"{action} {target}"[:50]
+        return action or (tool_input.get("_i") or "")[:50]
+    if tool_name == "Browser":
+        action = tool_input.get("action", "")
+        url = tool_input.get("url", "")
+        if url:
+            return f"{action} {url}"[:50]
+        return action or (tool_input.get("_i") or "")[:50]
+    if tool_name == "Eval":
+        cells = tool_input.get("cells")
+        if isinstance(cells, list) and cells:
+            title = cells[0].get("title", "")
+            if title:
+                return title[:40]
+            return cells[0].get("language", "")
+        return (tool_input.get("_i") or "")[:50]
+    if tool_name in ("AstGrep", "AstEdit"):
+        pat = tool_input.get("pat", "")
+        if pat:
+            return pat[:30]
+        ops = tool_input.get("ops")
+        if isinstance(ops, list) and ops:
+            return (ops[0].get("pat") or "")[:30]
+        return (tool_input.get("_i") or "")[:50]
+    if tool_name == "Debug":
+        action = tool_input.get("action", "")
+        prog = tool_input.get("program", "")
+        if action and prog:
+            return f"{action} {prog}"[:50]
+        return action or (tool_input.get("_i") or "")[:50]
+    # Universal fallback: OMP tools carry _i (intent) field
+    return (tool_input.get("_i") or "")[:50]
 
 
 # ---------------------------------------------------------------------------

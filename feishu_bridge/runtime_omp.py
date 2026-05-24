@@ -70,6 +70,10 @@ class OmpRpcRunner(BaseRunner):
         "web_fetch": "WebFetch",
         "ask": "Ask",
         "agent": "Agent",
+        "ast_grep": "AstGrep",
+        "ast_edit": "AstEdit",
+        "debug": "Debug",
+        "resolve": "Resolve",
     }
 
     @classmethod
@@ -617,6 +621,16 @@ class OmpRpcRunner(BaseRunner):
                     "name": name,
                     "hint_data": _extract_hint_data(name, arguments),
                 })
+            elif utype == "toolcall_end" and arguments:
+                # At toolcall_start, arguments may be empty (streamed
+                # incrementally).  Backfill hint_data on end if still blank.
+                hint = _extract_hint_data(name, arguments)
+                if hint:
+                    state.pending_tool_status.append({
+                        "name": name,
+                        "hint_data": hint,
+                        "_backfill": True,
+                    })
             if name == "TodoWrite":
                 todos = arguments.get("todos")
                 if isinstance(todos, list):

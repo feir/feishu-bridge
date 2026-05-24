@@ -1193,6 +1193,11 @@ class ResponseHandle:
         "Skill": "执行技能",
         "TodoWrite": "更新任务",
         "Ask": "询问用户",
+        "AstGrep": "AST 搜索",
+        "AstEdit": "AST 重写",
+        "Debug": "调试程序",
+        "Search": "搜索代码",
+        "Resolve": "确认操作",
     }
 
     @staticmethod
@@ -1249,6 +1254,15 @@ class ResponseHandle:
             else:
                 label = self._TOOL_STATUS_MAP.get(name, name)
                 hint = self._format_tool_hint(name, hint_data)
+
+            # Backfill: update the last matching entry that had no hint
+            if isinstance(tc, dict) and tc.get("_backfill"):
+                if hint and self._tool_history:
+                    for entry in reversed(self._tool_history):
+                        if entry["label"] == label and not entry["hint"]:
+                            entry["hint"] = hint
+                            break
+                continue
 
             if self._tool_history:
                 last = self._tool_history[-1]

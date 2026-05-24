@@ -7,46 +7,141 @@ from feishu_bridge.runtime import _extract_hint_data
 
 
 class TestExtractHintData:
-    def test_bash_extracts_first_word(self):
-        assert _extract_hint_data("Bash", {"command": "git status"}) == "git"
+    # ── Bash ──
+    def test_bash_returns_command(self):
+        assert _extract_hint_data("Bash", {"command": "git status"}) == "git status"
 
-    def test_bash_path_command(self):
-        assert _extract_hint_data("Bash", {"command": "/usr/bin/env python3 -m pytest"}) == "/usr/bin/env"
+    def test_bash_prefers_description(self):
+        assert _extract_hint_data("Bash", {
+            "command": "pip install foo",
+            "description": "Installing deps",
+        }) == "Installing deps"
 
-    def test_bash_empty_command(self):
+    def test_bash_truncates_long_command(self):
+        cmd = "x" * 100
+        assert _extract_hint_data("Bash", {"command": cmd}) == cmd[:60]
+
+    def test_bash_empty_command_returns_empty(self):
         assert _extract_hint_data("Bash", {"command": ""}) == ""
         assert _extract_hint_data("Bash", {}) == ""
 
-    def test_read_file_path(self):
-        assert _extract_hint_data("Read", {"file_path": "/home/user/project/main.py"}) == "/home/user/project/main.py"
+    def test_bash_empty_command_falls_back_to_intent(self):
+        assert _extract_hint_data("Bash", {"_i": "Running tests"}) == "Running tests"
 
-    def test_edit_file_path(self):
-        assert _extract_hint_data("Edit", {"file_path": "/tmp/foo.txt"}) == "/tmp/foo.txt"
+    # ── Read / Write / Edit ──
+    def test_read_file_path_alma(self):
+        """Alma (Claude Code) uses file_path."""
+        assert _extract_hint_data("Read", {"file_path": "/home/user/main.py"}) == "/home/user/main.py"
 
-    def test_write_file_path(self):
-        assert _extract_hint_data("Write", {"file_path": "/a/b.md"}) == "/a/b.md"
+    def test_read_path_omp(self):
+        """OMP uses path."""
+        assert _extract_hint_data("Read", {"path": "/home/user/main.py"}) == "/home/user/main.py"
 
+    def test_read_prefers_file_path(self):
+        """file_path takes precedence over path (Alma compat)."""
+        assert _extract_hint_data("Read", {
+            "file_path": "/alma.py",
+            "path": "/omp.py",
+        }) == "/alma.py"
+
+    def test_edit_path_omp(self):
+        assert _extract_hint_data("Edit", {"path": "/tmp/foo.txt"}) == "/tmp/foo.txt"
+
+    def test_write_path_omp(self):
+        assert _extract_hint_data("Write", {"path": "/a/b.md"}) == "/a/b.md"
+
+    def test_read_empty(self):
+        assert _extract_hint_data("Read", {}) == ""
+
+    # ── Agent / Task ──
     def test_agent_description_truncated(self):
         desc = "A" * 60
         assert _extract_hint_data("Agent", {"description": desc}) == "A" * 40
 
-    def test_agent_short_description(self):
-        assert _extract_hint_data("Agent", {"description": "Review code"}) == "Review code"
+    def test_task_description(self):
+        assert _extract_hint_data("Task", {"description": "Review code"}) == "Review code"
 
-    def test_skill_name(self):
-        assert _extract_hint_data("Skill", {"skill": "done"}) == "done"
-
+    # ── Grep / Search ──
     def test_grep_pattern_truncated(self):
         pattern = "x" * 50
         assert _extract_hint_data("Grep", {"pattern": pattern}) == "x" * 30
 
-    def test_unknown_tool_returns_empty(self):
-        assert _extract_hint_data("Glob", {"pattern": "*.py"}) == ""
-        assert _extract_hint_data("WebFetch", {"url": "https://example.com"}) == ""
+    def test_search_alias(self):
+        assert _extract_hint_data("Search", {"pattern": "TODO"}) == "TODO"
 
-    def test_empty_input(self):
-        assert _extract_hint_data("Read", {}) == ""
-        assert _extract_hint_data("Agent", {}) == ""
+    # ── Skill ──
+    def test_skill_name(self):
+        assert _extract_hint_data("Skill", {"skill": "done"}) == "done"
+
+    # ── WebSearch / WebFetch ──
+    def test_websearch_query(self):
+        assert _extract_hint_data("WebSearch", {"query": "python async"}) == "python async"
+
+    def test_webfetch_url(self):
+        assert _extract_hint_data("WebFetch", {"url": "https://example.com"}) == "https://example.com"
+
+    # ── Find ──
+    def test_find_single_path(self):
+        assert _extract_hint_data("Find", {"paths": ["src/**/*.ts"]}) == "src/**/*.ts"
+
+    def test_find_multiple_paths(self):
+        result = _extract_hint_data("Find", {"paths": ["src/**/*.ts", "tests/**/*.ts"]})
+        assert result == "src/**/*.ts +1"
+
+    def test_find_empty_falls_back_to_intent(self):
+        assert _extract_hint_data("Find", {"_i": "Finding test files"}) == "Finding test files"
+
+    # ── Lsp ──
+    def test_lsp_action_and_file(self):
+        result = _extract_hint_data("Lsp", {"action": "definition", "file": "main.py"})
+        assert result == "definition main.py"
+
+    def test_lsp_action_only(self):
+        assert _extract_hint_data("Lsp", {"action": "diagnostics"}) == "diagnostics"
+
+    def test_lsp_falls_back_to_intent(self):
+        assert _extract_hint_data("Lsp", {"_i": "Finding definitions"}) == "Finding definitions"
+
+    # ── Browser ──
+    def test_browser_action_and_url(self):
+        result = _extract_hint_data("Browser", {"action": "open", "url": "https://example.com"})
+        assert result == "open https://example.com"
+
+    def test_browser_action_only(self):
+        assert _extract_hint_data("Browser", {"action": "close"}) == "close"
+
+    # ── Eval ──
+    def test_eval_cell_title(self):
+        result = _extract_hint_data("Eval", {"cells": [{"title": "imports", "language": "py"}]})
+        assert result == "imports"
+
+    def test_eval_cell_language_fallback(self):
+        result = _extract_hint_data("Eval", {"cells": [{"language": "py"}]})
+        assert result == "py"
+
+    # ── AstGrep / AstEdit ──
+    def test_ast_grep_pattern(self):
+        assert _extract_hint_data("AstGrep", {"pat": "console.log($$$)"}) == "console.log($$$)"
+
+    def test_ast_edit_ops_pattern(self):
+        result = _extract_hint_data("AstEdit", {"ops": [{"pat": "old($A)", "out": "new($A)"}]})
+        assert result == "old($A)"
+
+    # ── Debug ──
+    def test_debug_action_and_program(self):
+        result = _extract_hint_data("Debug", {"action": "launch", "program": "./app"})
+        assert result == "launch ./app"
+
+    # ── Universal _i fallback ──
+    def test_unknown_tool_uses_intent(self):
+        assert _extract_hint_data("SomeNewTool", {"_i": "Doing work"}) == "Doing work"
+
+    def test_unknown_tool_no_intent(self):
+        assert _extract_hint_data("SomeNewTool", {}) == ""
+
+    def test_intent_truncated(self):
+        intent = "A" * 80
+        assert _extract_hint_data("SomeNewTool", {"_i": intent}) == "A" * 50
 
 
 class TestFormatToolHint:
@@ -56,10 +151,6 @@ class TestFormatToolHint:
     def fmt(self):
         from feishu_bridge.ui import ResponseHandle
         return ResponseHandle._format_tool_hint
-
-    def test_bash_basename(self, fmt):
-        assert fmt("Bash", "/usr/bin/git") == "git"
-        assert fmt("Bash", "git") == "git"
 
     def test_read_basename(self, fmt):
         assert fmt("Read", "/home/user/project/main.py") == "main.py"
@@ -76,6 +167,12 @@ class TestFormatToolHint:
 
     def test_unknown_tool_passthrough(self, fmt):
         assert fmt("Grep", "pattern") == "pattern"
+
+    def test_webfetch_host(self, fmt):
+        assert fmt("WebFetch", "https://docs.python.org/3/library/os.html") == "docs.python.org/3/library/os.html"
+
+    def test_webfetch_host_only(self, fmt):
+        assert fmt("WebFetch", "https://example.com/") == "example.com"
 
 
 class TestMcpDisplayName:
@@ -190,4 +287,40 @@ class TestToolStatusUpdateDedup:
     def test_summary_updated_skips(self, handle):
         handle._summary_updated = True
         handle.tool_status_update([{"name": "Read", "hint_data": "/a.py"}])
+        assert len(handle._tool_history) == 0
+
+    def test_backfill_updates_empty_hint(self, handle):
+        """_backfill entries update the last matching entry with empty hint."""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": ""},
+        ])
+        assert handle._tool_history[0]["hint"] == ""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a/foo.py", "_backfill": True},
+        ])
+        assert handle._tool_history[0]["hint"] == "foo.py"
+
+    def test_backfill_skips_if_hint_already_set(self, handle):
+        """_backfill doesn't overwrite an existing non-empty hint."""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a/foo.py"},
+        ])
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a/bar.py", "_backfill": True},
+        ])
+        # Should NOT have been changed
+        assert handle._tool_history[0]["hint"] == "foo.py"
+
+    def test_backfill_no_new_entry(self, handle):
+        """_backfill entries never create new history entries."""
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "git status", "_backfill": True},
+        ])
+        assert len(handle._tool_history) == 0
+
+    def test_task_excluded(self, handle):
+        """Task tool is excluded from tool history (shown as agent)."""
+        handle.tool_status_update([
+            {"name": "Task", "hint_data": ""},
+        ])
         assert len(handle._tool_history) == 0
