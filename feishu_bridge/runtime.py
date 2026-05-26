@@ -125,6 +125,124 @@ class StreamState:
     pending_todo_update: list[dict] | None = None
     pending_agent_launches: list[dict] | None = None
     bg_agent_running: bool = False
+    # OMP todo state machine — rebuilt from ops deltas
+    _todo_phases: list[dict] = field(default_factory=list)
+
+    # ── Todo state machine (OMP ops format) ──
+
+    def apply_todo_ops(self, ops: list) -> None:
+        """Apply OMP todo_write ops to internal state."""
+        for op_dict in ops:
+            if not isinstance(op_dict, dict):
+                continue
+            op = op_dict.get("op")
+            if op == "init":
+                self._todo_phases = []
+                for phase_def in (op_dict.get("list") or []):
+                    if not isinstance(phase_def, dict):
+                        continue
+                    phase: dict = {"name": phase_def.get("phase", ""), "tasks": []}
+                    for item in (phase_def.get("items") or []):
+                        phase["tasks"].append({"content": str(item), "status": "pending"})
+                    self._todo_phases.append(phase)
+                self._auto_promote()
+            elif op == "start":
+                task = op_dict.get("task")
+                if task:
+                    # Demote any existing in_progress task before activating
+                    self._demote_active()
+                    self._set_task_status(task, "in_progress")
+            elif op == "done":
+                task = op_dict.get("task")
+                phase_name = op_dict.get("phase")
+                if task:
+                    self._set_task_status(task, "completed")
+                    self._auto_promote()
+                elif phase_name:
+                    self._set_phase_status(phase_name, "completed")
+                    self._auto_promote()
+            elif op == "drop":
+                task = op_dict.get("task")
+                phase_name = op_dict.get("phase")
+                if task:
+                    self._set_task_status(task, "dropped")
+                    self._auto_promote()
+                elif phase_name:
+                    self._set_phase_status(phase_name, "dropped")
+                    self._auto_promote()
+            elif op == "rm":
+                task = op_dict.get("task")
+                phase_name = op_dict.get("phase")
+                if not task and not phase_name:
+                    self._todo_phases = []
+                elif task:
+                    for p in self._todo_phases:
+                        p["tasks"] = [t for t in p["tasks"] if t["content"] != task]
+                    self._auto_promote()
+                elif phase_name:
+                    self._todo_phases = [p for p in self._todo_phases if p["name"] != phase_name]
+                    self._auto_promote()
+            elif op == "append":
+                phase_name = op_dict.get("phase", "")
+                items = op_dict.get("items") or []
+                phase = next((p for p in self._todo_phases if p["name"] == phase_name), None)
+                if phase is None:
+                    phase = {"name": phase_name, "tasks": []}
+                    self._todo_phases.append(phase)
+                for item in items:
+                    phase["tasks"].append({"content": str(item), "status": "pending"})
+                self._auto_promote()
+            # "note" — no state change
+
+    def get_todo_list(self) -> list[dict]:
+        """Flatten phases into [{content, status}] for UI rendering."""
+        result: list[dict] = []
+        for phase in self._todo_phases:
+            for task in phase["tasks"]:
+                result.append({"content": task["content"], "status": task["status"]})
+        return result
+
+    def _auto_promote(self) -> None:
+        """Promote first pending task to in_progress if none is active."""
+        for phase in self._todo_phases:
+            for task in phase["tasks"]:
+                if task["status"] == "in_progress":
+                    return  # already have an active task
+        for phase in self._todo_phases:
+            for task in phase["tasks"]:
+                if task["status"] == "pending":
+                    task["status"] = "in_progress"
+                    return
+
+    def _set_task_status(self, content: str, status: str,
+                         phase_name: str | None = None) -> None:
+        phases = self._todo_phases
+        if phase_name:
+            phases = [p for p in phases if p["name"] == phase_name]
+        for phase in phases:
+            for task in phase["tasks"]:
+                if task["content"] == content:
+                    task["status"] = status
+                    return
+        # Fallback: if phase_name was given but no match, try globally
+        if phase_name:
+            self._set_task_status(content, status)
+
+    def _set_phase_status(self, name: str, status: str) -> None:
+        """Set all non-terminal tasks in a phase to the given status."""
+        for phase in self._todo_phases:
+            if phase["name"] == name:
+                for task in phase["tasks"]:
+                    if task["status"] not in ("completed", "dropped"):
+                        task["status"] = status
+
+    def _demote_active(self) -> None:
+        """Demote any in_progress task back to pending."""
+        for phase in self._todo_phases:
+            for task in phase["tasks"]:
+                if task["status"] == "in_progress":
+                    task["status"] = "pending"
+                    return
 
 
 def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
@@ -149,7 +267,15 @@ def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
         # Alma uses "file_path", OMP uses "path"
         return tool_input.get("file_path") or tool_input.get("path") or ""
     if tool_name in ("Agent", "Task"):
-        return (tool_input.get("description") or "")[:40]
+        # OMP format: tasks[] array with per-task descriptions
+        tasks = tool_input.get("tasks")
+        if isinstance(tasks, list) and tasks:
+            descs = [t.get("description", "") for t in tasks if isinstance(t, dict)]
+            joined = ", ".join(d for d in descs if d)
+            if joined:
+                return joined[:40]
+        # Claude Code / Alma format: top-level description
+        return (tool_input.get("description") or tool_input.get("_i") or "")[:40]
     if tool_name == "Skill":
         return tool_input.get("skill", "")
     if tool_name in ("Grep", "Search"):

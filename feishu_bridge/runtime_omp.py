@@ -632,13 +632,22 @@ class OmpRpcRunner(BaseRunner):
                         "_backfill": True,
                     })
             if name == "TodoWrite":
+                # Claude Code format: full state list
                 todos = arguments.get("todos")
                 if isinstance(todos, list):
                     state.pending_todo_update = todos
+                # OMP format: delta ops — apply to state machine (only on end)
+                elif utype == "toolcall_end":
+                    ops = arguments.get("ops")
+                    if isinstance(ops, list) and ops:
+                        state.apply_todo_ops(ops)
+                        state.pending_todo_update = state.get_todo_list()
             elif name == "Agent":
-                if arguments.get("run_in_background"):
+                if utype != "toolcall_end":
+                    pass  # wait for complete arguments
+                elif arguments.get("run_in_background"):
                     state.bg_agent_running = True
-                else:
+                elif arguments.get("description"):
                     launch = {
                         "description": arguments.get("description", ""),
                         "name": arguments.get("name"),
@@ -648,14 +657,36 @@ class OmpRpcRunner(BaseRunner):
                         state.pending_agent_launches = []
                     state.pending_agent_launches.append(launch)
             elif name == "Task":
-                launch = {
-                    "description": arguments.get("description", ""),
-                    "name": arguments.get("name"),
-                    "subagent_type": arguments.get("subagent_type", ""),
-                }
-                if state.pending_agent_launches is None:
-                    state.pending_agent_launches = []
-                state.pending_agent_launches.append(launch)
+                if utype != "toolcall_end":
+                    pass  # wait for complete arguments
+                # OMP format: tasks[] array with per-task entries
+                elif isinstance(arguments.get("tasks"), list) and arguments["tasks"]:
+                    agent_type = arguments.get("agent", "")
+                    launches = []
+                    for t in arguments["tasks"]:
+                        if not isinstance(t, dict):
+                            continue
+                        desc = t.get("description", "") or t.get("id", "")
+                        if desc:
+                            launches.append({
+                                "description": desc,
+                                "name": t.get("id"),
+                                "subagent_type": agent_type,
+                            })
+                    if launches:
+                        if state.pending_agent_launches is None:
+                            state.pending_agent_launches = []
+                        state.pending_agent_launches.extend(launches)
+                # Claude Code format: top-level description
+                elif arguments.get("description"):
+                    launch = {
+                        "description": arguments.get("description", ""),
+                        "name": arguments.get("name"),
+                        "subagent_type": arguments.get("subagent_type", ""),
+                    }
+                    if state.pending_agent_launches is None:
+                        state.pending_agent_launches = []
+                    state.pending_agent_launches.append(launch)
             return False
 
 

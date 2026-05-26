@@ -1339,6 +1339,8 @@ class ResponseHandle:
                 lines.append(f"~~☑ {content}~~")
             elif status == "in_progress":
                 lines.append(f"◉ **{content}**")
+            elif status == "dropped":
+                lines.append(f"~~✗ {content}~~")
             else:
                 lines.append(f"☐ {content}")
         return "\n".join(lines)
@@ -1391,7 +1393,12 @@ class ResponseHandle:
         if not self._cardkit_card_id:
             if not self._ensure_card():
                 return
-        self._active_agents = [{"status": "in_progress", **a} for a in launches]
+        # Dedupe by description to avoid double-counting from toolcall_start/end
+        existing = {a.get("description") for a in self._active_agents}
+        for a in launches:
+            if a.get("description") not in existing:
+                self._active_agents.append({"status": "in_progress", **a})
+                existing.add(a.get("description"))
         self._render_progress()
 
     def _mark_agents_completed(self):
