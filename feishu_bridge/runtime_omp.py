@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 
+import hashlib
 import json
 import logging
 import os
@@ -331,7 +332,16 @@ class OmpRpcRunner(BaseRunner):
         if extra_env:
             env.update(extra_env)
 
-        log.info("Spawning OMP RPC: sid=%s cmd=%s", session_id[:8], " ".join(args[:6]))
+        if system_prompt:
+            sp_bytes = system_prompt.encode("utf-8")
+            sp_hash = hashlib.sha256(sp_bytes).hexdigest()[:12]
+            sp_meta = f"sp=sha256:{sp_hash} sp_bytes={len(sp_bytes)}"
+        else:
+            sp_meta = "sp=<none>"
+        log.info(
+            "Spawning OMP RPC: sid=%s cmd=%s %s",
+            session_id[:8], " ".join(args[:6]), sp_meta,
+        )
 
         proc = subprocess.Popen(
             args,
