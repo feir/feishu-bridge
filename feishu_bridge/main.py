@@ -648,7 +648,8 @@ def _format_task_detail_bridge(task: dict) -> str:
 
 def process_message(item: dict, bot_config: dict, lark_client,
                     session_map: SessionMap, runner: BaseRunner,
-                    feishu_tasks=None, feishu_docs=None, feishu_sheets=None):
+                    feishu_tasks=None, feishu_docs=None, feishu_sheets=None,
+                    thread_projects=None):
     """Compatibility wrapper for the worker pipeline implementation."""
     return _bridge_worker_process_message(
         item=item,
@@ -659,6 +660,7 @@ def process_message(item: dict, bot_config: dict, lark_client,
         feishu_tasks=feishu_tasks,
         feishu_docs=feishu_docs,
         feishu_sheets=feishu_sheets,
+        thread_projects=thread_projects,
         feishu_api_error_cls=FeishuAPIError,
         response_handle_cls=ResponseHandle,
         download_image_fn=download_image,
