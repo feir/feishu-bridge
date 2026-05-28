@@ -292,3 +292,59 @@ def test_unreadable_file_skipped(tmp_path: Path, monkeypatch) -> None:
     out = build_fresh_context_prompt(str(tmp_path))
     assert out is not None
     assert "good content" in out
+
+
+# ── resolve_dotclaude_root ──────────────────────────────────────────────────
+
+
+def test_resolver_project_workspace(tmp_path: Path) -> None:
+    """Project-layout: ``ws/.claude/memory/`` exists → root is the nested dir."""
+    from feishu_bridge.runtime import resolve_dotclaude_root
+    project = tmp_path / "project-foo"
+    (project / ".claude" / "memory").mkdir(parents=True)
+    assert resolve_dotclaude_root(str(project)) == project / ".claude"
+
+
+def test_resolver_dotclaude_root_layout(tmp_path: Path) -> None:
+    """Dotclaude-root layout: workspace is ``~/.claude`` itself.
+
+    Covers the production bot.workspace = ~/.claude case where ``memory/`` is
+    a direct child and there is no nested ``.claude/`` subdir.
+    """
+    from feishu_bridge.runtime import resolve_dotclaude_root
+    ws = tmp_path / ".claude"
+    (ws / "memory").mkdir(parents=True)
+    assert resolve_dotclaude_root(str(ws)) == ws
+
+
+def test_resolver_dotclaude_root_with_compact_only(tmp_path: Path) -> None:
+    """Dotclaude-root layout with compact-context.md but no memory/ dir."""
+    from feishu_bridge.runtime import resolve_dotclaude_root
+    ws = tmp_path / ".claude"
+    ws.mkdir()
+    (ws / "compact-context.md").write_text("hi", encoding="utf-8")
+    assert resolve_dotclaude_root(str(ws)) == ws
+
+
+def test_resolver_fresh_repo_falls_back_to_nested(tmp_path: Path) -> None:
+    """Neither layout present → return nested path (callers handle missing)."""
+    from feishu_bridge.runtime import resolve_dotclaude_root
+    ws = tmp_path / "fresh-project"
+    ws.mkdir()
+    assert resolve_dotclaude_root(str(ws)) == ws / ".claude"
+
+
+def test_fresh_context_dotclaude_root_layout(tmp_path: Path) -> None:
+    """Regression: workspace = ``~/.claude`` (dotclaude root) → fresh_context
+    must surface its `memory/projects.md` index, not silently return None.
+
+    Catches the Stage 1 production bug where path resolution assumed a nested
+    ``.claude/`` and skipped both sources for the dotclaude bot.
+    """
+    from feishu_bridge.runtime import build_fresh_context_prompt
+    ws = tmp_path / ".claude"
+    _write(ws / "memory" / "projects.md", PROJECTS_MD)
+    out = build_fresh_context_prompt(str(ws))
+    assert out is not None
+    assert "Projects index" in out
+    assert "feishu-bridge → ~/projects/feishu-bridge" in out

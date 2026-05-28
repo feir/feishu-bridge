@@ -16,6 +16,7 @@ from feishu_bridge.runtime import (
     ClaudeRunner,
     SessionMap,
     pick_primary_model,
+    resolve_dotclaude_root,
 )
 
 
@@ -238,6 +239,9 @@ class BridgeCommandHandler:
 
         elif cmd == "workflow-confirm":
             self._handle_workflow_confirm(item, handle)
+
+        elif cmd == "project":
+            self._handle_project(item, arg, handle)
 
         elif cmd == "workflow-unsupported":
             slash_cmd, _, reason = arg.partition("|")
@@ -1344,6 +1348,158 @@ class BridgeCommandHandler:
                 "`/feishu-bitable fields <app_token> <table_id>` — 查看字段定义"
             )
         return "未知服务"
+
+    # ── /project: bind thread to a project workspace (Stage 2) ──
+
+    def _handle_project(self, item: dict, arg: str, handle):
+        """Bind / clear / show the current thread's project workspace binding.
+
+        Usage:
+            /project <id>            # look up id in ~/.claude/memory/projects.md
+            /project <path>          # bind to absolute or ~-relative path
+            /project clear           # remove current binding
+            /project                 # show current binding (or 'unbound')
+        """
+        from feishu_bridge.state_thread_projects import (
+            normalize_path,
+            parse_projects_registry,
+        )
+
+        tp = getattr(self.bot, "thread_projects", None)
+        if tp is None:
+            handle.deliver("⚠️ thread-projects 存储未初始化", is_error=True)
+            return
+
+        bot_id  = item["bot_id"]
+        chat_id = item["chat_id"]
+        thr_id  = item.get("thread_id")
+        tag = SessionMap.format_key((bot_id, chat_id, thr_id))
+
+        sub = (arg or "").strip()
+
+        # Show current binding
+        if not sub:
+            entry = tp.get(tag)
+            if entry is None:
+                handle.deliver("当前 thread 未绑定项目。用法：\n"
+                               "`/project <id>` — 按 projects.md 表查 id\n"
+                               "`/project <path>` — 直接绑定路径\n"
+                               "`/project clear` — 清除绑定")
+            else:
+                handle.deliver(
+                    f"当前绑定：**{entry['project_id']}** → `{entry['workspace']}`\n"
+                    f"绑定于 {entry['bound_at']}（source: {entry['source']}）"
+                )
+            return
+
+        # Clear binding
+        if sub.lower() == "clear":
+            removed = tp.clear(tag)
+            if removed:
+                # [R3-H3] Drop the live session so the next turn re-spawns
+                # against the default workspace.
+                self.bot.session_map.delete((bot_id, chat_id, thr_id))
+                handle.deliver(
+                    "✅ 已清除项目绑定\n_（已重置会话；下一条消息将回到默认工作区起新会话）_"
+                )
+            else:
+                handle.deliver("ℹ️ 当前 thread 本就未绑定，无需清除")
+            return
+
+        # /project <id> or /project <path>
+        workspace_path: str | None = None
+        project_id: str | None = None
+        bound_via_id = False
+
+        # Token without path-like characters → must resolve through the
+        # registry. We never silently fall back to path binding here: a
+        # missing/corrupt registry could otherwise let "/project foo" bind to
+        # a relative directory of the same name in the bridge cwd (Codex R3
+        # code-review HIGH).
+        if "/" not in sub and "~" not in sub and "." not in sub:
+            registry_path = (
+                resolve_dotclaude_root(self.bot.workspace) / "memory" / "projects.md"
+            )
+            if not registry_path.exists():
+                handle.deliver(
+                    f"❌ 找不到项目注册表 `{registry_path}`。\n"
+                    f"用 `/project <绝对路径或 ~/...>` 直接绑定。",
+                    is_error=True,
+                )
+                return
+            try:
+                raw = registry_path.read_text(encoding="utf-8")
+                entries = parse_projects_registry(raw)
+            except (OSError, UnicodeError) as exc:
+                log.warning("failed to read/parse projects.md: %s", exc)
+                handle.deliver(
+                    f"❌ 读取项目注册表失败：{exc}\n"
+                    f"用 `/project <绝对路径或 ~/...>` 直接绑定。",
+                    is_error=True,
+                )
+                return
+            if not entries:
+                handle.deliver(
+                    "❌ 项目注册表为空（`memory/projects.md` 无可解析行）。\n"
+                    "用 `/project <绝对路径或 ~/...>` 直接绑定。",
+                    is_error=True,
+                )
+                return
+            match = next((e for e in entries if e.id == sub), None)
+            if not match:
+                available = ", ".join(e.id for e in entries[:12])
+                handle.deliver(
+                    f"❌ 未在 `memory/projects.md` 中找到项目 `{sub}`。\n"
+                    f"可用项目：{available}\n"
+                    f"或者用 `/project <绝对路径>` 直接绑定。",
+                    is_error=True,
+                )
+                return
+            normalized = normalize_path(match.path)
+            if not normalized:
+                handle.deliver(
+                    f"❌ projects.md 中 `{sub}` 的路径无法解析：{match.path!r}",
+                    is_error=True,
+                )
+                return
+            workspace_path = normalized
+            project_id = match.id
+            bound_via_id = True
+        else:
+            # Path-like input — normalize and use basename as id
+            normalized = normalize_path(sub)
+            if normalized is None:
+                handle.deliver(f"❌ 路径无法解析：{sub!r}", is_error=True)
+                return
+            workspace_path = normalized
+            project_id = os.path.basename(normalized.rstrip("/")) or normalized
+
+        assert workspace_path is not None and project_id is not None
+
+        try:
+            entry = tp.set(
+                tag,
+                project_id=project_id,
+                workspace=workspace_path,
+                source="explicit",
+            )
+        except ValueError as exc:
+            handle.deliver(f"❌ {exc}", is_error=True)
+            return
+
+        # [R3-H3] Drop the live session so the next turn re-spawns at the
+        # newly-bound workspace. Without this, an OMP RPC process already in
+        # flight would keep its old cwd + auto-loaded memories and the bind
+        # would only affect attachment routing.
+        self.bot.session_map.delete((bot_id, chat_id, thr_id))
+
+        msg = f"✅ 已绑定 **{entry['project_id']}** → `{entry['workspace']}`"
+        if not bound_via_id:
+            msg += "\n（按路径绑定，project_id = 路径 basename）"
+        if isinstance(self.bot.runner, ClaudeRunner):
+            msg += "\n_(Claude 模式下 cwd 不切换，仅影响 system prompt + 附件路径)_"
+        msg += "\n_（已重置会话；下一条消息将以新工作区起新会话）_"
+        handle.deliver(msg)
 
     def add_queued_reaction_to_item(self, item: dict, message_id: str):
         item["_queued_reaction_id"] = add_queued_reaction(self.bot.lark_client, message_id)

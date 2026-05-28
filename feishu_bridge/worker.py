@@ -19,6 +19,7 @@ from feishu_bridge.parsers import (
 from feishu_bridge.quota import WINDOW_LABELS
 from feishu_bridge.runtime import (
     BaseRunner, SessionMap, build_fresh_context_prompt, pick_primary_model,
+    resolve_dotclaude_root,
 )
 from feishu_bridge.session_journal import SessionJournal
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
@@ -46,6 +47,68 @@ def _derive_runner_type(runner) -> str:
     if "codex" in name:
         return "codex"
     return name.replace("runner", "") or "unknown"
+
+
+
+# ── Stage 2: heuristic project-binding suffix + log ──────────────────────────
+
+def _build_project_suffix(match, message: str) -> str | None:
+    """Compose a one-line binding-suggestion suffix for the agent reply.
+
+    Confidence taxonomy (mirrors design.md §决策矩阵):
+      * ``high``           → "识别到项目 X，回复 /project X 确认绑定"
+      * ``medium`` / ``low``→ "未绑定项目，回复 /project <id> 指定 / clear 清除"
+      * ``none`` + history → "未绑定项目，建议回复 /project <id> 指定"
+      * ``none`` + other   → no suffix (R3 narrow rule — don't pester chitchat)
+    """
+    from feishu_bridge.project_detector import has_history_trigger
+
+    if match is not None:
+        conf = match.confidence
+        pid = match.project_id
+        if conf == "high":
+            return f"_（识别到项目 **{pid}**，回复 `/project {pid}` 确认绑定）_"
+        if conf in ("medium", "low"):
+            return ("_（未绑定项目，回复 `/project <id>` 指定 / `/project clear` "
+                    "清除）_")
+    # match is None
+    if has_history_trigger(message):
+        return "_（未绑定项目，建议回复 `/project <id>` 指定，让回答更聚焦）_"
+    return None
+
+
+def _log_heuristic_event(global_workspace, bot_id: str, tag: str,
+                         message: str, match, history_triggered: bool) -> None:
+    """Append a single line of JSON describing a heuristic decision.
+
+    Goes to ``<global_workspace>/state/feishu-bridge/heuristic-log-{bot_id}.jsonl``.
+    Best-effort; logging failures must never propagate.
+    """
+    try:
+        path = (Path(global_workspace) / "state" / "feishu-bridge"
+                / f"heuristic-log-{bot_id}.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        msg_hash = hash(message) & 0xFFFFFFFF  # cheap, non-crypto fingerprint
+        # Spec task 4.5 schema: {ts, tag, message_hash, match, user_action}.
+        # `user_action` is populated by a future feedback-loop pass (Follow-up
+        # F7); for now write `null` so consumers see the expected key. We also
+        # carry `history_triggered` to support narrow-rule calibration.
+        record = {
+            "ts": int(time.time()),
+            "tag": tag,
+            "message_hash": f"{msg_hash:08x}",
+            "match": (
+                None if match is None
+                else {"id": match.project_id, "confidence": match.confidence,
+                      "via": match.matched_via}
+            ),
+            "user_action": None,
+            "history_triggered": bool(history_triggered),
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        log.warning("heuristic-log append failed: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Defer approval card
@@ -626,6 +689,7 @@ def process_message(
     fetch_quoted_message_fn=fetch_quoted_message,
     remove_typing_indicator_fn=remove_typing_indicator,
     session_not_found_signatures=None,
+    thread_projects=None,
 ):
     """Process a single message from the work queue."""
     bot_id = item["bot_id"]
@@ -634,6 +698,10 @@ def process_message(
     parent_id = item.get("parent_id")
     sender_id = item.get("sender_id", "")
     text = item.get("text", "")
+    original_text = text   # [R3 code-review M1] Heuristic decisions MUST use
+                           # the user's raw message, not the post-enrichment
+                           # text (quoted message / card / attachment notices
+                           # would otherwise leak history-trigger words).
     image_key = item.get("image_key")
     file_key = item.get("file_key")
     file_name = item.get("file_name")
@@ -641,6 +709,32 @@ def process_message(
 
     key = (bot_id, chat_id, thread_id)
     tag = SessionMap.format_key(key)
+
+    # ── Stage 2: thread→project binding + heuristic project intent ──
+    # bound != None  → user explicitly /project'd this thread
+    # bound == None  → fall back to default workspace; record heuristic match
+    #                  (if any) so the worker can append a binding-suggestion
+    #                  suffix to the reply without writing the table (D6).
+    bound = thread_projects.get(tag) if thread_projects is not None else None
+    resolved_workspace = bound["workspace"] if bound else bot_config["workspace"]
+    project_workspace = bound["workspace"] if bound else None
+    global_workspace  = bot_config["workspace"]   # [R2] source 1/2 恒走 ~/.claude
+
+    heuristic_match = None
+    if bound is None and thread_projects is not None and (original_text or "").strip():
+        try:
+            from feishu_bridge.project_detector import detect_project_intent
+            from feishu_bridge.state_thread_projects import parse_projects_registry
+            registry_path = (
+                resolve_dotclaude_root(global_workspace) / "memory" / "projects.md"
+            )
+            if registry_path.exists():
+                _registry = parse_projects_registry(
+                    registry_path.read_text(encoding="utf-8")
+                )
+                heuristic_match = detect_project_intent(original_text, _registry)
+        except (OSError, UnicodeError) as exc:
+            log.warning("project detector failed: %s", exc)
     handle = response_handle_cls(lark_client, chat_id, thread_id, message_id,
                                  bot_id=bot_id)
     image_path = None
@@ -659,7 +753,7 @@ def process_message(
 
         if image_key and message_id:
             image_path = download_image_fn(
-                lark_client, message_id, image_key, bot_config["workspace"]
+                lark_client, message_id, image_key, resolved_workspace
             )
             if image_path:
                 text = (
@@ -673,7 +767,7 @@ def process_message(
             display_name = file_name or "attachment"
             file_path = download_file_fn(
                 lark_client, message_id, file_key, display_name,
-                bot_config["workspace"],
+                resolved_workspace,
             )
             if file_path:
                 text = (
@@ -1067,19 +1161,29 @@ def process_message(
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
                 env_extra=env_extra,
+                workspace_override=resolved_workspace,   # [Stage 2]
             )
         else:
             new_sid = existing_sid or str(uuid.uuid4())
-            # Stage 1: inject global fresh-session memory (compact-context +
-            # projects index + session-history hint). Stage 2 will additionally
-            # pass project_workspace once thread→project binding lands.
-            fresh_ctx = build_fresh_context_prompt(bot_config["workspace"])
+            # Stage 1: global fresh-session memory (compact-context + projects
+            # index + session-history hint).
+            # Stage 2 [R3]: opt project_workspace into source 3 *only* when the
+            # runner does not have its own per-workspace memories backend. OMP
+            # auto-loads ~/.omp/agent/memories/<ws>/MEMORY.md, so source 3 would
+            # duplicate ~64KB of project context.
+            from feishu_bridge.runtime_omp import OmpRpcRunner
+            _is_omp = isinstance(runner, OmpRpcRunner)
+            fresh_ctx = build_fresh_context_prompt(
+                global_workspace,
+                project_workspace=(None if _is_omp else project_workspace),
+            )
             result = runner.run(
                 text, session_id=new_sid, resume=False, tag=tag,
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
                 env_extra=env_extra,
                 fresh_context=fresh_ctx,
+                workspace_override=resolved_workspace,
             )
             if stale_notice and isinstance(result, dict) and not result.get("is_error"):
                 result["result"] = stale_notice + "\n\n" + (result.get("result") or "")
@@ -1148,14 +1252,21 @@ def process_message(
                 log.warning("Session %s not found, auto-healing", existing_sid[:8])
                 session_map.delete(key)
                 retry_sid = str(uuid.uuid4())
-                # Auto-heal fresh path → re-inject fresh-context (same as 1071-1083)
-                retry_fresh_ctx = build_fresh_context_prompt(bot_config["workspace"])
+                # Auto-heal fresh path → re-inject fresh-context with the same
+                # Stage 2 [R3] OMP source-3 gating as the primary fresh branch.
+                from feishu_bridge.runtime_omp import OmpRpcRunner as _OmpRpcRunner
+                _retry_is_omp = isinstance(runner, _OmpRpcRunner)
+                retry_fresh_ctx = build_fresh_context_prompt(
+                    global_workspace,
+                    project_workspace=(None if _retry_is_omp else project_workspace),
+                )
                 result = runner.run(
                     text, session_id=retry_sid, resume=False, tag=tag,
                     on_output=on_stream, on_tool_status=on_tool_status,
                     on_todo_update=on_todo_update, on_agent_update=on_agent_update,
                     env_extra=env_extra,
                     fresh_context=retry_fresh_ctx,
+                    workspace_override=resolved_workspace,
                 )
                 if result.get("cancelled"):
                     handle.deliver(result["result"])
@@ -1258,6 +1369,26 @@ def process_message(
         ).rstrip()
         if _text:
             result["result"] = _text
+
+        # --- Stage 2: heuristic project-binding suffix + log ---
+        # Only attached on un-bound threads, on successful turns, when the
+        # detector found a match (or the user used a history/deploy trigger
+        # word — R3 narrow rule). Suffix is appended once; we never write
+        # the ThreadProjects table here (D6 — heuristic identifies only).
+        if (
+            thread_projects is not None
+            and bound is None
+            and not result.get("is_error")
+            and result.get("result")
+        ):
+            from feishu_bridge.project_detector import has_history_trigger
+            suffix = _build_project_suffix(heuristic_match, original_text)
+            if suffix:
+                result["result"] = result["result"].rstrip() + "\n\n" + suffix
+            _log_heuristic_event(
+                global_workspace, bot_id, tag, original_text,
+                heuristic_match, has_history_trigger(original_text),
+            )
 
         # Phase 6.3: append turn boundary to bridge journal.
         # Runs AFTER the Status-line strip so the journal records the same

@@ -96,7 +96,7 @@ log = logging.getLogger("feishu-bridge")
 _BRIDGE_CMD_EXACT = frozenset({
     "/help", "/new", "/clear", "/reset", "/stop", "/cancel",
     "/compact", "/model", "/agent", "/provider", "/status", "/btw", "/update",
-    "/restart-all", "/restart",
+    "/restart-all", "/restart", "/project",
 })
 
 
@@ -722,6 +722,9 @@ class FeishuBot:
         self._runtime_state_path = (
             Path(self.workspace) / "state" / "feishu-bridge" / f"runtime-state-{self.bot_id}.json"
         )
+        self._thread_projects_path = (
+            Path(self.workspace) / "state" / "feishu-bridge" / f"thread-projects-{self.bot_id}.json"
+        )
         try:
             from .ledger import Ledger
             self._ledger = Ledger.open(
@@ -767,6 +770,8 @@ class FeishuBot:
         )
         self.model_aliases = resolve_model_aliases(self.agent_config)
         self.command_handler = BridgeCommandHandler(self)
+        from feishu_bridge.state_thread_projects import ThreadProjects
+        self.thread_projects = ThreadProjects(self._thread_projects_path)
 
         # Quota poller (claude.ai API, cookie-based auth)
         from feishu_bridge.quota import QuotaPoller
@@ -1611,6 +1616,9 @@ class FeishuBot:
                 bridge_cmd = "btw"
             elif cmd == "/update":
                 bridge_cmd = "update"
+            elif cmd == "/project":
+                bridge_cmd = "project"
+                # cmd_arg keeps trailing text (id / path / 'clear' / empty)
             elif cmd == "/feishu-tasks":
                 bridge_cmd = "feishu-tasks"
             elif cmd == "/feishu-doc":
@@ -2027,6 +2035,7 @@ class FeishuBot:
                         feishu_tasks=getattr(self, 'feishu_tasks', None),
                         feishu_docs=getattr(self, 'feishu_docs', None),
                         feishu_sheets=getattr(self, 'feishu_sheets', None),
+                        thread_projects=getattr(self, 'thread_projects', None),
                     )
             except Exception:
                 log.exception("Worker loop error")

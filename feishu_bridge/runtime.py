@@ -178,6 +178,37 @@ def _parse_memory_sections(content: str, anchor_max_bytes: int) -> str:
     return "\n\n".join(out)
 
 
+def resolve_dotclaude_root(workspace: str) -> Path:
+    """Locate the workspace's ``.claude`` config directory.
+
+    The bridge accepts two workspace layouts:
+
+    1. **Project workspace** — e.g. ``~/projects/feishu-bridge``. The Claude
+       configuration lives in a nested ``./.claude/`` subdirectory.
+    2. **Dotclaude root** — e.g. ``~/.claude``. The workspace path *is* the
+       config directory; ``memory/``, ``compact-context.md`` etc. are direct
+       children, not under another ``.claude/``.
+
+    This helper picks whichever layout actually exists. Callers should use it
+    as the single source of truth so that ``runtime.build_fresh_context_prompt``,
+    ``commands._handle_project``, ``worker.process_message`` and ``done`` all
+    agree on the same physical directory.
+    """
+    ws = Path(str(workspace)).expanduser()
+    nested = ws / ".claude"
+    # If the nested .claude dir contains memory/ or compact-context.md, prefer
+    # it — that's the project-workspace layout the unit tests model. Otherwise
+    # fall back to the workspace itself (dotclaude-root layout).
+    if (nested / "memory").is_dir() or (nested / "compact-context.md").exists():
+        return nested
+    if ws.name == ".claude" and ((ws / "memory").is_dir()
+                                 or (ws / "compact-context.md").exists()):
+        return ws
+    # Final fallback: assume the nested layout. Callers' `.exists()` checks
+    # downstream will handle the missing-file case via the fallback contract.
+    return nested
+
+
 def build_fresh_context_prompt(
     workspace: str,
     *,
@@ -212,14 +243,14 @@ def build_fresh_context_prompt(
     ws_path = Path(str(workspace)).expanduser()
 
     # Source 1 — compact-context.md
-    compact_path = ws_path / ".claude" / "compact-context.md"
+    compact_path = resolve_dotclaude_root(workspace) / "compact-context.md"
     if compact_path.exists():
         text = _read_text_safe(compact_path)
         if text and text.strip():
             parts.append(f"## Compact context\n{text.strip()}")
 
     # Source 2 — projects.md index
-    projects_path = ws_path / ".claude" / "memory" / "projects.md"
+    projects_path = resolve_dotclaude_root(workspace) / "memory" / "projects.md"
     if projects_path.exists():
         text = _read_text_safe(projects_path)
         if text:
