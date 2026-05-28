@@ -18,7 +18,7 @@ from feishu_bridge.parsers import (
 )
 from feishu_bridge.quota import WINDOW_LABELS
 from feishu_bridge.runtime import (
-    BaseRunner, SessionMap, pick_primary_model,
+    BaseRunner, SessionMap, build_fresh_context_prompt, pick_primary_model,
 )
 from feishu_bridge.session_journal import SessionJournal
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
@@ -1070,11 +1070,16 @@ def process_message(
             )
         else:
             new_sid = existing_sid or str(uuid.uuid4())
+            # Stage 1: inject global fresh-session memory (compact-context +
+            # projects index + session-history hint). Stage 2 will additionally
+            # pass project_workspace once thread→project binding lands.
+            fresh_ctx = build_fresh_context_prompt(bot_config["workspace"])
             result = runner.run(
                 text, session_id=new_sid, resume=False, tag=tag,
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
                 env_extra=env_extra,
+                fresh_context=fresh_ctx,
             )
             if stale_notice and isinstance(result, dict) and not result.get("is_error"):
                 result["result"] = stale_notice + "\n\n" + (result.get("result") or "")
@@ -1143,11 +1148,14 @@ def process_message(
                 log.warning("Session %s not found, auto-healing", existing_sid[:8])
                 session_map.delete(key)
                 retry_sid = str(uuid.uuid4())
+                # Auto-heal fresh path → re-inject fresh-context (same as 1071-1083)
+                retry_fresh_ctx = build_fresh_context_prompt(bot_config["workspace"])
                 result = runner.run(
                     text, session_id=retry_sid, resume=False, tag=tag,
                     on_output=on_stream, on_tool_status=on_tool_status,
                     on_todo_update=on_todo_update, on_agent_update=on_agent_update,
                     env_extra=env_extra,
+                    fresh_context=retry_fresh_ctx,
                 )
                 if result.get("cancelled"):
                     handle.deliver(result["result"])

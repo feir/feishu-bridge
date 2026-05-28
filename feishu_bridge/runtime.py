@@ -76,6 +76,186 @@ def get_bridge_settings_path() -> str:
     return _BRIDGE_SETTINGS_PATH
 
 EMPTY_RESULT_MESSAGE = "Claude 本次未返回任何内容，请稍后重试。"
+
+SESSION_HISTORY_HINT = (
+    "若需历史细节请用 `session-history search <关键词>`（位于 `~/.claude/bin/`）。"
+)
+
+# Section names extracted from project MEMORY.md when project_workspace is set.
+# Matching is case-insensitive and whitespace-tolerant; variant headings like
+# "Pitfalls (project-specific)" still match "Known Pitfalls" via substring.
+_MEMORY_SECTION_KEYS = (
+    "Commands",
+    "Constraints",
+    "Known Pitfalls",
+    "Pitfalls",
+    "待办",
+    "TODO",
+    "Anchor",
+)
+
+
+def _read_text_safe(path: Path) -> Optional[str]:
+    """Read a UTF-8 text file or return None on any failure."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError) as exc:
+        log.warning("fresh-context: could not read %s: %s", path, exc)
+        return None
+
+
+def _parse_projects_md(content: str) -> str:
+    """Extract a compact `<id> → <path>` index from `memory/projects.md`.
+
+    The file format is a Markdown table with columns `ID | 名称 | 路径 | 状态`.
+    We tolerate extra columns and skip rows whose path cell is empty or whose id
+    looks like a separator (e.g. `---`).
+    """
+    lines = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        ident, _name, path_cell = cells[0], cells[1], cells[2]
+        if not ident or not path_cell:
+            continue
+        if set(ident) <= set("-: "):
+            continue
+        if ident.lower() in {"id", "项目"}:
+            continue
+        path = path_cell.strip().strip("`").strip()
+        if not path:
+            continue
+        lines.append(f"- {ident} → {path}")
+    if not lines:
+        return ""
+    return "## Projects index\n" + "\n".join(lines)
+
+
+def _parse_memory_sections(content: str, anchor_max_bytes: int) -> str:
+    """Extract the relevant H2 sections from a project MEMORY.md.
+
+    Headings are matched case-insensitively against `_MEMORY_SECTION_KEYS` via
+    substring; this tolerates variants like `## Known Pitfalls (project-specific)`.
+    Long sections (notably `Anchor`) are truncated to `anchor_max_bytes` bytes to
+    keep the injected payload bounded.
+    """
+    out: list[str] = []
+    current_heading: Optional[str] = None
+    current_buf: list[str] = []
+
+    def _flush() -> None:
+        if current_heading is None:
+            return
+        body = "\n".join(current_buf).strip("\n")
+        if not body:
+            return
+        encoded = body.encode("utf-8")
+        if len(encoded) > anchor_max_bytes:
+            body = encoded[:anchor_max_bytes].decode("utf-8", errors="ignore").rstrip()
+            body += "\n…(truncated)"
+        out.append(f"{current_heading}\n{body}")
+
+    for raw in content.splitlines():
+        if raw.startswith("## "):
+            _flush()
+            heading_text = raw[3:].strip()
+            lower = heading_text.lower()
+            if any(key.lower() in lower for key in _MEMORY_SECTION_KEYS):
+                current_heading = f"## {heading_text}"
+                current_buf = []
+            else:
+                current_heading = None
+                current_buf = []
+            continue
+        if current_heading is not None:
+            current_buf.append(raw)
+    _flush()
+
+    return "\n\n".join(out)
+
+
+def build_fresh_context_prompt(
+    workspace: str,
+    *,
+    project_workspace: Optional[str] = None,
+    max_bytes: int = 2048,
+    anchor_max_bytes: int = 1024,
+) -> Optional[str]:
+    """Compose a fresh-session memory prompt for `--append-system-prompt`.
+
+    Sources merged in order (partial-OK; bad sources are skipped, not fatal):
+      1. ``<workspace>/.claude/compact-context.md`` — global rolling context.
+      2. ``<workspace>/.claude/memory/projects.md`` — distilled into a compact
+         ``<id> → <path>`` index so the agent knows where each project lives.
+      3. ``<project_workspace>/.claude/MEMORY.md`` — only when ``project_workspace``
+         is provided (Stage 2 binding). Restricted to the H2 sections enumerated
+         in :data:`_MEMORY_SECTION_KEYS`.
+
+    A trailing :data:`SESSION_HISTORY_HINT` reminds the agent to consult
+    ``session-history`` for older context.
+
+    Returns ``None`` only when every source contributes zero usable content; any
+    single source failure is logged at WARNING and skipped. Never raises.
+
+    The combined payload is hard-capped at ``max_bytes`` bytes; long single
+    sections (especially MEMORY ``Anchor``) are further bounded by
+    ``anchor_max_bytes``.
+    """
+    if workspace is None or not str(workspace).strip():
+        return None
+
+    parts: list[str] = []
+    ws_path = Path(str(workspace)).expanduser()
+
+    # Source 1 — compact-context.md
+    compact_path = ws_path / ".claude" / "compact-context.md"
+    if compact_path.exists():
+        text = _read_text_safe(compact_path)
+        if text and text.strip():
+            parts.append(f"## Compact context\n{text.strip()}")
+
+    # Source 2 — projects.md index
+    projects_path = ws_path / ".claude" / "memory" / "projects.md"
+    if projects_path.exists():
+        text = _read_text_safe(projects_path)
+        if text:
+            try:
+                index = _parse_projects_md(text)
+            except Exception as exc:  # defensive: never raise out
+                log.warning("fresh-context: projects.md parse failed: %s", exc)
+                index = ""
+            if index:
+                parts.append(index)
+
+    # Source 3 — project-specific MEMORY (Stage 2 only)
+    if project_workspace:
+        proj_path = Path(str(project_workspace)).expanduser()
+        memory_path = proj_path / ".claude" / "MEMORY.md"
+        if memory_path.exists():
+            text = _read_text_safe(memory_path)
+            if text:
+                try:
+                    sections = _parse_memory_sections(text, anchor_max_bytes)
+                except Exception as exc:  # defensive
+                    log.warning("fresh-context: MEMORY.md parse failed: %s", exc)
+                    sections = ""
+                if sections:
+                    parts.append(f"## Project MEMORY ({proj_path.name})\n{sections}")
+
+    if not parts:
+        return None
+
+    body = "\n\n".join(parts)
+    if len(body.encode("utf-8")) > max_bytes:
+        # Truncate at byte boundary, then decode-tolerant rstrip to keep valid UTF-8
+        body = body.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore").rstrip()
+        body += "\n…(truncated)"
+    return f"{body}\n\n---\n{SESSION_HISTORY_HINT}"
+
 SILENT_OK_MESSAGE = "✓ 操作已完成（无文本输出）"
 
 
@@ -587,8 +767,13 @@ class BaseRunner(ABC):
     @abstractmethod
     def build_args(self, prompt: str, session_id: Optional[str],
                    resume: bool, streaming: bool, *,
-                   fork_session: bool = False) -> list:
-        """构建 CLI 命令行参数列表。"""
+                   fork_session: bool = False,
+                   fresh_context: Optional[str] = None) -> list:
+        """构建 CLI 命令行参数列表。
+
+        ``fresh_context`` 用于把 :func:`build_fresh_context_prompt` 的产物追加到
+        子进程的 ``--append-system-prompt``；仅在 ``resume=False`` 时由 caller 传入。
+        """
 
     @abstractmethod
     def parse_streaming_line(self, event: dict, state: StreamState) -> None:
@@ -647,14 +832,23 @@ class BaseRunner(ABC):
         """
         return True
 
-    def _build_system_prompt(self) -> str:
-        """Merge safety guard + extra system prompts into one string."""
-        parts = []
+    def _build_system_prompt(self, extra: Optional[str] = None) -> str:
+        """Merge safety guard + extra system prompts into one string.
+
+        ``extra`` is an optional per-run addendum (e.g. fresh-session memory
+        produced by :func:`build_fresh_context_prompt`); it is appended after
+        the safety guard and any instance-level ``extra_system_prompts``.
+        Passing ``extra`` does not mutate instance state — callers may invoke
+        this concurrently with different ``extra`` values without interference.
+        """
+        parts: list[str] = []
         if self._safety_prompt_mode == "full":
             parts.append(self._SAFETY_PROMPT)
         elif self._safety_prompt_mode == "minimal":
             parts.append(self._MINIMAL_SAFETY_PROMPT)
         parts.extend(self._extra_system_prompts)
+        if extra:
+            parts.append(extra)
         return "\n\n".join(parts)
 
     def _build_streaming_result(self, state: StreamState,
@@ -736,7 +930,9 @@ class BaseRunner(ABC):
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
             on_agent_update=None, env_extra: Optional[dict] = None,
-            fork_session: bool = False) -> dict:
+            fork_session: bool = False,
+            fresh_context: Optional[str] = None,
+            workspace_override: Optional[str] = None) -> dict:
 
         if len(prompt) > MAX_PROMPT_CHARS:
             log.warning("Prompt truncated: %d -> %d chars", len(prompt), MAX_PROMPT_CHARS)
@@ -744,13 +940,19 @@ class BaseRunner(ABC):
 
         streaming = bool(on_output) or self.ALWAYS_STREAMING
         args = self.build_args(prompt, session_id, resume, streaming,
-                               fork_session=fork_session)
+                               fork_session=fork_session,
+                               fresh_context=fresh_context)
 
-        _sp = self._build_system_prompt()
-        log.info("%s: resume=%s sid=%s stream=%s prompt=%d chars sys_prompt=%d chars (~%d tokens)",
+        # Mirror what build_args composed so the log reports the actual size
+        # the CLI saw (including fresh_context). _build_system_prompt is a pure
+        # function of (instance prompts + extra), so this is cheap and safe.
+        _sp = self._build_system_prompt(extra=fresh_context)
+        cwd = workspace_override or self.workspace
+        log.info("%s: resume=%s sid=%s stream=%s prompt=%d chars sys_prompt=%d chars (~%d tokens) cwd=%s%s",
                  self.get_display_name(), resume,
                  session_id[:8] if session_id else "-",
-                 streaming, len(prompt), len(_sp), len(_sp) // 4)
+                 streaming, len(prompt), len(_sp), len(_sp) // 4,
+                 cwd, " (override)" if workspace_override else "")
 
         env = None
         extra_env = self.get_extra_env()
@@ -765,7 +967,7 @@ class BaseRunner(ABC):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=self.workspace,
+            cwd=cwd,
             env=env,
             start_new_session=True,
         )
@@ -1082,7 +1284,8 @@ class ClaudeRunner(BaseRunner):
     ]
 
     def build_args(self, prompt, session_id, resume, streaming, *,
-                   fork_session=False):
+                   fork_session=False,
+                   fresh_context: Optional[str] = None):
         args = [
             self.command, "-p",
         ]
@@ -1097,7 +1300,7 @@ class ClaudeRunner(BaseRunner):
             args.extend(["--model", self.model])
         if self._setting_sources is not None:
             args.extend(["--setting-sources", self._setting_sources])
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(extra=fresh_context)
         if system_prompt:
             args.extend(["--append-system-prompt", system_prompt])
 
@@ -1342,7 +1545,8 @@ class CodexRunner(BaseRunner):
         self._tls = threading.local()
 
     def build_args(self, prompt, session_id, resume, streaming, *,
-                   fork_session=False):
+                   fork_session=False,
+                   fresh_context: Optional[str] = None):
         args = [
             self.command, "exec",
         ]
@@ -1353,7 +1557,7 @@ class CodexRunner(BaseRunner):
         args.extend([
             "--dangerously-bypass-approvals-and-sandbox",
             "--json",
-            "-C", self.workspace,
+            "-C", getattr(self._tls, "workspace_override", None) or self.workspace,
         ])
         if self.model:
             args.extend(["-m", self.model])
@@ -1374,11 +1578,21 @@ class CodexRunner(BaseRunner):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            on_agent_update=None, env_extra: Optional[dict] = None) -> dict:
-        """Override run() to manage per-invocation system prompt temp file."""
+            on_agent_update=None, env_extra: Optional[dict] = None,
+            fork_session: bool = False,
+            fresh_context: Optional[str] = None,
+            workspace_override: Optional[str] = None) -> dict:
+        """Override run() to manage per-invocation system prompt temp file.
+
+        ``fresh_context`` is folded into the temp instructions file so the
+        Codex CLI receives one merged ``model_instructions_file``. The base
+        run() must not re-inject it via ``build_args`` (Codex doesn't honor
+        ``--append-system-prompt``), so we pass ``fresh_context=None`` upstream.
+        """
         self._tls.instructions_path = None
+        self._tls.workspace_override = workspace_override
         try:
-            system_prompt = self._build_system_prompt()
+            system_prompt = self._build_system_prompt(extra=fresh_context)
             if system_prompt:
                 fd, path = tempfile.mkstemp(
                     prefix="codex-instructions-", suffix=".md", text=True,
@@ -1393,6 +1607,8 @@ class CodexRunner(BaseRunner):
                 tag=tag, on_output=on_output, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
                 env_extra=env_extra,
+                fresh_context=None,
+                workspace_override=workspace_override,
             )
         finally:
             path = getattr(self._tls, "instructions_path", None)
@@ -1402,6 +1618,7 @@ class CodexRunner(BaseRunner):
                 except OSError:
                     pass
                 self._tls.instructions_path = None
+            self._tls.workspace_override = None
 
     def parse_streaming_line(self, event, state):
         etype = event.get("type", "")

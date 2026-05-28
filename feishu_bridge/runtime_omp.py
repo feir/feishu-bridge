@@ -145,7 +145,9 @@ class OmpRpcRunner(BaseRunner):
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
             on_agent_update=None, env_extra: Optional[dict] = None,
-            fork_session: bool = False) -> dict:
+            fork_session: bool = False,
+            fresh_context: Optional[str] = None,
+            workspace_override: Optional[str] = None) -> dict:
 
         self._ensure_reaper()
 
@@ -154,7 +156,9 @@ class OmpRpcRunner(BaseRunner):
             return self._do_compact(session_id, stripped, tag)
 
         try:
-            rpc = self._get_or_spawn(session_id, resume, env_extra)
+            rpc = self._get_or_spawn(session_id, resume, env_extra,
+                                        fresh_context=fresh_context,
+                                        workspace_override=workspace_override)
         except _SpawnError as e:
             return {
                 "result": f"OMP 启动失败：{e}",
@@ -272,7 +276,9 @@ class OmpRpcRunner(BaseRunner):
     # ── Process pool ──
 
     def _get_or_spawn(self, session_id: Optional[str], resume: bool = True,
-                      env_extra: Optional[dict] = None) -> _RpcProcess:
+                      env_extra: Optional[dict] = None, *,
+                      fresh_context: Optional[str] = None,
+                      workspace_override: Optional[str] = None) -> _RpcProcess:
         if not session_id:
             raise _SpawnError("session_id is required for OMP RPC mode")
 
@@ -287,7 +293,9 @@ class OmpRpcRunner(BaseRunner):
                 log.warning("OMP process dead for sid=%s, respawning", session_id[:8])
                 self._processes.pop(session_id, None)
 
-        rpc = self._spawn(session_id, env_extra)
+        rpc = self._spawn(session_id, env_extra,
+                          fresh_context=fresh_context,
+                          workspace_override=workspace_override)
 
         with self._proc_lock:
             old = self._processes.get(session_id)
@@ -298,7 +306,9 @@ class OmpRpcRunner(BaseRunner):
 
         return rpc
 
-    def _spawn(self, session_id: str, env_extra: Optional[dict] = None) -> _RpcProcess:
+    def _spawn(self, session_id: str, env_extra: Optional[dict] = None,
+               *, fresh_context: Optional[str] = None,
+               workspace_override: Optional[str] = None) -> _RpcProcess:
         args = [self.command, "--mode", "rpc"]
 
         if self._extra_cli_args:
@@ -310,7 +320,7 @@ class OmpRpcRunner(BaseRunner):
         session_dir = self._session_dir(session_id)
         args.extend(["--session-dir", str(session_dir)])
 
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(extra=fresh_context)
         if system_prompt:
             args.extend(["--append-system-prompt", system_prompt])
 
@@ -329,7 +339,7 @@ class OmpRpcRunner(BaseRunner):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=self.workspace,
+            cwd=workspace_override or self.workspace,
             env=env,
             start_new_session=True,
         )
