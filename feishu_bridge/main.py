@@ -2008,12 +2008,20 @@ class FeishuBot:
     def _reply_queue_full(self, chat_id: str, thread_id, message_id: str):
         self._command_handler().reply_queue_full(chat_id, thread_id, message_id)
 
+    # Per-worker-thread consecutive-error threshold. Once a worker hits N
+    # back-to-back exceptions (any successful processing resets the counter),
+    # the whole process exits so launchd/systemd can restart it. Catches
+    # systemic bugs that keep the main process alive while every queued
+    # message fails (e.g. wrong process_message signature in v2026.05.29).
+    WORKER_FATAL_ERROR_THRESHOLD = 5
+
     def _worker_loop(self):
         """Consumer loop — pulls from work queue and processes.
 
         ChatTaskQueue guarantees at most one item per session in flight.
         on_complete() in finally block submits next pending or marks idle.
         """
+        consecutive_errors = 0
         while True:
             handle = None
             key = None
@@ -2039,8 +2047,19 @@ class FeishuBot:
                         feishu_sheets=getattr(self, 'feishu_sheets', None),
                         thread_projects=getattr(self, 'thread_projects', None),
                     )
+                consecutive_errors = 0
             except Exception:
                 log.exception("Worker loop error")
+                consecutive_errors += 1
+                if consecutive_errors >= self.WORKER_FATAL_ERROR_THRESHOLD:
+                    log.critical(
+                        "Worker hit %d consecutive errors — exiting for restart",
+                        consecutive_errors)
+                    def _deferred_exit():
+                        logging.shutdown()
+                        os._exit(1)
+                    threading.Timer(0.3, _deferred_exit).start()
+                    return
             finally:
                 # Cancel fallback timer (no-op if already fired or cancelled)
                 if handle and getattr(handle, '_card_fallback_timer', None):
