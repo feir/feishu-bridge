@@ -24,11 +24,25 @@ fi
 # Today's CalVer base
 TODAY=$(date +%Y.%m.%d)
 
-if [ "$CURRENT" = "$TODAY" ]; then
-  NEW="${TODAY}.1"
-elif [[ "$CURRENT" == "${TODAY}."* ]]; then
-  N="${CURRENT##*.}"
-  NEW="${TODAY}.$((N + 1))"
+# Parse CURRENT into date prefix + optional .N suffix.
+if [[ "$CURRENT" =~ ^([0-9]{4}\.[0-9]{2}\.[0-9]{2})(\.([0-9]+))?$ ]]; then
+  CURRENT_DATE="${BASH_REMATCH[1]}"
+  CURRENT_N="${BASH_REMATCH[3]}"
+else
+  echo "auto-version: unparseable version: $CURRENT" >&2
+  exit 1
+fi
+
+# Bump base = max(CURRENT_DATE, TODAY). Never regress when CURRENT carries a
+# future date (manual edit, timezone skew, prior bump on a clock-ahead box).
+# sort -V on zero-padded CalVer date prefixes matches calendar order.
+HIGHER=$(printf '%s\n%s\n' "$CURRENT_DATE" "$TODAY" | sort -V | tail -1)
+if [ "$HIGHER" = "$CURRENT_DATE" ]; then
+  if [ -z "$CURRENT_N" ]; then
+    NEW="${CURRENT_DATE}.1"
+  else
+    NEW="${CURRENT_DATE}.$((CURRENT_N + 1))"
+  fi
 else
   NEW="$TODAY"
 fi
