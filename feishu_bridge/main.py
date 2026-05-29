@@ -2129,36 +2129,57 @@ def fetch_bot_info(client, fallback_name: str = "Claude Code") -> tuple[str, str
 
 
 def _notify_restart_complete(bot):
-    """Patch the pre-restart card to show completion, if one exists."""
+    """Patch the pre-restart card to show completion, if one exists.
+
+    The patch is attempted on a background daemon thread with bounded retries
+    so a transient outbound failure at boot (e.g. proxy 503) cannot leave the
+    card stuck on "正在重启..." nor delay the bot coming online.
+    """
     state_dir = Path(bot.workspace) / "state" / "feishu-bridge"
     restart_file = state_dir / f"restart-{bot.bot_id}.json"
     if not restart_file.exists():
         return
     try:
         data = json.loads(restart_file.read_text())
-        mid = data.get("message_id")
-        if mid:
-            from feishu_bridge.ui import build_restart_complete_card
-            from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
-            card = build_restart_complete_card(version=data.get("version", ""))
-            card_json = json.dumps(card, ensure_ascii=False)
-            body = PatchMessageRequestBody.builder() \
-                .content(card_json).build()
-            req = PatchMessageRequest.builder() \
-                .message_id(mid).request_body(body).build()
-            resp = bot.lark_client.im.v1.message.patch(req)
-            if resp.success():
-                log.info("Restart-complete card patched: %s", mid)
-            else:
-                log.warning("Restart-complete patch failed: code=%s msg=%s",
-                            resp.code, resp.msg)
     except Exception:
-        log.warning("Failed to notify restart completion", exc_info=True)
+        log.warning("Failed to read restart state", exc_info=True)
+        data = {}
     finally:
+        # State file is single-use; drop it regardless of patch outcome.
         try:
             restart_file.unlink(missing_ok=True)
         except Exception:
             pass
+
+    mid = data.get("message_id")
+    if not mid:
+        return
+
+    def _patch():
+        from feishu_bridge.ui import build_restart_complete_card
+        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+        card = build_restart_complete_card(version=data.get("version", ""))
+        card_json = json.dumps(card, ensure_ascii=False)
+        body = PatchMessageRequestBody.builder().content(card_json).build()
+        req = PatchMessageRequest.builder() \
+            .message_id(mid).request_body(body).build()
+        for attempt in range(5):
+            try:
+                resp = bot.lark_client.im.v1.message.patch(req)
+                if resp.success():
+                    log.info("Restart-complete card patched: %s", mid)
+                    return
+                log.warning("Restart-complete patch failed: code=%s msg=%s "
+                            "(attempt %d)", resp.code, resp.msg, attempt + 1)
+            except Exception:
+                log.warning("Restart-complete patch error (attempt %d)",
+                            attempt + 1, exc_info=True)
+            if attempt < 4:
+                time.sleep(2.0 * (attempt + 1))
+        log.warning("Failed to notify restart completion after retries: %s", mid)
+
+    threading.Thread(
+        target=_patch, name="restart-complete", daemon=True).start()
 
 
 # ============================================================
