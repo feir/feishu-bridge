@@ -29,6 +29,14 @@ from feishu_bridge.workflows import (
 
 PLAN_SKILL_DIR = Path.home() / ".agents" / "skills" / "plan"
 
+# These exercise the external `/plan` skill scripts (spec-resolve / spec-write)
+# which live outside this repo. Skip when the skill isn't installed so the suite
+# stays green in CI and on machines without it; they still run where present.
+requires_plan_skill = pytest.mark.skipif(
+    not (PLAN_SKILL_DIR / "scripts" / "spec-resolve.py").exists(),
+    reason="plan skill not installed at ~/.agents/skills/plan/scripts",
+)
+
 
 def _valid_draft() -> dict:
     return {
@@ -170,6 +178,7 @@ def test_plan_start_empty_arg(tmp_path):
     assert "需要提供目标描述" in result.user_message
 
 
+@requires_plan_skill
 def test_plan_start_success_waits_for_confirm(tmp_path):
     runner = FakeRunner([_mk_json_response(_valid_draft())])
     wf = PlanWorkflow(skill_dir=PLAN_SKILL_DIR, ttl_string="7d")
@@ -185,6 +194,7 @@ def test_plan_start_success_waits_for_confirm(tmp_path):
     assert "/stop" in result.user_message
 
 
+@requires_plan_skill
 def test_plan_start_json_policy_failure(tmp_path):
     bad = {"result": "not json", "is_error": False}
     runner = FakeRunner([bad, bad, bad])
@@ -196,6 +206,7 @@ def test_plan_start_json_policy_failure(tmp_path):
     assert len(runner.calls) == 3
 
 
+@requires_plan_skill
 def test_plan_start_max_changes_rejects(tmp_path):
     # Pre-create 3 active changes; spec-resolve should report slots_remaining=0.
     # Workspace needs a git repo OR we rely on non-git fallback at tmp_path/.specs.
@@ -217,6 +228,7 @@ def test_plan_start_max_changes_rejects(tmp_path):
 
 # ---------- PlanWorkflow.resume_confirm / resume_cancel ----------
 
+@requires_plan_skill
 def test_plan_resume_confirm_writes_files(tmp_path):
     specs_root = tmp_path / ".specs"
     payload = {
@@ -241,6 +253,7 @@ def test_plan_resume_confirm_writes_files(tmp_path):
     assert "## Spec-Check" in ttext
 
 
+@requires_plan_skill
 def test_plan_resume_confirm_refuses_overwrite(tmp_path):
     specs_root = tmp_path / ".specs"
     target_dir = specs_root / "changes" / "test-slug"
