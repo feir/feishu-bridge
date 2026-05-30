@@ -13,10 +13,10 @@
 # THIS is the sanctioned bump-then-push flow (SKIP_VERSION_CHECK=1).
 #
 # Usage:
-#   scripts/ship.sh                     # auto-generated release notes
+#   scripts/ship.sh                     # notes from commit subjects
 #   scripts/ship.sh "headline text"     # prepend a human headline
 #
-# Env (forwarded to release.sh): RELEASE_NO_LLM=1, RELEASE_NO_PUSH=1
+# Env (forwarded to release.sh): RELEASE_NO_PUSH=1, RELEASE_ALLOW_UNPUSHED=1
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

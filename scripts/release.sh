@@ -1,6 +1,6 @@
 #!/bin/bash
-# release.sh — create an annotated tag for the CURRENT version with
-# LLM-written release notes, then push.
+# release.sh — create an annotated tag for the CURRENT version with release
+# notes built from commit subjects, then push.
 #
 # Expects auto-version.sh to have already bumped __init__.py + pyproject.toml
 # and the bump to be committed. Reads the version from __init__.py.
@@ -10,8 +10,8 @@
 #   scripts/release.sh "headline text"    # prepend a human-supplied headline
 #
 # Env:
-#   RELEASE_NO_LLM=1   — skip LLM, use raw commit subjects
-#   RELEASE_NO_PUSH=1  — create tag locally only
+#   RELEASE_NO_PUSH=1         — create tag locally, don't push (no publish)
+#   RELEASE_ALLOW_UNPUSHED=1  — allow tagging a commit not yet on origin/<branch>
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -57,42 +57,13 @@ trap 'rm -f "$NOTES_FILE"' EXIT
   [ -n "$HEADLINE" ] && { echo "$HEADLINE"; echo; }
 } > "$NOTES_FILE"
 
+# Release notes are the commit subjects since the last tag — deterministic, no
+# external tools. When only version-bump commits exist, list those verbatim.
+echo "## Changes" >> "$NOTES_FILE"
 if [ -z "$COMMITS" ]; then
-  echo "## Changes" >> "$NOTES_FILE"
   echo "$ALL_COMMITS" | sed 's/^/- /' >> "$NOTES_FILE"
-elif [ "${RELEASE_NO_LLM:-0}" = "1" ] || ! command -v claude >/dev/null 2>&1; then
-  echo "## Changes" >> "$NOTES_FILE"
-  echo "$COMMITS" | sed 's/^/- /' >> "$NOTES_FILE"
 else
-  PROMPT=$(cat <<PROMPT_END
-你是 feishu-bridge 项目的发版记录助手。根据下面的 commit subject 列表，
-为 ${TAG} 写一份中文 release notes（Markdown，≤150 字），结构如下：
-
-## 亮点
-- 1-3 条最重要的用户可见变化（新功能 / 行为变化 / 破坏性变更）
-
-## 修复与改进
-- 其他修复、重构、测试、文档（每条一行，合并相关项）
-
-规则：
-- 不要复述版本号或日期
-- 合并相关的 commit，不要逐条复述
-- 语气平实，避免营销感
-- 只输出 Markdown，不要解释或总结
-
-Commit subjects:
-${COMMITS}
-PROMPT_END
-)
-  LLM_OUT=$(printf '%s' "$PROMPT" \
-    | claude -p --model haiku --setting-sources "" 2>/dev/null \
-    || true)
-  if [ -n "$LLM_OUT" ]; then
-    printf '%s\n' "$LLM_OUT" >> "$NOTES_FILE"
-  else
-    echo "## Changes" >> "$NOTES_FILE"
-    echo "$COMMITS" | sed 's/^/- /' >> "$NOTES_FILE"
-  fi
+  echo "$COMMITS" | sed 's/^/- /' >> "$NOTES_FILE"
 fi
 
 git tag -a "$TAG" -F "$NOTES_FILE"
