@@ -12,6 +12,7 @@
 		170C2C55176CEA84F74DAC46 /* LaunchctlHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = E849CDBB3F06BA0F41675D6B /* LaunchctlHelper.swift */; };
 		1CED7244E7C0F5F8BA51FA51 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5055C7874386C817D8086129 /* App.swift */; };
 		5279C5294DE72A8C553AEDB2 /* MenuBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88DF5FF3BCCEEA70B774497E /* MenuBarView.swift */; };
+		612EE27D5E403F544AF3AB59 /* UnixSocketTransportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03AE1C39CF00FC3C80703EDE /* UnixSocketTransportTests.swift */; };
 		623F4FB42677B45C085582C6 /* ConfigManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3528722BC95A2938788091D1 /* ConfigManager.swift */; };
 		66976CB4DF02A6A1B17A61F8 /* LogViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA6D67CF5CF3A8A806C5D6B3 /* LogViewer.swift */; };
 		7062BB42CE47CFEC47828545 /* UnixSocketTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24D4188DE1CDCF02F8424A87 /* UnixSocketTransport.swift */; };
@@ -37,6 +38,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		03AE1C39CF00FC3C80703EDE /* UnixSocketTransportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnixSocketTransportTests.swift; sourceTree = "<group>"; };
 		10E76E81E5460348B2A07C72 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		12E743C55286E60B15605E76 /* CredentialValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CredentialValidator.swift; sourceTree = "<group>"; };
 		24D4188DE1CDCF02F8424A87 /* UnixSocketTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnixSocketTransport.swift; sourceTree = "<group>"; };
@@ -83,6 +85,7 @@
 				A61A002E72417D0FBA129188 /* BridgeStatusTests.swift */,
 				B40D482634CA77852C4A13B9 /* ConfigManagerTests.swift */,
 				AD62F7B4D4B57CE893356D1E /* StatusPollerTests.swift */,
+				03AE1C39CF00FC3C80703EDE /* UnixSocketTransportTests.swift */,
 			);
 			path = FeishuBridgeTests;
 			sourceTree = "<group>";
@@ -257,6 +260,7 @@
 				F88E611A5B2F0EF9F25AF5A8 /* BridgeStatusTests.swift in Sources */,
 				02C82AE19EA64C6C1A0E8C00 /* ConfigManagerTests.swift in Sources */,
 				F42DB47ED102047218D6D3A5 /* StatusPollerTests.swift in Sources */,
+				612EE27D5E403F544AF3AB59 /* UnixSocketTransportTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
