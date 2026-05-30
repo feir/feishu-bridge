@@ -820,6 +820,15 @@ class BaseRunner(ABC):
         """返回表示 session 不存在的错误签名列表。默认空。"""
         return []
 
+    def display_default_model(self) -> Optional[str]:
+        """Real model the CLI uses when no model is pinned, for UI/status only.
+
+        Returns ``None`` when the bridge cannot know it — most CLIs choose a
+        default internally. NEVER influences process spawning (``build_args``);
+        this is purely a display hint.
+        """
+        return None
+
     def get_extra_env(self) -> dict:
         """额外环境变量。默认注入用户 PATH。"""
         env = dict(self._fixed_env)

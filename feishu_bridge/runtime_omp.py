@@ -91,12 +91,18 @@ class OmpRpcRunner(BaseRunner):
 
     @property
     def resolved_model(self) -> str:
-        """Return the model name for display, resolving from omp config if needed."""
+        """Model name for internal labeling (modelUsage); never empty."""
+        return self.display_default_model() or "(cli-default)"
+
+    def display_default_model(self) -> Optional[str]:
+        """omp pins no ``--model`` here; it picks per-role models from
+        ``~/.omp/agent/config.yml``. Surface ``modelRoles.default`` for display.
+        Returns ``None`` when that config is unreadable."""
         if self.model:
             return self.model
         if self._resolved_model is None:
             self._resolved_model = self._read_omp_default_model()
-        return self._resolved_model or "(cli-default)"
+        return self._resolved_model
 
     @staticmethod
     def _read_omp_default_model() -> Optional[str]:

@@ -958,13 +958,22 @@ class FeishuBot:
     # Model management
     # ------------------------------------------------------------------
 
+    def _effective_model_display(self) -> str:
+        """Model string for UI/status: config-pinned model, else the active
+        runner's known CLI default, else a placeholder."""
+        effective = _effective_default_model(self.agent_config, self.bot_config)
+        if effective:
+            return effective
+        runner = getattr(self, "runner", None)
+        hint = runner.display_default_model() if runner is not None else None
+        return hint or "(CLI 默认)"
+
     def get_model_status(self) -> tuple[str, bool]:
         """Return current effective model and whether an override is active."""
         override = self._runtime_state.model_override
         if override:
             return override, True
-        effective = _effective_default_model(self.agent_config, self.bot_config)
-        return effective or "(CLI 默认)", False
+        return self._effective_model_display(), False
 
     def set_model(self, raw_input: str) -> tuple[str, bool]:
         """Set or clear model override. Thread-safe via _state_lock.
@@ -982,9 +991,11 @@ class FeishuBot:
 
         with self._state_lock:
             if resolved is None:
-                effective = _effective_default_model(self.agent_config, self.bot_config)
-                self.runner.model = effective
+                self.runner.model = _effective_default_model(
+                    self.agent_config, self.bot_config
+                )
                 self._runtime_state.model_override = None
+                effective = self._effective_model_display()
             else:
                 self.runner.model = resolved
                 self._runtime_state.model_override = resolved
@@ -995,7 +1006,7 @@ class FeishuBot:
             except OSError:
                 log.warning("runtime-state save failed after model change", exc_info=True)
 
-        return effective or "(CLI 默认)", resolved is None
+        return effective, resolved is None
 
     # ------------------------------------------------------------------
     # Provider / Agent switching

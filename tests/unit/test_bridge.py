@@ -3110,7 +3110,10 @@ def _make_model_command_bot(model_aliases, initial_model):
     bot.lark_client = object()
     bot.session_map = {}
     bot.model_aliases = dict(model_aliases)
-    bot.runner = types.SimpleNamespace(model=initial_model)
+    bot.runner = types.SimpleNamespace(
+        model=initial_model,
+        display_default_model=lambda: None,  # claude: CLI picks its own default
+    )
     bot.bot_config = {"model": initial_model}
     bot.agent_config = {"type": "claude", "provider": "default", "providers": {"default": {}}}
     bot._state_lock = threading.RLock()
@@ -3188,6 +3191,67 @@ def test_model_command_display_cli_default_when_no_model(monkeypatch):
     })
 
     assert "(CLI 默认)" in captured[0]
+
+
+def test_omp_runner_display_default_model(monkeypatch, tmp_path):
+    """OmpRpcRunner surfaces modelRoles.default from ~/.omp/agent/config.yml
+    when no model is pinned, falls back to None when config is absent, and
+    prefers an explicitly pinned model."""
+    from feishu_bridge.runtime_omp import OmpRpcRunner
+
+    monkeypatch.setattr(bridge.Path, "home", staticmethod(lambda: tmp_path))
+    cfg_dir = tmp_path / ".omp" / "agent"
+    cfg_dir.mkdir(parents=True)
+
+    runner = OmpRpcRunner(command="omp", model=None, workspace="/tmp", timeout=60)
+
+    # No config yet → unknown default.
+    assert runner.display_default_model() is None
+
+    # Config present → modelRoles.default surfaced (cache is per-instance).
+    (cfg_dir / "config.yml").write_text(
+        "modelRoles:\n  default: anthropic/claude-opus-4-8:medium\n"
+    )
+    fresh = OmpRpcRunner(command="omp", model=None, workspace="/tmp", timeout=60)
+    assert fresh.display_default_model() == "anthropic/claude-opus-4-8:medium"
+
+    # Explicit pin wins over config.
+    pinned = OmpRpcRunner(command="omp", model="gpt-5", workspace="/tmp", timeout=60)
+    assert pinned.display_default_model() == "gpt-5"
+
+
+def test_get_model_status_falls_back_to_runner_default(monkeypatch):
+    """When config pins no model, get_model_status reports the runner's
+    resolved CLI default instead of the '(CLI 默认)' placeholder."""
+    from feishu_bridge.runtime_state import RuntimeState
+
+    bot = object.__new__(bridge.FeishuBot)
+    bot.agent_config = {"type": "omp", "provider": "default", "providers": {"default": {}}}
+    bot.bot_config = {"model": None}
+    bot._runtime_state = RuntimeState()
+    bot.runner = types.SimpleNamespace(
+        model=None,
+        display_default_model=lambda: "anthropic/claude-opus-4-8:medium",
+    )
+
+    display, has_override = bot.get_model_status()
+    assert has_override is False
+    assert display == "anthropic/claude-opus-4-8:medium"
+
+
+def test_get_model_status_placeholder_when_runner_default_unknown(monkeypatch):
+    """Unknown CLI default (runner returns None) keeps the '(CLI 默认)' placeholder."""
+    from feishu_bridge.runtime_state import RuntimeState
+
+    bot = object.__new__(bridge.FeishuBot)
+    bot.agent_config = {"type": "claude", "provider": "default", "providers": {"default": {}}}
+    bot.bot_config = {"model": None}
+    bot._runtime_state = RuntimeState()
+    bot.runner = types.SimpleNamespace(model=None, display_default_model=lambda: None)
+
+    display, has_override = bot.get_model_status()
+    assert has_override is False
+    assert display == "(CLI 默认)"
 
 
 def test_switch_agent_rebuilds_runner_and_clears_sessions(monkeypatch, tmp_path):
