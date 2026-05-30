@@ -132,6 +132,7 @@ final class StatusPoller {
     }
 
     private func pollHealth() async {
+        let wasRunning = bridgeRunning
         guard let c = ensureClient() else {
             let reachable = await UnixSocketTransport(
                 sockPath: FileManager.default.homeDirectoryForCurrentUser
@@ -139,6 +140,7 @@ final class StatusPoller {
             ).probe()
             bridgeRunning = reachable
             if !reachable { client = nil }
+            if reachable && !wasRunning { await pollStatus() }
             return
         }
 
@@ -146,6 +148,10 @@ final class StatusPoller {
             let h = try await c.health()
             bridgeRunning = h.ok
             lastError = nil
+            // Transition offline→online: fetch status now instead of waiting
+            // for the next 10 s statusTask tick, which otherwise leaves the
+            // header showing "Running" while the body reads "not running".
+            if h.ok && !wasRunning { await pollStatus() }
         } catch {
             bridgeRunning = false
             client = nil  // force reconnect next cycle

@@ -154,7 +154,12 @@ struct MenuBarView: View {
     private func quotaSection(_ status: BridgeStatusResponse) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             if status.quota.available, let windows = status.quota.windows {
-                ForEach(Array(windows.sorted(by: { $0.key < $1.key })), id: \.key) { key, window in
+                // Only surface the two primary windows; ignore extra
+                // model-specific windows (seven_day_opus, etc.).
+                let visible = ["five_hour", "seven_day"].compactMap { key in
+                    windows[key].map { (key, $0) }
+                }
+                ForEach(visible, id: \.0) { key, window in
                     HStack(spacing: 8) {
                         Text(quotaLabel(key))
                             .font(.caption)

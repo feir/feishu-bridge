@@ -313,7 +313,7 @@ wheels = [
 
 [[package]]
 name = "feishu-bridge"
-version = "2026.5.30.4"
+version = "2026.5.31"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
