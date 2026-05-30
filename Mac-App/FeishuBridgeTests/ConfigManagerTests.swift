@@ -61,6 +61,26 @@ struct ConfigManagerTests {
         #expect(agent["timeout_seconds"] as! Int == 300)
     }
 
+    // MARK: - firstBotName extraction
+
+    @Test func firstBotNameExtractsConfiguredName() {
+        let config: [String: Any] = ["bots": [["name": "feishu-bridge-mbp"]]]
+        #expect(ConfigManager.firstBotName(from: config) == "feishu-bridge-mbp")
+    }
+
+    @Test func firstBotNameUsesFirstWhenMultiple() {
+        let config: [String: Any] = ["bots": [["name": "alpha"], ["name": "beta"]]]
+        #expect(ConfigManager.firstBotName(from: config) == "alpha")
+    }
+
+    @Test func firstBotNameNilWhenMissingOrEmpty() {
+        #expect(ConfigManager.firstBotName(from: nil) == nil)
+        #expect(ConfigManager.firstBotName(from: [:]) == nil)
+        #expect(ConfigManager.firstBotName(from: ["bots": []]) == nil)
+        #expect(ConfigManager.firstBotName(from: ["bots": [["name": ""]]]) == nil)
+        #expect(ConfigManager.firstBotName(from: ["bots": [["app_id": "x"]]]) == nil)
+    }
+
     // MARK: - Agent CLI detection
 
     @Test func agentCLIDetection() {

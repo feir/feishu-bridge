@@ -97,6 +97,25 @@ enum ConfigManager {
         return json
     }
 
+    /// The name of the first configured bot, if any.
+    ///
+    /// The bridge derives every runtime path (control socket, token, launch
+    /// agent label) from this name, so the menu-bar app MUST use the same
+    /// value rather than guessing from the hostname.
+    static func firstBotName() -> String? {
+        firstBotName(from: loadConfig())
+    }
+
+    /// Pure variant: extract the first bot name from an already-loaded config.
+    static func firstBotName(from config: [String: Any]?) -> String? {
+        guard let bots = config?["bots"] as? [[String: Any]],
+              let name = bots.first?["name"] as? String,
+              !name.isEmpty else {
+            return nil
+        }
+        return name
+    }
+
     /// Load .env values as a dictionary.
     static func loadEnv() -> [String: String] {
         guard let content = try? String(contentsOf: envPath, encoding: .utf8) else {

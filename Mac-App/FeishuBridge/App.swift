@@ -3,10 +3,19 @@ import SwiftUI
 @main
 struct FeishuBridgeApp: App {
 
-    /// Resolve the active bot name: UserDefaults (set by onboarding) → hostname fallback.
+    /// Resolve the active bot name.
+    ///
+    /// Order: explicit override (onboarding) → configured bot in
+    /// config.json → hostname fallback. config.json MUST win over the
+    /// hostname because the bridge names its control socket/token after the
+    /// configured bot; guessing from the hostname produces a wrong socket
+    /// path and the app falsely reports "bridge not running".
     private static func resolveBotName() -> String {
         if let saved = UserDefaults.standard.string(forKey: "botName"), !saved.isEmpty {
             return saved
+        }
+        if let configured = ConfigManager.firstBotName() {
+            return configured
         }
         let host = ProcessInfo.processInfo.hostName
             .components(separatedBy: ".").first ?? "mac"
