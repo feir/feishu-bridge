@@ -26,6 +26,17 @@ if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
   exit 0
 fi
 
+# Refuse to tag a commit that isn't on the remote branch yet. The tag push
+# triggers PyPI publish + GitHub Release; if origin/<branch> doesn't yet contain
+# this commit, we'd publish before the branch reflects the release. scripts/ship.sh
+# pushes the branch first; direct callers must too (override: RELEASE_ALLOW_UNPUSHED=1).
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [ "${RELEASE_ALLOW_UNPUSHED:-0}" != "1" ] \
+   && ! git merge-base --is-ancestor HEAD "origin/${BRANCH}" 2>/dev/null; then
+  echo "release: HEAD is not on origin/${BRANCH} — push the branch first (or use scripts/ship.sh)" >&2
+  exit 1
+fi
+
 LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
 RANGE="${LAST_TAG:+${LAST_TAG}..}HEAD"
 ALL_COMMITS=$(git log --no-merges --format='%s' "$RANGE" || true)

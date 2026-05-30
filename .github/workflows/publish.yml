@@ -6,7 +6,64 @@ on:
       - "v*"
 
 jobs:
+  test-python:
+    name: Python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests
+        run: uv run --extra dev pytest tests/unit -q
+
+  build-macos:
+    name: macOS app — test + build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        working-directory: Mac-App
+        run: xcodegen generate
+
+      - name: Run Swift tests
+        working-directory: Mac-App
+        run: |
+          xcodebuild test \
+            -project FeishuBridge.xcodeproj \
+            -scheme FeishuBridge \
+            -destination 'platform=macOS'
+
+      - name: Build Release app
+        working-directory: Mac-App
+        run: |
+          xcodebuild \
+            -project FeishuBridge.xcodeproj \
+            -scheme FeishuBridge \
+            -configuration Release \
+            -derivedDataPath build/dd \
+            build \
+            CONFIGURATION_BUILD_DIR="$PWD/build/Release"
+          # ditto preserves the bundle structure and ad-hoc signature in the zip.
+          ditto -c -k --keepParent \
+            "build/Release/Feishu Bridge.app" \
+            "FeishuBridge-macOS.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: Mac-App/FeishuBridge-macOS.zip
+          if-no-files-found: error
+
   publish:
+    name: Publish to PyPI + GitHub Release
+    needs: [test-python, build-macos]
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for Trusted Publisher (OIDC)
@@ -28,6 +85,12 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
 
+      - name: Download macOS app artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-app
+          path: dist-macos  # separate dir so it is NOT uploaded to PyPI
+
       - name: Extract annotated tag message
         id: tag_msg
         run: |
@@ -44,3 +107,4 @@ jobs:
           body: ${{ steps.tag_msg.outputs.body }}
           generate_release_notes: true  # auto-append PR/commit diff
           fail_on_unmatched_files: false
+          files: dist-macos/FeishuBridge-macOS.zip

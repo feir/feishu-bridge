@@ -51,4 +51,13 @@ fi
 sed -i '' "s/^__version__ = .*/__version__ = \"$NEW\"/" "$INIT_FILE"
 sed -i '' "s/^version = .*/version = \"$NEW\"/" "$TOML_FILE"
 
+# Keep uv.lock's pinned project version in sync, so the version-bump commit is
+# self-contained and the lockfile never drifts into an unrelated later commit.
+# uv writes progress to stderr, leaving stdout clean for the version capture.
+if command -v uv >/dev/null 2>&1; then
+  uv lock >&2 || echo "auto-version: 'uv lock' failed; sync uv.lock manually" >&2
+else
+  echo "auto-version: uv not found; skipping uv.lock sync" >&2
+fi
+
 echo "$NEW"
