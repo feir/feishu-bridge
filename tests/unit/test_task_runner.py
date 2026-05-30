@@ -271,13 +271,28 @@ def _spawn_ignoring_sigterm():
 
 
 def _spawn_polite_child():
-    """Child that exits on SIGTERM promptly."""
-    return subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(30)"],
+    """Child that exits promptly on SIGTERM.
+
+    Emits READY once its SIGTERM handler is installed so the caller can await
+    it before signalling — same race-free handshake as _spawn_ignoring_sigterm.
+    Without it, SIGTERM can land during interpreter startup and the child rides
+    out the full grace window on a loaded runner (flaky timeout).
+    """
+    code = (
+        "import signal, sys, time;"
+        "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0));"
+        "sys.stdout.write('READY\\n'); sys.stdout.flush();"
+        "time.sleep(30)"
+    )
+    p = subprocess.Popen(
+        [sys.executable, "-u", "-c", code],
         start_new_session=True,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
+    line = p.stdout.readline()
+    assert line.strip() == b"READY", f"unexpected readiness output: {line!r}"
+    return p
 
 
 def test_terminate_pgid_sigterm_happy_path():
@@ -654,6 +669,7 @@ def test_main_rejects_invalid_runner_token():
     assert rc == 2
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="task_runner.main needs macOS libproc")
 def test_phase_s_logs_redact_argv(tmp_path: Path, caplog):
     """argv at INFO level must only show argv[0] + length (no token leak)."""
     import logging as _logging

@@ -94,6 +94,10 @@ private final class LineServer: @unchecked Sendable {
 
     init(path: String, mode: Mode) throws {
         self.path = path
+        // Bulletproof against writes to a peer that already closed (e.g. probe()
+        // connects then immediately closes): ignore SIGPIPE for this test process
+        // so such a write returns EPIPE instead of killing the runner.
+        signal(SIGPIPE, SIG_IGN)
         unlink(path)
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -136,14 +140,15 @@ private final class LineServer: @unchecked Sendable {
     }
 
     private func serve(client: Int32, mode: Mode) {
+        let got = drainRequest(client)
         switch mode {
         case .reply(let body):
-            drainRequest(client)
-            writeAll(client, Array((body + "\n").utf8))
+            // Only reply if the client actually sent a request. probe() sends
+            // nothing and closes, so skipping avoids a write to a dead socket.
+            if got > 0 { writeAll(client, Array((body + "\n").utf8)) }
             close(client)
         case .partial(let body):
-            drainRequest(client)
-            writeAll(client, Array(body.utf8))   // no trailing newline
+            if got > 0 { writeAll(client, Array(body.utf8)) }  // no trailing newline
             close(client)
         case .silent:
             // Hold the fd open so the client read blocks until its own timeout.
@@ -151,9 +156,10 @@ private final class LineServer: @unchecked Sendable {
         }
     }
 
-    private func drainRequest(_ client: Int32) {
+    @discardableResult
+    private func drainRequest(_ client: Int32) -> Int {
         var buf = [UInt8](repeating: 0, count: 4096)
-        _ = buf.withUnsafeMutableBytes { read(client, $0.baseAddress, $0.count) }
+        return buf.withUnsafeMutableBytes { read(client, $0.baseAddress, $0.count) }
     }
 
     private func writeAll(_ client: Int32, _ bytes: [UInt8]) {

@@ -38,7 +38,8 @@ jobs:
           xcodebuild test \
             -project FeishuBridge.xcodeproj \
             -scheme FeishuBridge \
-            -destination 'platform=macOS'
+            -destination 'platform=macOS' \
+            -parallel-testing-enabled NO
 
       - name: Build Release app
         working-directory: Mac-App
