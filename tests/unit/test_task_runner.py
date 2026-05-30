@@ -296,13 +296,20 @@ def _spawn_polite_child():
 
 
 def test_terminate_pgid_sigterm_happy_path():
+    import threading
     p = _spawn_polite_child()
     try:
         pgid = os.getpgid(p.pid)
         start = time.monotonic()
+        # terminate_pgid probes the *group* via killpg(., 0). On Linux an
+        # unreaped zombie still satisfies that probe, so the grace loop would
+        # never see a clean SIGTERM exit and would burn the full grace before
+        # SIGKILL. Reap concurrently (as the real task_runner does) so the pgid
+        # is freed the instant the child exits and detection is prompt.
+        reaper = threading.Thread(target=p.wait, daemon=True)
+        reaper.start()
         task_runner.terminate_pgid(pgid, grace_s=5.0)
-        # Child should be reaped well within grace.
-        p.wait(timeout=3.0)
+        reaper.join(timeout=3.0)
         elapsed = time.monotonic() - start
         assert p.returncode is not None
         assert elapsed < 2.0, f"SIGTERM-respecting child took {elapsed:.2f}s"
