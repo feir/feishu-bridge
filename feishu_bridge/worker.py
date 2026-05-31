@@ -671,6 +671,19 @@ def _bg_mark_delivery_outcome(item: dict, delivered: bool,
             pass
 
 
+def _footer_project_label(bound: dict | None, resolved_workspace: str) -> str:
+    """Footer project label for the final card.
+
+    Returns the ``/project``-bound ``project_id`` when this thread is bound,
+    else the directory name of the workspace the turn actually ran in. Mirrors
+    the old git-branch readout's "empty → omitted" behaviour: an empty/blank
+    workspace yields ``""``, which the footer builder drops.
+    """
+    if bound:
+        return bound["project_id"]
+    return Path(resolved_workspace).name if resolved_workspace else ""
+
+
 def process_message(
     item: dict,
     bot_config: dict,
@@ -1430,10 +1443,14 @@ def process_message(
             _last_usage = result.get("last_call_usage") or result.get("usage") or {}
             model_usage = result.get("modelUsage") or {}
             model_name = pick_primary_model(model_usage, getattr(runner, "model", None))
+            # Footer project label: reflects where the turn actually ran
+            # (resolved_workspace), not the bot's global ~/.claude default that
+            # runner.workspace points to. See _footer_project_label.
+            project_label = _footer_project_label(bound, resolved_workspace)
             delivered = handle.deliver(result["result"], is_error=result["is_error"],
                                        last_call_usage=_last_usage,
                                        model_name=model_name,
-                                       workspace=runner.workspace,
+                                       project_label=project_label,
                                        context_alert=ctx_alert)
             _bg_mark_delivery_outcome(item, delivered)
 

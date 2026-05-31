@@ -13,7 +13,6 @@ from feishu_bridge.ui import (
     build_cardkit_final_card,
     rebuild_card_with_selection,
     _card_cache,
-    _get_git_label,
 )
 
 
@@ -259,68 +258,32 @@ class TestBuildCardkitFinalCard:
         # Should not contain the "claude-" prefix
         assert "claude-" not in footer
 
-    @patch("feishu_bridge.ui._get_git_label", return_value="main*")
-    def test_footer_includes_git_label(self, mock_git):
-        card = build_cardkit_final_card("Hi", workspace="/tmp/fake")
+    def test_footer_includes_project_label(self):
+        card = build_cardkit_final_card("Hi", project_label="feishu-bridge")
         footer = card["body"]["elements"][-1]["content"]
-        assert "main*" in footer
+        assert "feishu-bridge" in footer
 
     def test_footer_full(self):
-        """All footer fields present: ✅ · model · elapsed · tokens · git."""
-        with patch("feishu_bridge.ui._get_git_label", return_value="dev"):
-            card = build_cardkit_final_card(
-                "Hi", elapsed_s=90, total_tokens=12345,
-                model_name="claude-sonnet-4-6", workspace="/tmp/fake")
+        """All footer fields present: ✅ · model · elapsed · tokens · project."""
+        card = build_cardkit_final_card(
+            "Hi", elapsed_s=90, total_tokens=12345,
+            model_name="claude-sonnet-4-6", project_label="my-project")
         footer = card["body"]["elements"][-1]["content"]
         assert "✅" in footer
         assert "sonnet-4-6" in footer
-        assert "dev" in footer
+        assert "my-project" in footer
         assert "1m30s" in footer
         assert "12.3k tokens" in footer
 
-    def test_footer_no_model_no_workspace(self):
-        """Footer gracefully omits model/git when not provided."""
+    def test_footer_no_model_no_project(self):
+        """Footer gracefully omits model/project when not provided."""
         card = build_cardkit_final_card("Hi", elapsed_s=5)
         footer = card["body"]["elements"][-1]["content"]
         assert "✅" in footer
         assert "5.0s" in footer
-        # No model or git info
+        # No model or project info
         parts = footer.split(" · ")
         assert len(parts) == 2  # status + elapsed
-
-
-# ---------------------------------------------------------------------------
-# _get_git_label
-# ---------------------------------------------------------------------------
-
-class TestGetGitLabel:
-    @patch("feishu_bridge.ui.subprocess.run")
-    def test_clean_repo(self, mock_run):
-        from subprocess import CompletedProcess
-        mock_run.side_effect = [
-            CompletedProcess([], 0, stdout="main\n", stderr=""),
-            CompletedProcess([], 0, stdout="", stderr=""),
-        ]
-        assert _get_git_label("/tmp") == "main"
-
-    @patch("feishu_bridge.ui.subprocess.run")
-    def test_dirty_repo(self, mock_run):
-        from subprocess import CompletedProcess
-        mock_run.side_effect = [
-            CompletedProcess([], 0, stdout="feat/ui\n", stderr=""),
-            CompletedProcess([], 0, stdout=" M file.py\n", stderr=""),
-        ]
-        assert _get_git_label("/tmp") == "feat/ui*"
-
-    @patch("feishu_bridge.ui.subprocess.run")
-    def test_not_a_git_repo(self, mock_run):
-        from subprocess import CompletedProcess
-        mock_run.return_value = CompletedProcess([], 128, stdout="", stderr="not a repo")
-        assert _get_git_label("/tmp") is None
-
-    @patch("feishu_bridge.ui.subprocess.run", side_effect=OSError("no git"))
-    def test_exception_returns_none(self, mock_run):
-        assert _get_git_label("/tmp") is None
 
 
 # ---------------------------------------------------------------------------

@@ -17,8 +17,30 @@ from feishu_bridge.project_detector import ProjectMatch
 from feishu_bridge.state_thread_projects import ThreadProjects
 from feishu_bridge.worker import (
     _build_project_suffix,
+    _footer_project_label,
     _log_heuristic_event,
 )
+
+
+# ── _footer_project_label ──────────────────────────────────────────────────
+
+
+class TestFooterProjectLabel:
+    def test_bound_uses_project_id(self):
+        bound = {"project_id": "feishu-bridge",
+                 "workspace": "/Users/x/projects/feishu-bridge"}
+        # project_id wins even if it differs from the workspace basename
+        assert _footer_project_label(bound, bound["workspace"]) == "feishu-bridge"
+
+    def test_unbound_uses_workspace_basename(self):
+        assert _footer_project_label(None, "/Users/x/.claude") == ".claude"
+
+    def test_unbound_strips_trailing_slash(self):
+        assert _footer_project_label(None, "/Users/x/projects/foo/") == "foo"
+
+    def test_unbound_empty_workspace_yields_empty(self):
+        # Empty/blank workspace → "" so the footer builder omits the segment
+        assert _footer_project_label(None, "") == ""
 
 
 # ── _build_project_suffix ──────────────────────────────────────────────────

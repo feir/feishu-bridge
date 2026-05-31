@@ -5,7 +5,6 @@ import json
 import logging
 import os.path
 import re
-import subprocess
 import threading
 import time
 import urllib.parse
@@ -755,28 +754,6 @@ def _format_usage_footer(usage: dict) -> str:
     return " · ".join(parts) if parts else ""
 
 
-def _get_git_label(workspace: str) -> str | None:
-    """Return 'branch' or 'branch*' (dirty), or None on failure."""
-    try:
-        branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=workspace, capture_output=True, text=True, timeout=5,
-        )
-        if branch.returncode != 0:
-            return None
-        name = branch.stdout.strip()
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=workspace, capture_output=True, text=True, timeout=5,
-        )
-        if dirty.returncode == 0 and dirty.stdout.strip():
-            name += "*"
-        return name
-    except Exception as e:
-        log.debug("_get_git_label failed for %s: %s", workspace, e)
-        return None
-
-
 def build_cardkit_final_card(content: str, is_error: bool = False,
                              elapsed_s: float = 0,
                              total_tokens: int = 0,
@@ -784,7 +761,7 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
                              chat_id: str | None = None,
                              bot_id: str | None = None,
                              model_name: str | None = None,
-                             workspace: str | None = None,
+                             project_label: str | None = None,
                              todos: list[dict] | None = None,
                              context_alert: str | None = None) -> dict:
     # P1: parse action markers BEFORE optimize (Finding 6 ordering fix)
@@ -835,7 +812,7 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
         })
 
     # Footer: all status info in one notation-sized element
-    # Line 1: ✅ 9/9 tasks · model · elapsed · tokens · git
+    # Line 1: ✅ 9/9 tasks · model · elapsed · tokens · project
     # Line 2: context alert (if any)
     # Line 3: update banner (if any)
     status = "❌" if is_error else "✅"
@@ -855,9 +832,12 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
         detail_parts.append(_format_usage_footer(last_call_usage))
     elif total_tokens > 0:
         detail_parts.append(f"{_format_tokens(total_tokens)} tokens")
-    git_label = _get_git_label(workspace) if workspace else None
-    if git_label:
-        detail_parts.append(git_label)
+    # Project workspace label (project_id when /project-bound, else the
+    # default workspace's directory name). Replaces the former git branch
+    # readout, which always reflected the global ~/.claude repo rather than
+    # the per-thread project binding.
+    if project_label:
+        detail_parts.append(project_label)
 
     status_line = " · ".join([status, *detail_parts]) if detail_parts else status
     footer_lines = [status_line]
@@ -1049,7 +1029,7 @@ class ResponseHandle:
 
     def deliver(self, content: str, is_error: bool = False,
                 total_tokens: int = 0, model_name: str | None = None,
-                workspace: str | None = None,
+                project_label: str | None = None,
                 context_alert: str | None = None,
                 last_call_usage: dict | None = None) -> bool:
         """Send the final content. Returns True iff a Feishu write succeeded.
@@ -1080,7 +1060,7 @@ class ResponseHandle:
             return self._deliver_cardkit(content, is_error,
                                          last_call_usage=last_call_usage,
                                          model_name=model_name,
-                                         workspace=workspace,
+                                         project_label=project_label,
                                          context_alert=context_alert)
         return self._deliver_im_patch(content, is_error,
                                       context_alert=context_alert)
@@ -1088,7 +1068,7 @@ class ResponseHandle:
     def _deliver_cardkit(self, content: str, is_error: bool,
                          last_call_usage: dict | None = None,
                          model_name: str | None = None,
-                         workspace: str | None = None,
+                         project_label: str | None = None,
                          context_alert: str | None = None) -> bool:
         card_id = self._cardkit_card_id
         seq = self._next_seq()
@@ -1124,7 +1104,7 @@ class ResponseHandle:
             content, is_error, elapsed_s=elapsed_s,
             last_call_usage=last_call_usage,
             chat_id=self.chat_id, bot_id=self.bot_id,
-            model_name=model_name, workspace=workspace,
+            model_name=model_name, project_label=project_label,
             todos=self._last_todos, context_alert=context_alert)
         card_data = json.dumps(final_card_json, ensure_ascii=False)
         log.info("CardKit card.update: card_id=%s content_len=%d payload_bytes=%d seq=%d",
