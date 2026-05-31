@@ -20,7 +20,7 @@ def _runner(tmp_path, **kwargs):
     return PiRunner(**params)
 
 
-def test_pi_build_args_defaults_to_json_readonly_tools_and_session(tmp_path):
+def test_pi_build_args_defaults_to_json_no_tool_injection_and_session(tmp_path):
     runner = _runner(
         tmp_path,
         extra_cli_args=["--provider", "omlx"],
@@ -32,7 +32,9 @@ def test_pi_build_args_defaults_to_json_readonly_tools_and_session(tmp_path):
     assert args[:3] == ["pi", "--mode", "json"]
     assert args[3:5] == ["--provider", "omlx"]
     assert ["--model", "Qwen3.6-35B-A3B-mxfp4"] == args[5:7]
-    assert ["--tools", "read,grep,find,ls"] == args[7:9]
+    # Bridge is a pure conduit: it must NOT inject a tool allowlist. Pi uses
+    # its native toolset unless the operator scopes it via config args.
+    assert "--tools" not in args
     assert "--append-system-prompt" in args
     assert "bridge rules" in args
     assert "--session" in args
@@ -50,6 +52,13 @@ def test_pi_build_args_respects_tool_and_session_overrides(tmp_path):
 
     assert "--tools" not in args
     assert args.count("--no-session") == 1
+
+    # Operator scopes pi's tools via config args_by_type — passes through
+    # verbatim, bridge adds nothing on top.
+    runner = _runner(tmp_path, extra_cli_args=["--tools", "read,write,bash,edit"])
+    args = runner.build_args("hello", "sid", False, True)
+    assert args.count("--tools") == 1
+    assert "read,write,bash,edit" in args
 
     runner = _runner(
         tmp_path,

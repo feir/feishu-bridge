@@ -19,7 +19,6 @@ class PiRunner(BaseRunner):
     """
 
     ALWAYS_STREAMING = True
-    READONLY_TOOLS = "read,grep,find,ls"
 
     def display_default_model(self) -> Optional[str]:
         """Pi pins no ``--model`` under the default provider; it reads its own
@@ -58,9 +57,13 @@ class PiRunner(BaseRunner):
         if self.model and not self._has_arg(args, "--model"):
             args.extend(["--model", self.model])
 
-        if not self._has_any_arg(args, {"--tools", "--no-tools"}):
-            args.extend(["--tools", self.READONLY_TOOLS])
-
+        # No tool-policy injection: the bridge is a pure conduit for pi. Pi
+        # uses its native toolset (read/bash/edit/write) governed by pi's own
+        # config (~/.pi/agent/settings.json, AGENTS.md). Operators can still
+        # scope tools per provider via config args_by_type (--tools/--no-tools/
+        # --exclude-tools), which arrive through _extra_cli_args above. Unlike
+        # Claude, pi has no tool_deferred approval flow, so access is gated by
+        # the bot's allowed_users, not a per-call approval card.
         system_prompt = self._build_system_prompt(extra=fresh_context)
         if system_prompt:
             args.extend(["--append-system-prompt", system_prompt])
