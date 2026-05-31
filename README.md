@@ -382,6 +382,8 @@ Pi runner 适合把本机 `pi` 作为 bridge 后端，再由 Pi 连接本地 oML
 
 Pi 当前不支持 bridge 触发的 `/compact`；当当前 runner 是 Pi 时，`/compact` 会返回“不支持”，context 告警也会提示使用 `/new` 开始新会话。Pi 的 token 使用量来自 Pi JSON 事件中的 usage 字段，bridge 会把它映射到 `/status` 和消息 footer。
 
+Pi 支持**按会话持久记忆**：scope 为 `(bot, chat, thread)`，bridge 每个 turn 只读注入 `<bridge_home>/feishu-bridge/pi-memory/<hash>.md` 的内容到系统提示，并指示 agent 在需要记住持久事实时用 `read`/`edit` 维护该文件。bridge 只读、绝不写该文件，pi 是唯一写者（避免并发写竞争）。
+
 为避免本地模型自动吃进过多 Claude Code 上下文，推荐 staging/生产先保留 `--no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes`。如果要给 Pi 增加规则，优先使用短上下文：
 
 - 全局：`~/.pi/agent/AGENTS.md`

@@ -1168,12 +1168,24 @@ def process_message(
                 type(runner).__name__, existing_sid[:8],
             )
             stale_notice = "⚠️ 会话已重建（本地会话在 bridge 重启后未持久化）"
+        # Item 3 [pi-runner-ux-v1]: per-session persistent memory for the Pi
+        # runner, injected as an extra system-prompt section on EVERY turn
+        # (resume + new). Pi owns writes; the bridge is read-only here.
+        pi_mem = ""
+        try:
+            from feishu_bridge.runtime_pi import PiRunner
+            from feishu_bridge import pi_memory
+            if isinstance(runner, PiRunner):
+                pi_mem = pi_memory.build_injection(tag)
+        except Exception:
+            pi_mem = ""
         if existing_sid and stale_notice is None:
             result = runner.run(
                 text, session_id=existing_sid, resume=True, tag=tag,
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
                 env_extra=env_extra,
+                fresh_context=(pi_mem or None),
                 workspace_override=resolved_workspace,   # [Stage 2]
             )
         else:
@@ -1195,7 +1207,7 @@ def process_message(
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
                 env_extra=env_extra,
-                fresh_context=fresh_ctx,
+                fresh_context=((fresh_ctx or "") + pi_mem) or None,
                 workspace_override=resolved_workspace,
             )
             if stale_notice and isinstance(result, dict) and not result.get("is_error"):

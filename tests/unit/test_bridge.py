@@ -4113,3 +4113,96 @@ def test_ledger_prev_ctx_rowid_tiebreak(tmp_path):
         _time.time = orig
     # Latest = 3000 (third insert), prev = 2000 (second insert).
     assert db.prev_ctx_tokens("s1") == 2000
+
+
+# ---- pi-runner-ux-v1 Item 3: per-session memory worker injection ----
+
+def _run_pm_capture_pi_mem(monkeypatch, runner, session_map):
+    """Run process_message for a plain text turn, capturing runner.run kwargs.
+
+    Stubs fresh-context + pi memory to known sentinels so the assembled
+    fresh_context passed to runner.run is deterministic.
+    """
+    from feishu_bridge import pi_memory
+    monkeypatch.setattr(bridge_worker, "build_fresh_context_prompt",
+                        lambda *a, **k: "FRESH")
+    monkeypatch.setattr(pi_memory, "build_injection", lambda tag: "PIMEM")
+    bridge_worker.process_message(
+        item={
+            "bot_id": "bot", "chat_id": "chat", "thread_id": None,
+            "message_id": "mid", "text": "hello",
+        },
+        bot_config={"workspace": "/tmp"},
+        lark_client=None,
+        session_map=session_map,
+        runner=runner,
+        response_handle_cls=FakeHandle,
+        download_image_fn=lambda *a, **k: None,
+        fetch_card_content_fn=lambda *a, **k: None,
+        fetch_forward_messages_fn=lambda *a, **k: None,
+        fetch_quoted_message_fn=lambda *a, **k: None,
+        remove_typing_indicator_fn=lambda *a, **k: None,
+        session_not_found_signatures=[],
+    )
+    return runner.captured
+
+
+class _ResumeSessionMap(DummySessionMap):
+    def get(self, key):
+        return "existing-sid"
+
+
+def _make_capture_pi_runner():
+    from feishu_bridge.runtime_pi import PiRunner
+
+    class _CapturePiRunner(PiRunner):
+        def __init__(self):
+            super().__init__(command="pi", model="test-model",
+                             workspace="/tmp", timeout=30,
+                             safety_prompt_mode="off")
+            self.captured = {}
+
+        def run(self, text, **kwargs):
+            self.captured = dict(kwargs)
+            return {"result": text, "session_id": "s", "is_error": False}
+
+        def has_session(self, sid):
+            return True
+
+    return _CapturePiRunner()
+
+
+class _CaptureOKRunner:
+    def __init__(self):
+        self.captured = {}
+
+    def run(self, text, **kwargs):
+        self.captured = dict(kwargs)
+        return {"result": text, "session_id": "s", "is_error": False}
+
+    def has_session(self, sid):
+        return True
+
+
+def test_pi_memory_injected_on_new_session(monkeypatch):
+    cap = _run_pm_capture_pi_mem(monkeypatch, _make_capture_pi_runner(),
+                                 DummySessionMap())
+    # new session: global fresh context + pi memory, both injected
+    assert cap["fresh_context"] == "FRESHPIMEM"
+
+
+def test_pi_memory_injected_on_resume(monkeypatch):
+    cap = _run_pm_capture_pi_mem(monkeypatch, _make_capture_pi_runner(),
+                                 _ResumeSessionMap())
+    # resume: only pi memory (no global fresh context on resume)
+    assert cap["fresh_context"] == "PIMEM"
+
+
+def test_non_pi_runner_fresh_context_unchanged(monkeypatch):
+    # non-Pi runner gets the pre-existing behavior: fresh_ctx on new, None on resume
+    cap_new = _run_pm_capture_pi_mem(monkeypatch, _CaptureOKRunner(),
+                                     DummySessionMap())
+    assert cap_new["fresh_context"] == "FRESH"
+    cap_res = _run_pm_capture_pi_mem(monkeypatch, _CaptureOKRunner(),
+                                     _ResumeSessionMap())
+    assert cap_res["fresh_context"] is None

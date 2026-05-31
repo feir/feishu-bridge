@@ -278,32 +278,188 @@ def test_pi_parse_protocol_error_event(tmp_path):
     assert result["result"] == "Pi 协议错误：invalid JSON protocol frame"
 
 
-def test_pi_parse_tool_status_events(tmp_path):
+def _toolcall_event(utype, *, call_id=None, name="read", arguments=None):
+    tc = {"type": "toolCall", "name": name}
+    if call_id is not None:
+        tc["id"] = call_id
+    if arguments is not None:
+        tc["arguments"] = arguments
+    return {
+        "type": "message_update",
+        "assistantMessageEvent": {
+            "type": utype,
+            "partial": {"content": [tc]},
+        },
+    }
+
+
+def test_normalize_pi_tool():
+    assert PiRunner._normalize_pi_tool("read") == "Read"
+    assert PiRunner._normalize_pi_tool("bash") == "Bash"
+    assert PiRunner._normalize_pi_tool("ls") == "Ls"
+    assert PiRunner._normalize_pi_tool("grep") == "Grep"
+    # Unknown pi tool → .title() fallback (still renders, no crash)
+    assert PiRunner._normalize_pi_tool("inspect") == "Inspect"
+    assert PiRunner._normalize_pi_tool("") == ""
+
+
+def test_tool_status_single_emit_per_id(tmp_path):
+    """toolcall_* is authoritative; tool_execution_* is a no-op; one entry."""
     runner = _runner(tmp_path)
     state = StreamState()
 
+    # Same call id arrives via start (no args yet), tool_execution noise, then
+    # end (with args). Must surface exactly one normalized dict.
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="toolu_1", name="read"), state)
+    runner.parse_streaming_line(
+        {"type": "tool_execution_start", "toolName": "read"}, state)
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="toolu_1", name="read",
+                        arguments={"path": "/a/README.md"}), state)
+    runner.parse_streaming_line(
+        {"type": "tool_execution_end", "toolName": "read",
+         "result": {"isError": True}}, state)
+
+    assert state.pending_tool_status == [
+        {"name": "Read", "hint_data": "/a/README.md"}]
+    assert state.is_error is False
+    assert state.done is False
+
+
+def test_tool_execution_only_stream_no_status(tmp_path):
+    """Degenerate stream with only tool_execution_* (id-less) → no status."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        {"type": "tool_execution_start", "toolName": "read"}, state)
+    runner.parse_streaming_line(
+        {"type": "tool_execution_end", "toolName": "read"}, state)
+    assert state.pending_tool_status == []
+
+
+def test_emit_deferred_until_args(tmp_path):
+    """start with empty args emits nothing; emit once when args arrive."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="toolu_9", name="bash"), state)
+    assert state.pending_tool_status == []
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="toolu_9", name="bash",
+                        arguments={"command": "ls -1"}), state)
+    assert state.pending_tool_status == [{"name": "Bash", "hint_data": "ls"}]
+
+
+def test_two_blank_starts_no_miscorrelation(tmp_path):
+    """Two same-name calls with distinct ids each get their own correct hint."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="a", name="read"), state)
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="b", name="read"), state)
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="b", name="read",
+                        arguments={"path": "/x/b.py"}), state)
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="a", name="read",
+                        arguments={"path": "/x/a.py"}), state)
+    assert state.pending_tool_status == [
+        {"name": "Read", "hint_data": "/x/b.py"},
+        {"name": "Read", "hint_data": "/x/a.py"},
+    ]
+
+
+def test_extract_hint_ls_find():
+    from feishu_bridge.runtime import _extract_hint_data
+    assert _extract_hint_data("Ls", {"path": "/a/b"}) == "/a/b"
+    assert _extract_hint_data("Find", {"path": "/a", "pattern": "*.py"}) == "*.py"
+    assert _extract_hint_data("Find", {"path": "/a"}) == "/a"
+
+
+def test_format_tool_hint_ls():
+    """Ls renders the basename of its directory path, like Read/Write/Edit."""
+    from feishu_bridge.ui import ResponseHandle
+    assert ResponseHandle._format_tool_hint("Ls", "/a/b/c") == "c"
+    assert ResponseHandle._format_tool_hint("Read", "/a/b/README.md") == "README.md"
+
+
+# ---- Item 3: per-session memory (pi sole-writer, bridge read-only) ----
+
+def test_pi_memory_scope_and_read(tmp_path, monkeypatch):
+    from feishu_bridge import pi_memory
+    root = tmp_path / "mem"
+    monkeypatch.setattr(pi_memory, "_root", lambda: root)
+
+    # Distinct (bot,chat,thread) tags → distinct files; thread is part of scope.
+    p_base = pi_memory.memory_path("bot:chatA:")
+    p_thread = pi_memory.memory_path("bot:chatA:thread1")
+    p_other = pi_memory.memory_path("bot:chatB:")
+    assert len({p_base, p_thread, p_other}) == 3
+
+    # Missing file → empty, never raises.
+    assert pi_memory.safe_read("bot:chatA:") == ""
+
+    # soft_tail_cap truncates the injected copy only; disk file is untouched.
+    root.mkdir(parents=True, exist_ok=True)
+    p_base.write_text("y" * 20000, encoding="utf-8")
+    capped = pi_memory.soft_tail_cap(pi_memory.safe_read("bot:chatA:"), 8192)
+    assert len(capped.encode("utf-8")) <= 8192 + 64       # tail + marker
+    assert p_base.stat().st_size == 20000                  # file unchanged
+
+
+def test_memory_injection_isolation(tmp_path, monkeypatch):
+    from feishu_bridge import pi_memory
+    root = tmp_path / "mem"
+    root.mkdir()
+    monkeypatch.setattr(pi_memory, "_root", lambda: root)
+
+    pi_memory.memory_path("b:cA:").write_text("FACT_A 简体中文", encoding="utf-8")
+    pi_memory.memory_path("b:cB:").write_text("FACT_B english", encoding="utf-8")
+    pi_memory.memory_path("b:cA:t1").write_text("FACT_T1", encoding="utf-8")
+
+    inj_a = pi_memory.build_injection("b:cA:")
+    inj_b = pi_memory.build_injection("b:cB:")
+
+    assert "FACT_A" in inj_a and "FACT_B" not in inj_a
+    assert "FACT_B" in inj_b and "FACT_A" not in inj_b
+    # Different thread of same chat is isolated.
+    assert "FACT_T1" not in inj_a
+    # Write protocol + absolute path present so the agent knows where to write.
+    assert "edit" in inj_a and str(pi_memory.memory_path("b:cA:")) in inj_a
+
+
+def test_memory_unreadable_no_raise(monkeypatch):
+    from feishu_bridge import pi_memory
+
+    def boom():
+        raise OSError("unreadable root")
+
+    monkeypatch.setattr(pi_memory, "_root", boom)
+    # Both degrade to empty without raising.
+    assert pi_memory.safe_read("b:c:") == ""
+    assert pi_memory.build_injection("b:c:") == ""
+
+
+def test_tool_status_malformed_event_no_raise(tmp_path):
+    """Malformed events must not raise; degrade to a bare-name entry (spec:
+    never-raises → bare tool label), not silently dropped."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    # arguments not a dict, arriving on END (call resolving) → bare-name entry
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="m1", name="read",
+                        arguments="oops"), state)
+    # missing name → cannot label → skipped (no crash)
     runner.parse_streaming_line({
         "type": "message_update",
         "assistantMessageEvent": {
-            "type": "toolcall_start",
-            "partial": {
-                "content": [{"type": "toolCall", "name": "ls"}],
-            },
+            "type": "toolcall_end",
+            "partial": {"content": [{"type": "toolCall", "id": "m2"}]},
         },
     }, state)
-    runner.parse_streaming_line({
-        "type": "tool_execution_start",
-        "toolName": "read",
-    }, state)
-    runner.parse_streaming_line({
-        "type": "tool_execution_end",
-        "toolName": "read",
-        "result": {"isError": True},
-    }, state)
-
-    assert state.pending_tool_status == ["ls", "read", "read"]
-    assert state.is_error is False
-    assert state.done is False
+    assert state.pending_tool_status == [{"name": "Read", "hint_data": ""}]
 
 
 def test_create_runner_pi_builds_pi_runner(tmp_path):

@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from feishu_bridge.runtime import BaseRunner, StreamState, log
+from feishu_bridge.runtime import BaseRunner, StreamState, _extract_hint_data, log
 
 
 class PiRunner(BaseRunner):
@@ -19,6 +19,27 @@ class PiRunner(BaseRunner):
     """
 
     ALWAYS_STREAMING = True
+
+    # Pi emits lowercase native tool names (read/bash/edit/write/ls/grep/find).
+    # Normalize to the bridge's canonical PascalCase vocabulary so ui.py's
+    # _TOOL_STATUS_MAP / _format_tool_hint (keyed on canonical names) and the
+    # shared _extract_hint_data both apply. Mirrors omp's _normalize_tool_name.
+    _TOOL_NAME_MAP = {
+        "bash": "Bash",
+        "read": "Read",
+        "write": "Write",
+        "edit": "Edit",
+        "ls": "Ls",
+        "list": "Ls",
+        "grep": "Grep",
+        "search": "Grep",
+        "find": "Find",
+        "glob": "Glob",
+    }
+
+    @classmethod
+    def _normalize_pi_tool(cls, raw_name: str) -> str:
+        return cls._TOOL_NAME_MAP.get((raw_name or "").lower(), (raw_name or "").title())
 
     def display_default_model(self) -> Optional[str]:
         """Pi pins no ``--model`` under the default provider; it reads its own
@@ -84,16 +105,12 @@ class PiRunner(BaseRunner):
             self._handle_message_update(event, state)
             return
 
-        if etype == "tool_execution_start":
-            tool_name = event.get("toolName")
-            if tool_name:
-                state.pending_tool_status.append(str(tool_name))
-            return
-
-        if etype == "tool_execution_end":
-            tool_name = event.get("toolName")
-            if tool_name:
-                state.pending_tool_status.append(str(tool_name))
+        if etype in ("tool_execution_start", "tool_execution_end"):
+            # No-op for tool status. These coarse lifecycle events carry only
+            # `toolName` (no tool-call id, no arguments). The authoritative,
+            # rich source is `message_update.toolcall_*` (carries id + name +
+            # arguments), handled in _handle_message_update. Emitting here too
+            # would duplicate each call and provide no file/command target.
             return
 
         if etype == "turn_end":
@@ -226,23 +243,74 @@ class PiRunner(BaseRunner):
             return
 
         if utype in {"toolcall_start", "toolcall_end"}:
-            tool_name = self._tool_name_from_update(update)
-            if tool_name:
-                state.pending_tool_status.append(tool_name)
+            self._emit_tool_status(update, state,
+                                   is_start=(utype == "toolcall_start"))
+
+    def _emit_tool_status(self, update: dict, state: StreamState,
+                          is_start: bool) -> None:
+        """Surface a pi tool call as one ``{name, hint_data}`` entry.
+
+        Authoritative source for pi tool status (``message_update.toolcall_*``).
+        Each call is emitted exactly once — when its arguments first become
+        available — keyed by tool-call id (``state._tool_seen_ids``). Never
+        raises: extraction failures degrade to skipping this status update.
+        """
+        try:
+            tc = self._tool_call_from_update(update)
+            if not tc:
+                return
+            name = tc.get("name")
+            if not name:
+                return
+            call_id = tc.get("id")
+            if call_id and call_id in state._tool_seen_ids:
+                return
+            if not call_id and not is_start:
+                # id-less call: act on start only to avoid start+end double.
+                # Known limitation: an id-less split call whose args arrive only
+                # on `end` surfaces a bare label (no hint). Real pi always emits
+                # a tool-call id (verified), so this affects only malformed
+                # streams — an acceptable degradation, never a crash.
+                return
+            canonical = self._normalize_pi_tool(name)
+            args = tc.get("arguments")
+            if not isinstance(args, dict):
+                args = {}
+            if not args:
+                # No usable arguments. With an id on a *start* event, defer —
+                # a later toolcall_end may carry them. Otherwise the call is
+                # resolving without extractable args: degrade to a bare-name
+                # entry (still useful: "执行命令"/"读取文件") rather than
+                # dropping the status (spec contract: never-raises → bare label).
+                if call_id and is_start:
+                    return
+                state.pending_tool_status.append(
+                    {"name": canonical, "hint_data": ""})
+                if call_id:
+                    state._tool_seen_ids.add(call_id)
+                return
+            hint = _extract_hint_data(canonical, args)
+            state.pending_tool_status.append(
+                {"name": canonical, "hint_data": hint})
+            if call_id:
+                state._tool_seen_ids.add(call_id)
+        except Exception as e:  # never-raises hot path
+            log.debug("pi tool-status extract failed: %s", e)
 
     @staticmethod
-    def _tool_name_from_update(update: dict) -> Optional[str]:
-        tool_call = update.get("toolCall") or {}
+    def _tool_call_from_update(update: dict) -> Optional[dict]:
+        """Return the toolCall object (id/name/arguments) from an update."""
+        tool_call = update.get("toolCall")
         if isinstance(tool_call, dict) and tool_call.get("name"):
-            return str(tool_call["name"])
+            return tool_call
         partial = update.get("partial") or {}
         content = partial.get("content") or []
         if isinstance(content, list):
             for item in content:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "toolCall" and item.get("name"):
-                    return str(item["name"])
+                if (isinstance(item, dict)
+                        and item.get("type") == "toolCall"
+                        and item.get("name")):
+                    return item
         return None
 
     @classmethod

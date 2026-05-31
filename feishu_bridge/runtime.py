@@ -338,6 +338,9 @@ class StreamState:
     bg_agent_running: bool = False
     # OMP todo state machine — rebuilt from ops deltas
     _todo_phases: list[dict] = field(default_factory=list)
+    # Pi tool-status: tool-call ids already emitted to pending_tool_status,
+    # so each call surfaces exactly once (id-correlated single emit).
+    _tool_seen_ids: set = field(default_factory=set)
 
     # ── Todo state machine (OMP ops format) ──
 
@@ -495,11 +498,21 @@ def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
         return (tool_input.get("query") or "")[:40]
     if tool_name == "WebFetch":
         return (tool_input.get("url") or "")[:60]
+    if tool_name == "Ls":
+        # Pi `ls` tool: single directory path.
+        return (tool_input.get("path") or tool_input.get("file_path") or "")
     if tool_name == "Find":
         paths = tool_input.get("paths")
         if isinstance(paths, list) and paths:
             first = str(paths[0])[:40]
             return f"{first} +{len(paths)-1}" if len(paths) > 1 else first
+        # Pi `find` tool: single `path` + `pattern`; pattern is the salient hint.
+        pattern = tool_input.get("pattern")
+        if pattern:
+            return str(pattern)[:40]
+        single = tool_input.get("path")
+        if single:
+            return str(single)[:40]
         return (tool_input.get("_i") or "")[:50]
     if tool_name == "Lsp":
         action = tool_input.get("action", "")

@@ -1176,6 +1176,7 @@ class ResponseHandle:
         "Grep": "搜索代码",
         "Glob": "查找文件",
         "Find": "查找文件",
+        "Ls": "列出目录",
         "WebFetch": "抓取网页",
         "WebSearch": "搜索网页",
         "Lsp": "代码分析",
@@ -1202,7 +1203,7 @@ class ResponseHandle:
     def _format_tool_hint(tool_name: str, hint_data: str) -> str:
         if not hint_data:
             return ""
-        if tool_name in ("Read", "Write", "Edit"):
+        if tool_name in ("Read", "Write", "Edit", "Ls"):
             return os.path.basename(hint_data)
         if tool_name == "WebFetch":
             from urllib.parse import urlparse
