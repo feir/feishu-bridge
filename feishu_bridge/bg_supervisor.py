@@ -81,6 +81,20 @@ _STALE_LAUNCHING_MS = 30 * 1000
 # intervention.
 _DELIVERY_ATTEMPT_CAP = 10
 
+
+# CLI-originated bg tasks (background Bash captured by the bg-task-redirect
+# hook) are enqueued with this placeholder chat_id — there is no real Feishu
+# chat behind it, so their completion can never be delivered. Matched EXACTLY
+# (not "any non-oc_ id"): a genuinely misconfigured chat_id must still surface
+# as a delivery failure rather than be silently swallowed as "no target".
+_NO_DELIVERY_CHAT_IDS = frozenset({"chat"})
+
+
+def _is_no_delivery_target(chat_id: Optional[str]) -> bool:
+    """True iff ``chat_id`` is empty or a known placeholder with no real
+    Feishu chat behind it (so delivery can never succeed)."""
+    return not chat_id or chat_id in _NO_DELIVERY_CHAT_IDS
+
 # §6.3 reap tuning: grace between SIGTERM and SIGKILL mirrors wrapper Phase W.
 _REAP_SIGTERM_GRACE_S = 5.0
 _REAP_POLL_INTERVAL_S = 0.5
@@ -588,6 +602,7 @@ class BgSupervisor:
             "queued_launched": 0,
             "deliveries_handed_off": 0,
             "retry_budget_exhausted": 0,
+            "no_target_remediated": 0,
             # §6.6 cleanup+archive counters.
             "archived": 0,
             "archive_expired": 0,
@@ -1355,21 +1370,61 @@ class BgSupervisor:
     def _log_retry_budget_exhausted(
         self, repo: BgTaskRepo, stats: dict[str, int],
     ) -> None:
-        """Emit ERROR for delivery_failed rows that have burned their budget."""
+        """Emit ERROR for delivery_failed rows that have burned their budget.
+
+        Rows whose chat_id is a no-delivery placeholder (CLI-originated tasks)
+        are remediated to terminal 'sent' instead of logged — this retires
+        pre-existing exhausted placeholder rows that the delivery-scan guard
+        can never reach (``list_pending_deliveries`` excludes attempt>=cap),
+        so they stop re-emitting the error on every restart.
+        """
+        # LEFT JOIN (not INNER): orphan runs whose bg_tasks row is gone
+        # (FK CASCADE should prevent it, but DB corruption can — see
+        # _scan_delivery_outbox) must still surface for the operator. bg_tasks
+        # .chat_id is NOT NULL, so a NULL chat_id here means "task missing".
         rows = repo.conn.execute(
-            """SELECT id, task_id, delivery_attempt_count, delivery_error
-                 FROM bg_runs
-                WHERE delivery_state='delivery_failed'
-                  AND delivery_attempt_count >= ?""",
+            """SELECT r.id, r.task_id, r.delivery_attempt_count,
+                      r.delivery_error, t.chat_id
+                 FROM bg_runs r LEFT JOIN bg_tasks t ON t.id = r.task_id
+                WHERE r.delivery_state='delivery_failed'
+                  AND r.delivery_attempt_count >= ?""",
             (_DELIVERY_ATTEMPT_CAP,),
         ).fetchall()
-        stats["retry_budget_exhausted"] = len(rows)
+        now_ms = int(time.time() * 1000)
+        logged = 0
+        remediated = 0
         for r in rows:
+            # Only auto-settle when the task still exists AND its chat_id is a
+            # no-delivery placeholder. Orphans (chat_id IS NULL) fall through to
+            # the operator-facing log — never silently settled.
+            if r["chat_id"] is not None and _is_no_delivery_target(r["chat_id"]):
+                try:
+                    repo.mark_delivery_state(
+                        r["id"], "sent",
+                        expected_from="delivery_failed",
+                        sent_at=now_ms,
+                        session_resume_status="no_delivery_target",
+                    )
+                    remediated += 1
+                except Exception:
+                    log.exception(
+                        "bg reconcile: remediate no-target run %s failed",
+                        r["id"],
+                    )
+                continue
+            logged += 1
             log.error(
                 "bg reconcile: run %s (task=%s) exhausted delivery retries "
                 "(%d/%d): last error=%r — operator intervention required",
                 r["id"], r["task_id"], r["delivery_attempt_count"],
                 _DELIVERY_ATTEMPT_CAP, r["delivery_error"],
+            )
+        stats["retry_budget_exhausted"] = logged
+        stats["no_target_remediated"] = remediated
+        if remediated:
+            log.info(
+                "bg reconcile: settled %d exhausted no-delivery-target run(s)",
+                remediated,
             )
 
     # ---- UDS bind -------------------------------------------------------------
@@ -1723,6 +1778,31 @@ class BgSupervisor:
                 except Exception:
                     log.exception(
                         "bg-supervisor: mark orphan run %s failed", run_id,
+                    )
+                continue
+
+            # CLI-originated bg tasks carry a placeholder chat_id with no real
+            # Feishu chat, so delivery can never succeed. Settle them terminally
+            # as 'sent' instead of burning the 10-attempt budget and emitting
+            # the per-restart "operator intervention required" ERROR. The output
+            # is on disk and the originating session already got its completion
+            # notification — there is simply no Feishu chat to deliver to, so
+            # 'sent' ("delivery phase complete") is the correct terminal.
+            if _is_no_delivery_target(task_row.chat_id):
+                log.debug(
+                    "bg-supervisor: run %s has no deliverable chat_id (%r) — "
+                    "settling without Feishu delivery", run_id, task_row.chat_id,
+                )
+                try:
+                    repo.mark_delivery_state(
+                        run_id, "sent",
+                        expected_from=run_row["delivery_state"],
+                        sent_at=now_ms,
+                        session_resume_status="no_delivery_target",
+                    )
+                except Exception:
+                    log.exception(
+                        "bg-supervisor: settle no-target run %s failed", run_id,
                     )
                 continue
 

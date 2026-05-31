@@ -735,6 +735,92 @@ def test_scan_delivery_delivers_pending_run(short_env, repo):
     assert call["extras"]["_bg_run_id"] == run_id
 
 
+def test_is_no_delivery_target():
+    from feishu_bridge.bg_supervisor import _is_no_delivery_target
+    # Real oc_ chats — and even a misconfigured non-placeholder id — are NOT
+    # treated as no-target; only the known placeholder / empty values are, so a
+    # typo still surfaces as a real delivery failure rather than silent loss.
+    assert not _is_no_delivery_target("oc_edba0af0")
+    assert not _is_no_delivery_target("od_typo")
+    assert _is_no_delivery_target("chat")
+    assert _is_no_delivery_target("")
+    assert _is_no_delivery_target(None)
+
+
+def test_log_retry_budget_exhausted_remediates_no_target_rows(short_env, repo):
+    """Pre-existing exhausted placeholder rows (attempt>=cap, unreachable by the
+    delivery-scan guard) are settled to 'sent' instead of re-logging the
+    per-restart 'operator intervention required' ERROR; real-chat exhausted
+    rows are still surfaced."""
+    _, ghost_run = _make_pending_run(repo, session_id="s_cli", chat_id="chat")
+    _, real_run = _make_pending_run(repo, session_id="s_real", chat_id="oc_real")
+    for rid in (ghost_run, real_run):
+        repo.conn.execute(
+            "UPDATE bg_runs SET delivery_state='delivery_failed', "
+            "delivery_attempt_count=10 WHERE id=?",
+            (rid,),
+        )
+    repo.conn.commit()
+
+    sup = _make_delivery_supervisor(short_env)
+    stats: dict[str, int] = {}
+    sup._log_retry_budget_exhausted(repo, stats)
+
+    assert _delivery_state(repo.conn, ghost_run) == "sent"
+    assert _delivery_state(repo.conn, real_run) == "delivery_failed"
+    assert stats["retry_budget_exhausted"] == 1
+    assert stats.get("no_target_remediated") == 1
+
+
+def test_log_retry_budget_exhausted_keeps_orphan_visible(short_env, repo):
+    """An exhausted orphan run (bg_tasks row gone → LEFT JOIN chat_id IS NULL)
+    must keep surfacing for the operator, never be silently settled."""
+    tid, orphan_run = _make_pending_run(repo, session_id="s_orphan")
+    repo.conn.execute("PRAGMA foreign_keys=OFF")
+    repo.conn.execute("DELETE FROM bg_tasks WHERE id=?", (tid,))
+    repo.conn.execute(
+        "UPDATE bg_runs SET delivery_state='delivery_failed', "
+        "delivery_attempt_count=10 WHERE id=?",
+        (orphan_run,),
+    )
+    repo.conn.commit()
+
+    sup = _make_delivery_supervisor(short_env)
+    stats: dict[str, int] = {}
+    sup._log_retry_budget_exhausted(repo, stats)
+
+    assert _delivery_state(repo.conn, orphan_run) == "delivery_failed"
+    assert stats["retry_budget_exhausted"] == 1
+    assert stats["no_target_remediated"] == 0
+
+
+def test_scan_delivery_settles_non_deliverable_chat_without_enqueue(
+    short_env, repo,
+):
+    """CLI-originated bg tasks carry a placeholder chat_id (no oc_ target).
+    They settle as 'sent' without calling enqueue_fn or burning the retry
+    budget — no per-restart 'operator intervention required' ERROR."""
+    from feishu_bridge.session_resume import SessionsIndex
+
+    tid, run_id = _make_pending_run(repo, session_id="sess_cli", chat_id="chat")
+    idx = SessionsIndex(Path(short_env["db_path"]).parent / "sessions.json")
+    idx.touch("sess_cli", "chat", int(time.time() * 1000))
+
+    calls: list[dict] = []
+    def _fake_enqueue(**kwargs):
+        calls.append(kwargs)
+        return ("queued", {})
+
+    sup = _make_delivery_supervisor(
+        short_env, enqueue_fn=_fake_enqueue, sessions_index=idx,
+    )
+    delivered = sup._scan_delivery_outbox(repo)
+
+    assert delivered == 0          # not counted as a delivery
+    assert calls == []             # enqueue_fn never called
+    assert _delivery_state(repo.conn, run_id) == "sent"  # terminal, settled
+
+
 def test_scan_delivery_fresh_fallback_prefix_when_unseen(short_env, repo):
     """session not in index → fresh_fallback prefix + effective_sid=None."""
     from feishu_bridge.session_resume import SessionsIndex
@@ -1788,6 +1874,7 @@ def test_reconcile_returns_stats_dict_with_all_keys(short_env, repo):
         "queued_launched",
         "deliveries_handed_off",
         "retry_budget_exhausted",
+        "no_target_remediated",
         # §6.6 cleanup + quarantine retention (Commit C).
         "archived",
         "archive_expired",
