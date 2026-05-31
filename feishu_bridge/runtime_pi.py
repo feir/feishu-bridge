@@ -22,7 +22,8 @@ class PiRunner(BaseRunner):
 
     def build_args(self, prompt: str, session_id: Optional[str],
                    resume: bool, streaming: bool, *,
-                   fork_session: bool = False) -> list:
+                   fork_session: bool = False,
+                   fresh_context: Optional[str] = None) -> list:
         args = [self.command, "--mode", "json"]
 
         if self._extra_cli_args:
@@ -34,7 +35,7 @@ class PiRunner(BaseRunner):
         if not self._has_any_arg(args, {"--tools", "--no-tools"}):
             args.extend(["--tools", self.READONLY_TOOLS])
 
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(extra=fresh_context)
         if system_prompt:
             args.extend(["--append-system-prompt", system_prompt])
 

@@ -60,6 +60,22 @@ def test_pi_build_args_respects_tool_and_session_overrides(tmp_path):
     assert str(tmp_path / "custom.jsonl") in args
 
 
+def test_pi_build_args_accepts_fresh_context(tmp_path):
+    # Regression: BaseRunner.run() passes fresh_context= to build_args; PiRunner
+    # must accept it and fold it into the appended system prompt (same channel as
+    # ClaudeRunner/OmpRunner), not raise TypeError.
+    runner = _runner(tmp_path, extra_system_prompts=["bridge rules"])
+
+    args = runner.build_args(
+        "hello", "sid", False, True,
+        fresh_context="REMEMBER: fresh memory note",
+    )
+
+    sp = args[args.index("--append-system-prompt") + 1]
+    assert "REMEMBER: fresh memory note" in sp
+    assert "bridge rules" in sp
+
+
 def test_pi_parse_text_delta_and_final_usage(tmp_path):
     runner = _runner(tmp_path)
     state = StreamState(session_id="bridge-sid")
