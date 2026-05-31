@@ -946,6 +946,11 @@ class ResponseHandle:
         self._flush_ctrl: Optional[FlushController] = None
         self._typing_reaction_id: Optional[str] = None
         self._card_creation_lock = threading.Lock()
+        # Backoff gate for card creation: a persistent send failure (e.g. the
+        # transient token/WebSocket warmup window right after a restart) must
+        # not retry once per stream chunk and flood the log. Reset on success.
+        self._card_create_failures = 0
+        self._card_create_retry_at = 0.0  # time.monotonic() deadline
         self._card_fallback_timer: Optional[threading.Timer] = None
         self._card_fallback_timeout = 8
         self._summary_updated = False
@@ -991,6 +996,12 @@ class ResponseHandle:
             if self.card_message_id:
                 return True
 
+            # A prior create attempt failed and we're still in its backoff
+            # window — skip the API call so streaming chunks don't flood. The
+            # final deliver() sends the full content regardless of card state.
+            if time.monotonic() < self._card_create_retry_at:
+                return False
+
             if self._card_fallback_timer:
                 self._card_fallback_timer.cancel()
                 self._card_fallback_timer = None
@@ -1011,6 +1022,8 @@ class ResponseHandle:
                     self._flush_ctrl.set_card_ready()
                     if initial_content:
                         self._flush_ctrl.request_flush(initial_content)
+                    self._card_create_failures = 0
+                    self._card_create_retry_at = 0.0
                     return True
                 if self._terminated:
                     return False
@@ -1024,7 +1037,12 @@ class ResponseHandle:
                 self.card_message_id = msg_id
                 self._flush_ctrl = FlushController(self._perform_flush, use_cardkit=False)
                 self._flush_ctrl.set_card_ready()
+                self._card_create_failures = 0
+                self._card_create_retry_at = 0.0
                 return True
+            self._card_create_failures += 1
+            self._card_create_retry_at = time.monotonic() + min(
+                2.0 ** self._card_create_failures, 30.0)
             return False
 
     def deliver(self, content: str, is_error: bool = False,

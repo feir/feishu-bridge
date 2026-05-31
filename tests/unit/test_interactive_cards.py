@@ -407,3 +407,40 @@ class TestCardCacheAndRebuild:
         _card_cache[ref] = (_time.time() - 1, cached_card)
 
         assert rebuild_card_with_selection(ref, "A") is None
+
+
+# ---------------------------------------------------------------------------
+# ResponseHandle._ensure_card backoff (no per-chunk flood on send failure)
+# ---------------------------------------------------------------------------
+
+class TestEnsureCardBackoff:
+    def _handle(self):
+        from feishu_bridge.ui import ResponseHandle
+        # source_message_id=None forces the create-by-chat_id branch; lark
+        # client is never reached because the send methods are patched.
+        return ResponseHandle(lark_client=None, chat_id="oc_test", bot_id="cli_1")
+
+    def test_failure_sets_backoff_and_suppresses_retries(self):
+        h = self._handle()
+        with patch.object(h, "_try_create_cardkit", return_value=None), \
+             patch.object(h, "_send_card", return_value=None) as send:
+            # First attempt actually hits _send_card and fails → backoff armed.
+            assert h._ensure_card("a") is False
+            assert send.call_count == 1
+            assert h._card_create_failures == 1
+            assert h._card_create_retry_at > 0.0
+            # Subsequent stream chunks within the window must NOT call the API.
+            assert h._ensure_card("b") is False
+            assert h._ensure_card("c") is False
+            assert send.call_count == 1
+
+    def test_success_resets_backoff(self):
+        h = self._handle()
+        h._card_create_failures = 3
+        h._card_create_retry_at = 0.0  # window already expired → retry allowed
+        with patch.object(h, "_try_create_cardkit", return_value=None), \
+             patch.object(h, "_send_card", return_value="om_msgid"), \
+             patch("feishu_bridge.ui.FlushController"):
+            assert h._ensure_card("x") is True
+            assert h._card_create_failures == 0
+            assert h._card_create_retry_at == 0.0
