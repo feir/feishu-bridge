@@ -665,8 +665,12 @@ class BridgeCommandHandler:
         result = check_and_update()
         status = result.get("status")
         if status == "updated":
+            # restart_only: disk already had this version (no pipx ran this
+            # call) → "already ready". upgrade_and_restart: we pulled it now.
+            already_pulled = result.get("action") == "restart_only"
             self._deploy_and_restart(
-                handle, result["version"], __version__, already_pulled=False)
+                handle, result["version"], __version__,
+                already_pulled=already_pulled)
         elif status == "up_to_date":
             handle.deliver(f"已是最新版本 v{__version__}，无需重启。")
         else:
@@ -862,7 +866,7 @@ class BridgeCommandHandler:
 
                 if status == "rejected":
                     lines.append("")
-                    lines.append(f"**Claude** \U0001f6ab")
+                    lines.append("**Claude** \U0001f6ab")
                     lines.append(f"- {label}: 已用尽{reset_str}")
                 else:
                     lines.append("")

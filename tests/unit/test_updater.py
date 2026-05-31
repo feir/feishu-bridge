@@ -73,6 +73,7 @@ def test_git_up_to_date(mock_run):
 
     result = uc._check_git("2026.03.24.1")
     assert result["status"] == "up_to_date"
+    assert result["action"] == "none"
     assert uc.pending_version is None
 
 
@@ -92,6 +93,7 @@ def test_git_has_update(mock_run):
         result = uc._check_git("2026.03.24.1")
 
     assert result["status"] == "updated"
+    assert result["action"] == "upgrade_and_restart"
     assert result["version"] == "2026.03.25"
     assert uc.pending_version == "2026.03.25"
 
@@ -137,36 +139,79 @@ def test_git_no_source_path(mock_run):
 # ── PyPI mode ───────────────────────────────────────────────────────
 
 
+@patch("feishu_bridge.updater._installed_version")
 @patch("requests.get")
-def test_pypi_up_to_date(mock_get):
-    """PyPI version == local → up_to_date."""
+def test_pypi_up_to_date(mock_get, mock_installed):
+    """PyPI latest == installed-on-disk == running → up_to_date/none."""
     uc = UpdateChecker("pypi", None, 3600)
     mock_get.return_value = MagicMock(
-        status_code=200,
-        json=lambda: {"info": {"version": "2026.3.24.1"}},
-    )
+        json=lambda: {"info": {"version": "2026.3.24.1"}})
     mock_get.return_value.raise_for_status = MagicMock()
+    mock_installed.return_value = "2026.03.24.1"
 
     result = uc._check_pypi("2026.03.24.1")
     assert result["status"] == "up_to_date"
+    assert result["action"] == "none"
 
 
 @patch("feishu_bridge.updater.subprocess.run")
+@patch("feishu_bridge.updater._installed_version")
 @patch("requests.get")
-def test_pypi_has_update(mock_get, mock_run):
-    """PyPI has newer version → pipx upgrade + set pending_version."""
+def test_pypi_has_update(mock_get, mock_installed, mock_run):
+    """PyPI newer than disk → pipx upgrade, post-verify passes → upgrade_and_restart."""
     uc = UpdateChecker("pypi", None, 3600)
     mock_get.return_value = MagicMock(
-        status_code=200,
-        json=lambda: {"info": {"version": "2026.3.25"}},
-    )
+        json=lambda: {"info": {"version": "2026.3.25"}})
     mock_get.return_value.raise_for_status = MagicMock()
-    mock_run.return_value = MagicMock(returncode=0)  # pipx upgrade
+    # before upgrade disk is old; after upgrade disk advanced to latest
+    mock_installed.side_effect = ["2026.03.24.1", "2026.3.25"]
+    mock_run.return_value = MagicMock(returncode=0)
 
     result = uc._check_pypi("2026.03.24.1")
     assert result["status"] == "updated"
+    assert result["action"] == "upgrade_and_restart"
     assert result["version"] == "2026.3.25"
     assert uc.pending_version == "2026.3.25"
+    mock_run.assert_called_once()
+
+
+@patch("feishu_bridge.updater.subprocess.run")
+@patch("feishu_bridge.updater._installed_version")
+@patch("requests.get")
+def test_pypi_disk_ahead_is_restart_only_no_pipx(mock_get, mock_installed, mock_run):
+    """Disk already at latest but running process is older → restart_only, NO pipx.
+    This is the loop-breaker: must not re-run pipx when disk is already current."""
+    uc = UpdateChecker("pypi", None, 3600)
+    mock_get.return_value = MagicMock(
+        json=lambda: {"info": {"version": "2026.3.25"}})
+    mock_get.return_value.raise_for_status = MagicMock()
+    mock_installed.return_value = "2026.3.25"          # disk already latest
+
+    result = uc._check_pypi("2026.03.24.1")            # running process is old
+    assert result["status"] == "updated"
+    assert result["action"] == "restart_only"
+    assert result["version"] == "2026.3.25"
+    assert uc.pending_version == "2026.3.25"
+    mock_run.assert_not_called()
+
+
+@patch("feishu_bridge.updater.subprocess.run")
+@patch("feishu_bridge.updater._installed_version")
+@patch("requests.get")
+def test_pypi_post_upgrade_verification_fail(mock_get, mock_installed, mock_run):
+    """pipx exits 0 but disk version did not advance → error, no pending_version."""
+    uc = UpdateChecker("pypi", None, 3600)
+    mock_get.return_value = MagicMock(
+        json=lambda: {"info": {"version": "2026.3.25"}})
+    mock_get.return_value.raise_for_status = MagicMock()
+    # before old; after pipx STILL old (partial/corrupted install)
+    mock_installed.side_effect = ["2026.03.24.1", "2026.03.24.1"]
+    mock_run.return_value = MagicMock(returncode=0)
+
+    result = uc._check_pypi("2026.03.24.1")
+    assert result["status"] == "error"
+    assert uc.pending_version is None
+    assert "校验失败" in result["message"]
 
 
 @patch("requests.get")
@@ -181,21 +226,71 @@ def test_pypi_network_error(mock_get):
 
 
 @patch("feishu_bridge.updater.subprocess.run")
+@patch("feishu_bridge.updater._installed_version")
 @patch("requests.get")
-def test_pypi_pipx_upgrade_failure(mock_get, mock_run):
-    """pipx upgrade fails → error, no pending_version."""
+def test_pypi_pipx_upgrade_failure(mock_get, mock_installed, mock_run):
+    """pipx upgrade returncode != 0 → error, no pending_version."""
     uc = UpdateChecker("pypi", None, 3600)
     mock_get.return_value = MagicMock(
-        status_code=200,
-        json=lambda: {"info": {"version": "2026.3.25"}},
-    )
+        json=lambda: {"info": {"version": "2026.3.25"}})
     mock_get.return_value.raise_for_status = MagicMock()
+    mock_installed.return_value = "2026.03.24.1"       # disk behind → upgrade tried
     mock_run.return_value = MagicMock(
         returncode=1, stderr=b"pipx error", stdout=b"")
 
     result = uc._check_pypi("2026.03.24.1")
     assert result["status"] == "error"
     assert uc.pending_version is None
+
+
+def test_check_and_update_serializes_concurrent_runs(monkeypatch):
+    """_check_lock serializes the whole run: while one check is mid-upgrade,
+    a concurrent check blocks, then returns restart_only WITHOUT launching a
+    second pipx — and the nested pending_version _lock does not deadlock."""
+    import threading
+    import time as _time
+
+    uc = UpdateChecker("pypi", None, 3600)
+    entered = threading.Event()
+    release = threading.Event()
+    run_calls = []
+
+    def blocking_run(*a, **k):
+        run_calls.append(a)
+        entered.set()          # we're inside pipx, holding _check_lock
+        release.wait(5)         # block until the test lets us finish
+        return MagicMock(returncode=0)
+
+    monkeypatch.setattr("feishu_bridge.updater.subprocess.run", blocking_run)
+    monkeypatch.setattr(
+        "requests.get",
+        lambda *a, **k: MagicMock(
+            raise_for_status=MagicMock(),
+            json=lambda: {"info": {"version": "2026.3.25"}}))
+    monkeypatch.setattr("feishu_bridge.__version__", "2026.03.24.1")
+    monkeypatch.setattr(
+        updater_mod, "_installed_version",
+        MagicMock(side_effect=["2026.03.24.1", "2026.3.25"]))
+
+    results = {}
+
+    def call(key):
+        results[key] = uc.check_and_update()
+
+    t1 = threading.Thread(target=call, args=("first",))
+    t1.start()
+    assert entered.wait(5)             # first is mid-upgrade, holds _check_lock
+    t2 = threading.Thread(target=call, args=("second",))
+    t2.start()
+    _time.sleep(0.2)
+    assert "second" not in results     # second is blocked on _check_lock
+    release.set()
+    t1.join(5)
+    t2.join(5)
+
+    assert results["first"]["action"] == "upgrade_and_restart"
+    assert results["second"]["action"] == "restart_only"
+    assert len(run_calls) == 1         # second did NOT launch a second pipx
 
 
 # ── check_and_update dispatch ───────────────────────────────────────
@@ -218,6 +313,7 @@ def test_check_and_update_early_return_when_pending():
     uc.pending_version = "2026.03.25"
     result = uc.check_and_update()
     assert result["status"] == "updated"
+    assert result["action"] == "restart_only"
     assert result["version"] == "2026.03.25"
 
 

@@ -551,3 +551,46 @@ def test_scope_key_from_item_matches_workflow_context():
         skill_dir=Path("/tmp/agents/skills/plan"),
     )
     assert bridge_commands._scope_key_from_item(item2) == ctx2.scope_key
+
+
+# ---------- /update action → already_pulled wiring ----------
+
+
+def _make_update_item():
+    return {
+        "_bridge_command": "update", "_cmd_arg": "",
+        "bot_id": "bot-1", "chat_id": "chat-1", "thread_id": None,
+        "message_id": "msg-1", "sender_id": "user-1", "chat_type": "p2p",
+    }
+
+
+def _run_update_capturing_deploy(monkeypatch, action):
+    from feishu_bridge import updater as updater_mod
+    handler = bridge_commands.BridgeCommandHandler(FakeBot())
+    monkeypatch.setattr(updater_mod, "get_pending_version", lambda: None)
+    monkeypatch.setattr(
+        updater_mod, "check_and_update",
+        lambda: {"status": "updated", "action": action, "version": "2026.5.31.9"})
+    captured = {}
+
+    def fake_deploy(handle, ver, cur, *, already_pulled):
+        captured["ver"] = ver
+        captured["already_pulled"] = already_pulled
+
+    monkeypatch.setattr(handler, "_deploy_and_restart", fake_deploy)
+    handle = FakeHandle(object(), "chat-1", None, "msg-1")
+    handler._handle_update(_make_update_item(), handle)
+    return captured
+
+
+def test_handle_update_restart_only_marks_already_pulled(monkeypatch):
+    """restart_only (disk already current) → _deploy_and_restart(already_pulled=True),
+    no claim of a fresh pull."""
+    captured = _run_update_capturing_deploy(monkeypatch, "restart_only")
+    assert captured == {"ver": "2026.5.31.9", "already_pulled": True}
+
+
+def test_handle_update_upgrade_performed_marks_pulled(monkeypatch):
+    """upgrade_and_restart (pipx ran this call) → already_pulled=False."""
+    captured = _run_update_capturing_deploy(monkeypatch, "upgrade_and_restart")
+    assert captured["already_pulled"] is False
