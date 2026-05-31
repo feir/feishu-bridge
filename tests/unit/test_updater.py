@@ -1,16 +1,13 @@
 """Tests for feishu_bridge.updater — background update checker."""
 
-import subprocess
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from feishu_bridge.updater import (
     UpdateChecker,
     _parse_calver,
     get_pending_version,
     get_update_banner_text,
-    init_updater,
 )
 from feishu_bridge import updater as updater_mod
 
@@ -270,3 +267,71 @@ def test_git_upstream_fallback_to_origin_head(mock_run):
     calls = mock_run.call_args_list
     assert "@{upstream}" in str(calls[1])
     assert "origin/HEAD" in str(calls[2])
+
+
+# ── pip ghost-dist purge (pre-upgrade resilience) ───────────────────
+
+
+def test_purge_pip_ghost_dists_removes_tombstones(tmp_path, monkeypatch):
+    import feishu_bridge
+    from feishu_bridge.updater import _purge_pip_ghost_dists
+
+    sp = tmp_path / "site-packages"
+    (sp / "feishu_bridge").mkdir(parents=True)
+    (sp / "feishu_bridge" / "__init__.py").write_text("")
+    # pip tombstones (must be removed) + real installs (must survive)
+    (sp / "~ark_oapi-1.6.5.dist-info").mkdir()
+    (sp / "~-rk_oapi-1.6.7.dist-info").mkdir()
+    (sp / "lark_oapi-1.6.7.dist-info").mkdir()
+    (sp / "lark_oapi").mkdir()
+    monkeypatch.setattr(
+        feishu_bridge, "__file__",
+        str(sp / "feishu_bridge" / "__init__.py"),
+    )
+
+    assert _purge_pip_ghost_dists() == 2
+    assert not (sp / "~ark_oapi-1.6.5.dist-info").exists()
+    assert not (sp / "~-rk_oapi-1.6.7.dist-info").exists()
+    assert (sp / "lark_oapi-1.6.7.dist-info").exists()
+    assert (sp / "lark_oapi").exists()
+
+
+def test_purge_pip_ghost_dists_noop_when_clean(tmp_path, monkeypatch):
+    import feishu_bridge
+    from feishu_bridge.updater import _purge_pip_ghost_dists
+
+    sp = tmp_path / "sp"
+    (sp / "feishu_bridge").mkdir(parents=True)
+    (sp / "feishu_bridge" / "__init__.py").write_text("")
+    monkeypatch.setattr(
+        feishu_bridge, "__file__",
+        str(sp / "feishu_bridge" / "__init__.py"),
+    )
+    assert _purge_pip_ghost_dists() == 0
+
+
+def test_purge_pip_ghost_dists_unlinks_symlink_without_following(
+    tmp_path, monkeypatch,
+):
+    import feishu_bridge
+    from feishu_bridge.updater import _purge_pip_ghost_dists
+
+    sp = tmp_path / "sp"
+    (sp / "feishu_bridge").mkdir(parents=True)
+    (sp / "feishu_bridge" / "__init__.py").write_text("")
+    # A '~' ghost that is a symlink to a real dir must be unlinked, never
+    # rmtree'd through (which would delete the target's contents).
+    target = tmp_path / "real_dir"
+    target.mkdir()
+    (target / "keep.txt").write_text("x")
+    ghost_link = sp / "~ghost-link"
+    ghost_link.symlink_to(target)
+    monkeypatch.setattr(
+        feishu_bridge, "__file__",
+        str(sp / "feishu_bridge" / "__init__.py"),
+    )
+
+    assert _purge_pip_ghost_dists() == 1
+    assert not ghost_link.exists()           # symlink removed
+    assert target.exists()                   # target NOT followed/deleted
+    assert (target / "keep.txt").exists()

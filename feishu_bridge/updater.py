@@ -5,12 +5,54 @@ and exposes pending_version for card footer notification.
 """
 
 import logging
+import shutil
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger("feishu-bridge")
+
+
+def _purge_pip_ghost_dists() -> int:
+    """Remove pip 'tombstone' dirs (names starting with '~') from the bridge's
+    own venv site-packages, returning how many were removed.
+
+    pip renames a distribution to '~ame' when it cannot fully remove it during
+    an interrupted/failed (un)install. These ghosts trigger 'Ignoring invalid
+    distribution' warnings and corrupt pip's uninstall bookkeeping, so a later
+    ``pipx upgrade`` (which does ``--force-reinstall``) aborts with a
+    missing-file OSError. Pre-cleaning makes upgrades resilient to a prior
+    crash. Best-effort; never raises.
+    """
+    try:
+        import feishu_bridge
+        site_packages = Path(feishu_bridge.__file__).resolve().parent.parent
+        ghosts = list(site_packages.glob("~*"))
+    except Exception:
+        log.debug("ghost-dist purge: cannot enumerate site-packages",
+                  exc_info=True)
+        return 0
+    removed = 0
+    for ghost in ghosts:
+        try:
+            # Symlink (even one pointing at a dir) must be unlinked, not
+            # rmtree'd. Don't suppress errors — a path that survives must not
+            # be counted as cleaned, else the upgrade failure mode silently
+            # persists and is harder to diagnose.
+            if ghost.is_symlink() or not ghost.is_dir():
+                ghost.unlink()
+            else:
+                shutil.rmtree(ghost)
+        except OSError as e:
+            log.debug("ghost-dist purge: cannot remove %s: %s", ghost, e)
+            continue
+        removed += 1
+    if removed:
+        log.info("ghost-dist purge: removed %d pip tombstone(s) before upgrade",
+                 removed)
+    return removed
 
 # Module-level singleton
 _updater: Optional["UpdateChecker"] = None
@@ -220,6 +262,10 @@ class UpdateChecker:
 
         log.info("Update check: v%s available (current: v%s), upgrading...",
                  latest, current_version)
+
+        # Pre-clean pip tombstones so a prior interrupted upgrade doesn't make
+        # this --force-reinstall abort on a missing-file OSError.
+        _purge_pip_ghost_dists()
 
         # Run pipx upgrade
         r = subprocess.run(

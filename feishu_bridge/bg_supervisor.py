@@ -1420,7 +1420,8 @@ class BgSupervisor:
                 _DELIVERY_ATTEMPT_CAP, r["delivery_error"],
             )
         stats["retry_budget_exhausted"] = logged
-        stats["no_target_remediated"] = remediated
+        # Deliberately NOT added to stats — reconcile() returns a fixed-shape
+        # stats dict (stable-shape contract test). Surfaced via log only.
         if remediated:
             log.info(
                 "bg reconcile: settled %d exhausted no-delivery-target run(s)",

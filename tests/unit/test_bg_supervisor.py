@@ -769,7 +769,9 @@ def test_log_retry_budget_exhausted_remediates_no_target_rows(short_env, repo):
     assert _delivery_state(repo.conn, ghost_run) == "sent"
     assert _delivery_state(repo.conn, real_run) == "delivery_failed"
     assert stats["retry_budget_exhausted"] == 1
-    assert stats.get("no_target_remediated") == 1
+    # Remediation count must NOT leak into stats — reconcile() has a
+    # fixed-shape contract (test_reconcile_returns_stats_dict_with_all_keys).
+    assert "no_target_remediated" not in stats
 
 
 def test_log_retry_budget_exhausted_keeps_orphan_visible(short_env, repo):
@@ -791,7 +793,7 @@ def test_log_retry_budget_exhausted_keeps_orphan_visible(short_env, repo):
 
     assert _delivery_state(repo.conn, orphan_run) == "delivery_failed"
     assert stats["retry_budget_exhausted"] == 1
-    assert stats["no_target_remediated"] == 0
+    assert "no_target_remediated" not in stats
 
 
 def test_scan_delivery_settles_non_deliverable_chat_without_enqueue(
