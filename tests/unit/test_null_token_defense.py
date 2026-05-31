@@ -198,6 +198,10 @@ class TestPiRunnerNullDefense:
         runner.model = "pi-mono"
         runner._build_streaming_result = PiRunner._build_streaming_result.__get__(runner)
         runner._format_error = PiRunner._format_error
+        # _build_streaming_result now resolves the modelUsage key via
+        # display_default_model(); bind the real method so a pinned model
+        # (self.model) surfaces as the key instead of a MagicMock.
+        runner.display_default_model = PiRunner.display_default_model.__get__(runner)
         state = StreamState()
         state.accumulated_text = "pi output"
         state.done = True

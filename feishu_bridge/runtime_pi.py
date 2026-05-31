@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Optional
 
-from feishu_bridge.runtime import BaseRunner, StreamState
+from feishu_bridge.runtime import BaseRunner, StreamState, log
 
 
 class PiRunner(BaseRunner):
@@ -19,6 +20,31 @@ class PiRunner(BaseRunner):
 
     ALWAYS_STREAMING = True
     READONLY_TOOLS = "read,grep,find,ls"
+
+    def display_default_model(self) -> Optional[str]:
+        """Pi pins no ``--model`` under the default provider; it reads its own
+        ``defaultModel`` from ``~/.pi/agent/settings.json``. Surface that for the
+        card footer / status display (mirrors OmpRunner.display_default_model).
+        Returns ``None`` when unreadable. Display only — never feeds build_args."""
+        if self.model:
+            return self.model
+        return self._read_pi_default_model()
+
+    @staticmethod
+    def _read_pi_default_model() -> Optional[str]:
+        """Read defaultModel from ~/.pi/agent/settings.json."""
+        config_path = Path.home() / ".pi" / "agent" / "settings.json"
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+        except (OSError, ValueError) as e:
+            log.debug("Cannot read pi settings for default model: %s", e)
+            return None
+        if isinstance(config, dict):
+            model = config.get("defaultModel")
+            if isinstance(model, str) and model.strip():
+                return model.strip()
+        return None
 
     def build_args(self, prompt: str, session_id: Optional[str],
                    resume: bool, streaming: bool, *,
@@ -122,7 +148,7 @@ class PiRunner(BaseRunner):
             return None
 
         usage = state.last_call_usage or {}
-        model_name = self.model or "(cli-default)"
+        model_name = self.display_default_model() or "(cli-default)"
 
         return {
             "result": text,

@@ -76,6 +76,46 @@ def test_pi_build_args_accepts_fresh_context(tmp_path):
     assert "bridge rules" in sp
 
 
+def test_pi_display_default_model_prefers_pinned(tmp_path):
+    runner = _runner(tmp_path, model="claude-sonnet-4-6")
+    assert runner.display_default_model() == "claude-sonnet-4-6"
+
+
+def test_pi_display_default_model_reads_pi_settings(tmp_path, monkeypatch):
+    # No pinned model → surface ~/.pi/agent/settings.json defaultModel instead
+    # of "(cli-default)" (mirrors OmpRunner reading ~/.omp/agent/config.yml).
+    home = tmp_path / "home"
+    (home / ".pi" / "agent").mkdir(parents=True)
+    (home / ".pi" / "agent" / "settings.json").write_text(
+        '{"defaultProvider": "anthropic", "defaultModel": "claude-opus-4-6"}')
+    monkeypatch.setattr("feishu_bridge.runtime_pi.Path.home", lambda: home)
+    runner = _runner(tmp_path, model=None)
+    assert runner.display_default_model() == "claude-opus-4-6"
+
+
+def test_pi_display_default_model_none_when_unreadable(tmp_path, monkeypatch):
+    monkeypatch.setattr("feishu_bridge.runtime_pi.Path.home",
+                        lambda: tmp_path / "nonexistent")
+    runner = _runner(tmp_path, model=None)
+    assert runner.display_default_model() is None
+
+
+def test_pi_modelusage_key_uses_resolved_default(tmp_path, monkeypatch):
+    # The card-footer model name comes from the modelUsage key; with no pinned
+    # model it must be the resolved pi default, not "(cli-default)".
+    home = tmp_path / "home"
+    (home / ".pi" / "agent").mkdir(parents=True)
+    (home / ".pi" / "agent" / "settings.json").write_text(
+        '{"defaultModel": "claude-opus-4-6"}')
+    monkeypatch.setattr("feishu_bridge.runtime_pi.Path.home", lambda: home)
+    runner = _runner(tmp_path, model=None)
+    state = StreamState(session_id="sid")
+    state.accumulated_text = "hello"
+    state.done = True
+    result = runner._build_streaming_result(state, "sid")
+    assert list(result["modelUsage"].keys()) == ["claude-opus-4-6"]
+
+
 def test_pi_parse_text_delta_and_final_usage(tmp_path):
     runner = _runner(tmp_path)
     state = StreamState(session_id="bridge-sid")
