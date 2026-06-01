@@ -393,61 +393,6 @@ def test_format_tool_hint_ls():
     assert ResponseHandle._format_tool_hint("Read", "/a/b/README.md") == "README.md"
 
 
-# ---- Item 3: per-session memory (pi sole-writer, bridge read-only) ----
-
-def test_pi_memory_scope_and_read(tmp_path, monkeypatch):
-    from feishu_bridge import pi_memory
-    root = tmp_path / "mem"
-    monkeypatch.setattr(pi_memory, "_root", lambda: root)
-
-    # Distinct (bot,chat,thread) tags → distinct files; thread is part of scope.
-    p_base = pi_memory.memory_path("bot:chatA:")
-    p_thread = pi_memory.memory_path("bot:chatA:thread1")
-    p_other = pi_memory.memory_path("bot:chatB:")
-    assert len({p_base, p_thread, p_other}) == 3
-
-    # Missing file → empty, never raises.
-    assert pi_memory.safe_read("bot:chatA:") == ""
-
-    # soft_tail_cap truncates the injected copy only; disk file is untouched.
-    root.mkdir(parents=True, exist_ok=True)
-    p_base.write_text("y" * 20000, encoding="utf-8")
-    capped = pi_memory.soft_tail_cap(pi_memory.safe_read("bot:chatA:"), 8192)
-    assert len(capped.encode("utf-8")) <= 8192 + 64       # tail + marker
-    assert p_base.stat().st_size == 20000                  # file unchanged
-
-
-def test_memory_injection_isolation(tmp_path, monkeypatch):
-    from feishu_bridge import pi_memory
-    root = tmp_path / "mem"
-    root.mkdir()
-    monkeypatch.setattr(pi_memory, "_root", lambda: root)
-
-    pi_memory.memory_path("b:cA:").write_text("FACT_A 简体中文", encoding="utf-8")
-    pi_memory.memory_path("b:cB:").write_text("FACT_B english", encoding="utf-8")
-    pi_memory.memory_path("b:cA:t1").write_text("FACT_T1", encoding="utf-8")
-
-    inj_a = pi_memory.build_injection("b:cA:")
-    inj_b = pi_memory.build_injection("b:cB:")
-
-    assert "FACT_A" in inj_a and "FACT_B" not in inj_a
-    assert "FACT_B" in inj_b and "FACT_A" not in inj_b
-    # Different thread of same chat is isolated.
-    assert "FACT_T1" not in inj_a
-    # Write protocol + absolute path present so the agent knows where to write.
-    assert "edit" in inj_a and str(pi_memory.memory_path("b:cA:")) in inj_a
-
-
-def test_memory_unreadable_no_raise(monkeypatch):
-    from feishu_bridge import pi_memory
-
-    def boom():
-        raise OSError("unreadable root")
-
-    monkeypatch.setattr(pi_memory, "_root", boom)
-    # Both degrade to empty without raising.
-    assert pi_memory.safe_read("b:c:") == ""
-    assert pi_memory.build_injection("b:c:") == ""
 
 
 def test_tool_status_malformed_event_no_raise(tmp_path):

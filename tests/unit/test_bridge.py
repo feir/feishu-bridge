@@ -4117,16 +4117,14 @@ def test_ledger_prev_ctx_rowid_tiebreak(tmp_path):
 
 # ---- pi-runner-ux-v1 Item 3: per-session memory worker injection ----
 
-def _run_pm_capture_pi_mem(monkeypatch, runner, session_map):
+def _run_capture_fresh_context(monkeypatch, runner, session_map):
     """Run process_message for a plain text turn, capturing runner.run kwargs.
 
-    Stubs fresh-context + pi memory to known sentinels so the assembled
+    Stubs fresh-context to a known sentinel so the assembled
     fresh_context passed to runner.run is deterministic.
     """
-    from feishu_bridge import pi_memory
     monkeypatch.setattr(bridge_worker, "build_fresh_context_prompt",
                         lambda *a, **k: "FRESH")
-    monkeypatch.setattr(pi_memory, "build_injection", lambda tag: "PIMEM")
     bridge_worker.process_message(
         item={
             "bot_id": "bot", "chat_id": "chat", "thread_id": None,
@@ -4184,25 +4182,25 @@ class _CaptureOKRunner:
         return True
 
 
-def test_pi_memory_injected_on_new_session(monkeypatch):
-    cap = _run_pm_capture_pi_mem(monkeypatch, _make_capture_pi_runner(),
-                                 DummySessionMap())
-    # new session: global fresh context + pi memory, both injected
-    assert cap["fresh_context"] == "FRESHPIMEM"
+def test_fresh_context_on_new_session(monkeypatch):
+    cap = _run_capture_fresh_context(monkeypatch, _make_capture_pi_runner(),
+                                     DummySessionMap())
+    # new session: global fresh context injected
+    assert cap["fresh_context"] == "FRESH"
 
 
-def test_pi_memory_injected_on_resume(monkeypatch):
-    cap = _run_pm_capture_pi_mem(monkeypatch, _make_capture_pi_runner(),
-                                 _ResumeSessionMap())
-    # resume: only pi memory (no global fresh context on resume)
-    assert cap["fresh_context"] == "PIMEM"
+def test_no_fresh_context_on_resume(monkeypatch):
+    cap = _run_capture_fresh_context(monkeypatch, _make_capture_pi_runner(),
+                                     _ResumeSessionMap())
+    # resume: no fresh context
+    assert cap["fresh_context"] is None
 
 
 def test_non_pi_runner_fresh_context_unchanged(monkeypatch):
-    # non-Pi runner gets the pre-existing behavior: fresh_ctx on new, None on resume
-    cap_new = _run_pm_capture_pi_mem(monkeypatch, _CaptureOKRunner(),
-                                     DummySessionMap())
+    # non-Pi runner gets the same behavior: fresh_ctx on new, None on resume
+    cap_new = _run_capture_fresh_context(monkeypatch, _CaptureOKRunner(),
+                                         DummySessionMap())
     assert cap_new["fresh_context"] == "FRESH"
-    cap_res = _run_pm_capture_pi_mem(monkeypatch, _CaptureOKRunner(),
-                                     _ResumeSessionMap())
+    cap_res = _run_capture_fresh_context(monkeypatch, _CaptureOKRunner(),
+                                         _ResumeSessionMap())
     assert cap_res["fresh_context"] is None
