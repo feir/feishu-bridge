@@ -1245,7 +1245,7 @@ class ResponseHandle:
                 name = tc.get("name", "")
                 hint_data = tc.get("hint_data", "")
 
-            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task", "Subagent"):
+            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task"):
                 continue
 
             if name.startswith("mcp__"):
@@ -1402,11 +1402,16 @@ class ResponseHandle:
         self._render_progress()
 
     def _mark_agents_completed(self):
-        """Clear agent display when text starts flowing."""
+        """Mark active agents as completed when text starts flowing."""
         if not self._active_agents:
             return
-        self._active_agents = []
-        self._render_progress()
+        changed = False
+        for a in self._active_agents:
+            if a.get("status") != "completed":
+                a["status"] = "completed"
+                changed = True
+        if changed:
+            self._render_progress()
 
     def todo_list_update(self, todos: list[dict]):
         """Update the todo element in the streaming card."""

@@ -331,3 +331,32 @@ class TestToolStatusUpdateDedup:
             {"name": "Task", "hint_data": ""},
         ])
         assert len(handle._tool_history) == 0
+
+    def test_subagent_not_excluded_from_tool_history(self, handle):
+        """Subagent degraded path should appear in tool history (not skipped)."""
+        handle.tool_status_update([
+            {"name": "Subagent", "hint_data": "scout: 分析代码"},
+        ])
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["label"] == "分发子任务"
+        assert handle._tool_history[0]["hint"] == "scout: 分析代码"
+
+    def test_mark_agents_completed_marks_not_clears(self, handle):
+        """_mark_agents_completed should mark agents as completed, not clear them."""
+        handle._active_agents = [
+            {"status": "in_progress", "description": "分析代码", "subagent_type": "scout"},
+        ]
+        handle._mark_agents_completed()
+        assert len(handle._active_agents) == 1
+        assert handle._active_agents[0]["status"] == "completed"
+
+    def test_agent_list_update_then_completed_renders_strikethrough(self, handle):
+        """Full lifecycle: launch → complete → rendered as strikethrough."""
+        handle._active_agents = []
+        handle.agent_list_update([
+            {"description": "分析代码", "name": None, "subagent_type": "scout"},
+        ])
+        assert len(handle._active_agents) == 1
+        assert handle._active_agents[0]["status"] == "in_progress"
+        handle._mark_agents_completed()
+        assert handle._active_agents[0]["status"] == "completed"
