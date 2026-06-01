@@ -1187,6 +1187,7 @@ class ResponseHandle:
         "Browser": "浏览器操作",
         "Agent": "分发子任务",
         "Task": "分发子任务",
+        "Subagent": "分发子任务",
         "TeamCreate": "创建团队",
         "SendMessage": "团队通信",
         "Skill": "执行技能",
@@ -1244,7 +1245,7 @@ class ResponseHandle:
                 name = tc.get("name", "")
                 hint_data = tc.get("hint_data", "")
 
-            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task"):
+            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task", "Subagent"):
                 continue
 
             if name.startswith("mcp__"):

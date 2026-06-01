@@ -378,6 +378,14 @@ def test_extract_hint_ls_find():
     assert _extract_hint_data("Find", {"path": "/a"}) == "/a"
 
 
+def test_extract_hint_subagent():
+    from feishu_bridge.runtime import _extract_hint_data
+    assert _extract_hint_data("Subagent", {"agent": "scout", "task": "分析代码"}) == "scout: 分析代码"
+    assert _extract_hint_data("Subagent", {"agent": "scout"}) == "scout"
+    assert _extract_hint_data("Subagent", {"task": "分析代码"}) == "分析代码"
+    assert _extract_hint_data("Subagent", {}) == ""
+
+
 def test_format_tool_hint_ls():
     """Ls renders the basename of its directory path, like Read/Write/Edit."""
     from feishu_bridge.ui import ResponseHandle
@@ -524,3 +532,99 @@ def test_load_config_pi_type_resolves_command(monkeypatch, tmp_path):
 
     assert result["agent"]["type"] == "pi"
     assert result["agent"]["_resolved_command"] == "pi"
+
+
+# ---- Subagent tool status ----
+
+def test_subagent_normal_extract_to_agent_launches(tmp_path):
+    """subagent with agent+task → pending_agent_launches, not tool_status."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_1", name="subagent",
+                        arguments={"agent": "scout", "task": "分析代码"}), state)
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches == [
+        {"description": "分析代码", "name": None, "subagent_type": "scout"},
+    ]
+    assert "sub_1" in state._tool_seen_ids
+
+
+def test_subagent_missing_agent_degrades_to_tool_status(tmp_path):
+    """subagent without agent → degrades to pending_tool_status."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_2", name="subagent",
+                        arguments={"task": "分析代码"}), state)
+    assert state.pending_agent_launches is None
+    assert len(state.pending_tool_status) == 1
+    assert state.pending_tool_status[0]["name"] == "Subagent"
+
+
+def test_subagent_missing_task_degrades_to_tool_status(tmp_path):
+    """subagent without task → degrades to pending_tool_status."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_3", name="subagent",
+                        arguments={"agent": "scout"}), state)
+    assert state.pending_agent_launches is None
+    assert len(state.pending_tool_status) == 1
+    assert state.pending_tool_status[0]["name"] == "Subagent"
+
+
+def test_subagent_deferred_start_to_end(tmp_path):
+    """start(no args) → end(with args): deferred extraction fires agent_launch."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    # start with no args → deferred
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="sub_4", name="subagent"), state)
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches is None
+    # end with args → fires
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_4", name="subagent",
+                        arguments={"agent": "developer", "task": "实现功能"}), state)
+    assert state.pending_agent_launches == [
+        {"description": "实现功能", "name": None, "subagent_type": "developer"},
+    ]
+    assert state.pending_tool_status == []
+
+
+def test_subagent_idless_start_only_no_duplicate(tmp_path):
+    """id-less subagent: only start is processed (end is dropped)."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    # id-less start with args → processes
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", name="subagent",
+                        arguments={"agent": "git-ops", "task": "提交代码"}), state)
+    assert state.pending_agent_launches == [
+        {"description": "提交代码", "name": None, "subagent_type": "git-ops"},
+    ]
+    # id-less end → dropped (existing logic)
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", name="subagent",
+                        arguments={"agent": "git-ops", "task": "提交代码"}), state)
+    # Still only one launch
+    assert len(state.pending_agent_launches) == 1
+
+
+def test_subagent_id_dedup(tmp_path):
+    """Same call_id should not produce duplicate launches."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_5", name="subagent",
+                        arguments={"agent": "scout", "task": "分析"}), state)
+    # Replay same id
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_5", name="subagent",
+                        arguments={"agent": "scout", "task": "分析"}), state)
+    assert len(state.pending_agent_launches) == 1
+
+
+def test_normalize_pi_tool_subagent():
+    assert PiRunner._normalize_pi_tool("subagent") == "Subagent"

@@ -490,6 +490,12 @@ def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
                 return joined[:40]
         # Claude Code / Alma format: top-level description
         return (tool_input.get("description") or tool_input.get("_i") or "")[:40]
+    if tool_name == "Subagent":
+        agent = tool_input.get("agent", "")
+        task = tool_input.get("task", "")
+        if agent and task:
+            return f"{agent}: {task[:40]}"
+        return (agent or task or "")[:50]
     if tool_name == "Skill":
         return tool_input.get("skill", "")
     if tool_name in ("Grep", "Search"):

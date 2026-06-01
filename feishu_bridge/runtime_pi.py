@@ -35,6 +35,7 @@ class PiRunner(BaseRunner):
         "search": "Grep",
         "find": "Find",
         "glob": "Glob",
+        "subagent": "Subagent",
     }
 
     @classmethod
@@ -289,6 +290,23 @@ class PiRunner(BaseRunner):
                 if call_id:
                     state._tool_seen_ids.add(call_id)
                 return
+            # Subagent: extract agent/task → pending_agent_launches
+            if canonical == "Subagent":
+                agent_name = args.get("agent", "")
+                task_text = args.get("task", "")
+                if agent_name and task_text:
+                    launch = {
+                        "description": task_text,
+                        "name": None,
+                        "subagent_type": agent_name,
+                    }
+                    if state.pending_agent_launches is None:
+                        state.pending_agent_launches = []
+                    state.pending_agent_launches.append(launch)
+                    if call_id:
+                        state._tool_seen_ids.add(call_id)
+                    return
+                # Extraction failed: degrade to tool_status path
             hint = _extract_hint_data(canonical, args)
             state.pending_tool_status.append(
                 {"name": canonical, "hint_data": hint})
