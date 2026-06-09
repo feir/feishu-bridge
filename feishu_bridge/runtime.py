@@ -44,7 +44,32 @@ def pick_primary_model(model_usage: dict, configured: str | None) -> str | None:
 DEFAULT_TIMEOUT = 300  # 5 minutes
 SILENT_TIMEOUT = 480   # 8 min — no assistant text output
 BG_AGENT_SILENT_TIMEOUT = 3600  # 1 hour — background agents (e.g. Codex review)
+TOOL_ACTIVE_SILENT_TIMEOUT = 1800  # 30 min — a runner tool is actively executing
 DEDUP_TTL = 43200  # 12 hours
+
+
+def compute_silent_budget(base_silent: int, *, bg_agent_running: bool,
+                          tool_active_count: int,
+                          tool_active_enabled: bool) -> int:
+    """Synthesize the silent-output timeout budget from concurrent liveness signals.
+
+    The budget is the max of three terms so any active signal can only *raise* the
+    window, never shrink it below the base hang-floor:
+
+    - ``base_silent`` — always; the floor that still catches a genuinely hung model.
+    - ``BG_AGENT_SILENT_TIMEOUT`` — when a background agent is running (Claude path).
+    - ``TOOL_ACTIVE_SILENT_TIMEOUT`` — when a runner tool is mid-execution (pi path),
+      gated by ``tool_active_enabled`` (the ``PI_TOOL_ACTIVE_BUDGET_ENABLED`` flag).
+
+    Pure function (no I/O) so the budget logic is unit-testable in isolation and the
+    loop has a single deterministic recompute point.
+    """
+    budget = base_silent
+    if bg_agent_running:
+        budget = max(budget, BG_AGENT_SILENT_TIMEOUT)
+    if tool_active_enabled and tool_active_count > 0:
+        budget = max(budget, TOOL_ACTIVE_SILENT_TIMEOUT)
+    return budget
 DEDUP_MAX = 5000
 QUEUE_MAX = 50
 MAX_PROMPT_CHARS = 50_000
@@ -336,6 +361,13 @@ class StreamState:
     pending_todo_update: list[dict] | None = None
     pending_agent_launches: list[dict] | None = None
     bg_agent_running: bool = False
+    # Number of runner tools currently mid-execution (pi tool_execution_start/end).
+    # >0 raises the silent budget to TOOL_ACTIVE_SILENT_TIMEOUT so a long single tool
+    # is not mistaken for a hang. Best-effort: clamped ≥0, reset on turn_end/error.
+    tool_active_count: int = 0
+    # Heartbeat signal: a tool lifecycle event arrived; the loop should re-arm the
+    # silent timer (carries no UI semantics, unlike pending_tool_status).
+    pending_silent_reset: bool = False
     # OMP todo state machine — rebuilt from ops deltas
     _todo_phases: list[dict] = field(default_factory=list)
     # Pi tool-status: tool-call ids already emitted to pending_tool_status,
@@ -1023,6 +1055,9 @@ class BaseRunner(ABC):
 
         proc = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,  # one-shot -p mode reads no stdin; closing it
+            # stops json-protocol runners (pi) from lingering on an inherited stdin
+            # after the turn. Opportunistic hardening for the post-turn exit tail.
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1119,29 +1154,64 @@ class BaseRunner(ABC):
             timer = threading.Timer(self.timeout, _timeout_kill)
             timer.start()
 
-        # Silent timeout: resets only on assistant text output.
-        silent_limit = getattr(self, 'silent_timeout', SILENT_TIMEOUT)
+        # Silent timeout: re-armed on meaningful liveness events (assistant text,
+        # tool status, todo/agent updates, runner tool-lifecycle heartbeats). The
+        # budget is recomputed from concurrent liveness signals (compute_silent_budget)
+        # so a mid-execution tool extends the window without disabling the hang floor.
+        base_silent = getattr(self, 'silent_timeout', SILENT_TIMEOUT)
+        silent_limit = base_silent
+        tool_active_enabled = os.environ.get(
+            "PI_TOOL_ACTIVE_BUDGET_ENABLED", "1"
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+        _silent_gen = 0
+        _silent_lock = threading.Lock()
 
-        def _silent_timeout_kill():
+        def _silent_timeout_kill(gen):
             nonlocal silent_timed_out
-            if result_received.is_set() or timed_out:
-                return
+            # Generation guard under a lock: a later _reset_silent_timer() bumps
+            # _silent_gen, so a stale Timer callback that fired just before being
+            # cancelled cannot win the kill race after a late heartbeat re-armed the
+            # timer. The lock makes the decide-and-commit atomic w.r.t. re-arm: the
+            # check and the silent_timed_out commit happen together, and the actual
+            # kill runs only after we hold the right to do so.
+            with _silent_lock:
+                if gen != _silent_gen:
+                    return
+                if result_received.is_set() or timed_out or silent_timed_out:
+                    return
+                silent_timed_out = True
             log.warning(
                 "%s silent timeout: sid=%s no assistant text for %ds",
                 self.get_display_name(),
                 (session_id or "-")[:8], silent_limit,
             )
-            silent_timed_out = True
             BaseRunner._kill_proc_tree(proc)
 
-        silent_timer = threading.Timer(silent_limit, _silent_timeout_kill)
+        silent_timer = threading.Timer(silent_limit, lambda: _silent_timeout_kill(0))
         silent_timer.start()
 
         def _reset_silent_timer():
-            nonlocal silent_timer
-            silent_timer.cancel()
-            silent_timer = threading.Timer(silent_limit, _silent_timeout_kill)
-            silent_timer.start()
+            nonlocal silent_timer, _silent_gen
+            with _silent_lock:
+                _silent_gen += 1
+                my_gen = _silent_gen
+                silent_timer.cancel()
+                silent_timer = threading.Timer(
+                    silent_limit, lambda: _silent_timeout_kill(my_gen))
+                silent_timer.start()
+
+        def _apply_silent_budget():
+            # Single ordered path: recompute budget → update limit → re-arm once.
+            # recompute-before-reset is required so a tool_execution_end lowers the
+            # window back to base BEFORE the timer is re-armed.
+            nonlocal silent_limit
+            silent_limit = compute_silent_budget(
+                base_silent,
+                bg_agent_running=state.bg_agent_running,
+                tool_active_count=state.tool_active_count,
+                tool_active_enabled=tool_active_enabled,
+            )
+            _reset_silent_timer()
 
         try:
             for line in proc.stdout:
@@ -1156,33 +1226,57 @@ class BaseRunner(ABC):
 
                 self.parse_streaming_line(event, state)
 
-                if state.bg_agent_running and silent_limit < BG_AGENT_SILENT_TIMEOUT:
-                    silent_limit = BG_AGENT_SILENT_TIMEOUT
-                    _reset_silent_timer()
+                # Collect liveness across drains; the bg-agent extension is now folded
+                # into compute_silent_budget (raises the budget on the next apply).
+                liveness = False
 
                 # Drain pending_output → on_output callback
                 if on_output and state.pending_output:
                     for text in state.pending_output:
                         on_output(text)
                     state.pending_output.clear()
-                    _reset_silent_timer()
+                    liveness = True
 
                 # Drain pending_tool_status → on_tool_status callback
                 if state.pending_tool_status:
                     if on_tool_status:
                         on_tool_status(list(state.pending_tool_status))
-                        _reset_silent_timer()
+                        liveness = True
                     state.pending_tool_status.clear()
 
-                # Drain pending_todo_update → on_todo_update callback
-                if on_todo_update and state.pending_todo_update is not None:
-                    on_todo_update(state.pending_todo_update)
+                # Drain pending_todo_update → on_todo_update callback. Reset is
+                # decoupled from callback presence: todo progress is liveness even
+                # when no UI callback is wired.
+                if state.pending_todo_update is not None:
+                    if on_todo_update:
+                        on_todo_update(state.pending_todo_update)
                     state.pending_todo_update = None
+                    liveness = True
 
-                # Drain pending_agent_launches → on_agent_update callback
-                if on_agent_update and state.pending_agent_launches is not None:
-                    on_agent_update(state.pending_agent_launches)
+                # Drain pending_agent_launches → on_agent_update callback (same
+                # callback-decoupled liveness treatment).
+                if state.pending_agent_launches is not None:
+                    if on_agent_update:
+                        on_agent_update(state.pending_agent_launches)
                     state.pending_agent_launches = None
+                    liveness = True
+
+                # Runner tool-lifecycle heartbeat (pi tool_execution_start/end):
+                # carries no UI payload, only re-arms the silent timer.
+                if state.pending_silent_reset:
+                    state.pending_silent_reset = False
+                    liveness = True
+
+                # Re-arm on any liveness event, or whenever the budget itself changed
+                # (a latch turned on/off) even without other output.
+                candidate = compute_silent_budget(
+                    base_silent,
+                    bg_agent_running=state.bg_agent_running,
+                    tool_active_count=state.tool_active_count,
+                    tool_active_enabled=tool_active_enabled,
+                )
+                if liveness or candidate != silent_limit:
+                    _apply_silent_budget()
 
                 if state.done:
                     result_received.set()
@@ -1269,6 +1363,10 @@ class BaseRunner(ABC):
                 "session_id": state.session_id or session_id,
                 "is_error": False,
                 "silent_timeout": True,
+                # Progress metadata for the auto-continue follow-up: True means a tool
+                # was still mid-execution at kill time (a long task we cut off), False
+                # means a model-level hang with no active tool.
+                "tool_was_active": state.tool_active_count > 0,
                 "peak_context_tokens": state.peak_context_tokens,
                 "compact_detected": state.compact_detected,
             }

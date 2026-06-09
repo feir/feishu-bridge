@@ -107,15 +107,29 @@ class PiRunner(BaseRunner):
             return
 
         if etype in ("tool_execution_start", "tool_execution_end"):
-            # No-op for tool status. These coarse lifecycle events carry only
-            # `toolName` (no tool-call id, no arguments). The authoritative,
-            # rich source is `message_update.toolcall_*` (carries id + name +
-            # arguments), handled in _handle_message_update. Emitting here too
-            # would duplicate each call and provide no file/command target.
+            # No UI status here: these coarse lifecycle events carry only
+            # `toolName` (no tool-call id, no arguments). The authoritative, rich
+            # UI source is `message_update.toolcall_*` (id + name + arguments),
+            # handled in _handle_message_update — emitting here would duplicate.
+            #
+            # They ARE the liveness signal: a tool is mid-execution, so the bridge
+            # raises the silent budget (TOOL_ACTIVE_SILENT_TIMEOUT) instead of
+            # mistaking a long single tool for a hang. Best-effort — events lack an
+            # id and may be unbalanced (error / cancel / missing end), so the count
+            # is clamped ≥0 here and reset to 0 on turn_end/error below.
+            if etype == "tool_execution_start":
+                state.tool_active_count += 1
+            else:
+                state.tool_active_count = max(0, state.tool_active_count - 1)
+            state.pending_silent_reset = True
             return
 
         if etype == "turn_end":
             state.final_result = event
+            # Turn boundary: clear any tool-active count left dangling by a missing
+            # tool_execution_end (best-effort lifecycle), so the silent budget does
+            # not stay extended into a text-only tail.
+            state.tool_active_count = 0
             message = event.get("message") or {}
             self._update_usage(message.get("usage"), state)
             stop_reason = message.get("stopReason")
@@ -143,6 +157,7 @@ class PiRunner(BaseRunner):
             state.pending_output.append(state.accumulated_text)
             state.is_error = True
             state.done = True
+            state.tool_active_count = 0  # clear lifecycle count on error path
             return
 
         if etype == "message_end":
