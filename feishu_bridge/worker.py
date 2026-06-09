@@ -18,8 +18,8 @@ from feishu_bridge.parsers import (
 )
 from feishu_bridge.quota import WINDOW_LABELS
 from feishu_bridge.runtime import (
-    BaseRunner, SessionMap, build_fresh_context_prompt, pick_primary_model,
-    resolve_dotclaude_root,
+    BaseRunner, SessionMap, TOOL_ACTIVE_SILENT_TIMEOUT,
+    build_fresh_context_prompt, pick_primary_model, resolve_dotclaude_root,
 )
 from feishu_bridge.session_journal import SessionJournal
 from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
@@ -1236,24 +1236,42 @@ def process_message(
             log.info("Tool deferred: sid=%s tool=%s", (defer_sid or "-")[:8], cmd_prefix_base)
             return handle
 
-        # --- Silent timeout: auto-continue (one retry) ---
+        # --- Silent timeout: progress-aware auto-continue (one retry) ---
         if result.get("silent_timeout") and not result.get("cancelled"):
             auto_sid = result.get("session_id") or existing_sid
-            log.info("Silent timeout auto-continue: sid=%s", (auto_sid or "-")[:8])
-            if result.get("result"):
-                on_stream(result["result"])
-            result = runner.run(
-                "继续", session_id=auto_sid, resume=True,
-                on_output=on_stream, on_tool_status=on_tool_status,
-                on_todo_update=on_todo_update, on_agent_update=on_agent_update,
-                env_extra=env_extra,
-            )
-            if result.get("silent_timeout"):
-                result["is_error"] = True
+            if result.get("tool_was_active"):
+                # A tool ran past the active-tool silent window (~30 min) and was
+                # killed. Resuming would most likely re-trigger the same long
+                # operation into another silent window, so surface to the user for a
+                # decision instead of a blind auto-continue.
+                log.info(
+                    "Silent timeout with active tool; surfacing without retry: sid=%s",
+                    (auto_sid or "-")[:8])
+                partial = result.get("accumulated_text") or ""
+                mins = TOOL_ACTIVE_SILENT_TIMEOUT // 60
+                result["is_error"] = False
                 result["result"] = (
-                    (result.get("result") or "")
-                    + "\n\n⚠️ 自动恢复仍无文本输出，请检查任务状态或发送 /new 开始新会话。"
+                    (partial + "\n\n" if partial else "")
+                    + f"⚠️ 工具运行超过 {mins} 分钟被中断。发送「继续」恢复，或 /new 开始新会话。"
                 )
+            else:
+                # No tool active: a model-level hang or finished-without-text turn —
+                # the case auto-continue was built for. Nudge it once with "继续".
+                log.info("Silent timeout auto-continue: sid=%s", (auto_sid or "-")[:8])
+                if result.get("result"):
+                    on_stream(result["result"])
+                result = runner.run(
+                    "继续", session_id=auto_sid, resume=True,
+                    on_output=on_stream, on_tool_status=on_tool_status,
+                    on_todo_update=on_todo_update, on_agent_update=on_agent_update,
+                    env_extra=env_extra,
+                )
+                if result.get("silent_timeout"):
+                    result["is_error"] = True
+                    result["result"] = (
+                        (result.get("result") or "")
+                        + "\n\n⚠️ 自动恢复仍无文本输出，请检查任务状态或发送 /new 开始新会话。"
+                    )
 
         if result.get("cancelled"):
             handle.deliver(result["result"])

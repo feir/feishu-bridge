@@ -1363,10 +1363,14 @@ class BaseRunner(ABC):
                 "session_id": state.session_id or session_id,
                 "is_error": False,
                 "silent_timeout": True,
-                # Progress metadata for the auto-continue follow-up: True means a tool
+                # Progress metadata for the auto-continue decision: True means a tool
                 # was still mid-execution at kill time (a long task we cut off), False
                 # means a model-level hang with no active tool.
                 "tool_was_active": state.tool_active_count > 0,
+                # Raw accumulated text (without the recovery-suffix above) so the
+                # worker can compose its own surfacing message when it declines to
+                # auto-continue.
+                "accumulated_text": state.accumulated_text,
                 "peak_context_tokens": state.peak_context_tokens,
                 "compact_detected": state.compact_detected,
             }
