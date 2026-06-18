@@ -331,14 +331,42 @@ class TestToolStatusUpdateDedup:
         ])
         assert len(handle._tool_history) == 0
 
-    def test_subagent_not_excluded_from_tool_history(self, handle):
-        """Subagent degraded path should appear in tool history (not skipped)."""
+    def test_subagent_excluded_from_tool_history(self, handle):
+        """Subagent is always routed through agent_list_update, never tool card."""
         handle.tool_status_update([
             {"name": "Subagent", "hint_data": "scout: 分析代码"},
         ])
+        assert len(handle._tool_history) == 0
+
+    def test_tool_status_update_without_main_card_accumulates_history(self, handle):
+        """tool_status_update accumulates _tool_history even when no main card exists.
+
+        _render_progress is mocked so cardkit ops don't crash; _update_summary
+        call is recorded by the mock but the real guard inside would no-op.
+        """
+        handle.card_message_id = None
+        handle._cardkit_card_id = None
+        handle.source_message_id = "src-msg-1"
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a/foo.py"},
+        ])
+        # _tool_history should still be populated
         assert len(handle._tool_history) == 1
-        assert handle._tool_history[0]["label"] == "分发子任务"
-        assert handle._tool_history[0]["hint"] == "scout: 分析代码"
+        assert handle._tool_history[0]["label"] == "读取文件"
+        # _render_progress was called (tool card path is independent)
+        handle._render_progress.assert_called_once()
+
+    def test_tool_status_update_no_source_msg_still_accumulates(self, handle):
+        """tool_status_update still accumulates _tool_history without source_message_id."""
+        handle.card_message_id = None
+        handle._cardkit_card_id = None
+        handle.source_message_id = None
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "git status"},
+        ])
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["label"] == "执行命令"
+        handle._render_progress.assert_called_once()
 
     def test_mark_agents_completed_marks_not_clears(self, handle):
         """_mark_agents_completed should mark agents as completed, not clear them."""
@@ -359,3 +387,59 @@ class TestToolStatusUpdateDedup:
         assert handle._active_agents[0]["status"] == "in_progress"
         handle._mark_agents_completed()
         assert handle._active_agents[0]["status"] == "completed"
+
+
+# ---- Fix D: _send_tool_card real path (no main card) ----
+
+def test_send_tool_card_no_main_card_replies_with_collapsible_panel():
+    """Tool card is sent via IM reply when no main card exists.
+
+    Verifies the full path: tool_status_update → _render_progress →
+    _render_tool_progress → _update_tool_card → _send_tool_card →
+    client.im.v1.message.reply.
+    """
+    from unittest.mock import MagicMock
+    from collections import deque
+    from feishu_bridge.ui import ResponseHandle
+
+    handle = ResponseHandle.__new__(ResponseHandle)
+    handle._tool_history = deque(maxlen=8)
+    handle._terminated = False
+    handle._summary_updated = False
+    handle._active_agents = []
+    handle._last_todos = None
+    handle.card_message_id = None
+    handle._cardkit_card_id = None
+    handle._cardkit_seq = 0
+    handle.thread_id = None
+    handle.source_message_id = "om_test_src"
+    handle._tool_msg_id = None
+
+    # Mock the IM client; _update_summary / _render_agent_progress safely
+    # no-op when _cardkit_card_id is None.
+    mock_client = MagicMock()
+    mock_reply_resp = MagicMock()
+    mock_reply_resp.success.return_value = True
+    mock_reply_resp.data.message_id = "msg-tool-test-999"
+    mock_client.im.v1.message.reply.return_value = mock_reply_resp
+    handle.client = mock_client
+
+    handle.tool_status_update([
+        {"name": "Bash", "hint_data": "git status"},
+    ])
+
+    # _tool_history grows
+    assert len(handle._tool_history) == 1
+    assert handle._tool_history[0]["label"] == "执行命令"
+
+    # client.im.v1.message.reply was called
+    mock_client.im.v1.message.reply.assert_called_once()
+
+    # The card content sent to IM must contain collapsible_panel
+    call_args = mock_client.im.v1.message.reply.call_args
+    req = call_args[0][0]  # ReplyMessageRequest
+    body = req.request_body  # ReplyMessageRequestBody
+    assert "collapsible_panel" in body.content
+
+    # _tool_msg_id is set from the successful reply
+    assert handle._tool_msg_id == "msg-tool-test-999"

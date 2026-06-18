@@ -292,6 +292,69 @@ class PiRunner(BaseRunner):
             args = tc.get("arguments")
             if not isinstance(args, dict):
                 args = {}
+
+            # Subagent always routes through pending_agent_launches OR
+            # warning; never reaches pending_tool_status.
+            if canonical == "Subagent":
+                # Multi-task parallel dispatch: tasks=[{agent, task}, ...]
+                tasks_list = args.get("tasks")
+                if isinstance(tasks_list, list) and tasks_list:
+                    emitted = False
+                    for entry in tasks_list:
+                        if not isinstance(entry, dict):
+                            continue
+                        agent_name = entry.get("agent", "")
+                        task_text = entry.get("task", "")
+                        if agent_name and task_text:
+                            if state.pending_agent_launches is None:
+                                state.pending_agent_launches = []
+                            state.pending_agent_launches.append({
+                                "description": task_text,
+                                "name": None,
+                                "subagent_type": agent_name,
+                            })
+                            emitted = True
+                        elif agent_name:
+                            if state.pending_agent_launches is None:
+                                state.pending_agent_launches = []
+                            state.pending_agent_launches.append({
+                                "description": agent_name,
+                                "name": None,
+                                "subagent_type": agent_name,
+                            })
+                            emitted = True
+                    if emitted:
+                        if call_id:
+                            state._tool_seen_ids.add(call_id)
+                        return
+                    # fall through to single-shot try then warning
+
+                # Single agent+task path
+                agent_name = args.get("agent", "")
+                task_text = args.get("task", "")
+                if agent_name and task_text:
+                    if state.pending_agent_launches is None:
+                        state.pending_agent_launches = []
+                    state.pending_agent_launches.append({
+                        "description": task_text,
+                        "name": None,
+                        "subagent_type": agent_name,
+                    })
+                    if call_id:
+                        state._tool_seen_ids.add(call_id)
+                    return
+
+                # All extraction failed (including empty args).
+                # If args are empty AND this is the start event with a
+                # call_id, defer — the end event may carry usable args.
+                if not args and call_id and is_start:
+                    return
+                log.warning("Subagent toolcall with unrecognized args shape: %s", args)
+                if call_id:
+                    state._tool_seen_ids.add(call_id)
+                return
+
+            # Non-Subagent: original general path
             if not args:
                 # No usable arguments. With an id on a *start* event, defer —
                 # a later toolcall_end may carry them. Otherwise the call is
@@ -305,23 +368,6 @@ class PiRunner(BaseRunner):
                 if call_id:
                     state._tool_seen_ids.add(call_id)
                 return
-            # Subagent: extract agent/task → pending_agent_launches
-            if canonical == "Subagent":
-                agent_name = args.get("agent", "")
-                task_text = args.get("task", "")
-                if agent_name and task_text:
-                    launch = {
-                        "description": task_text,
-                        "name": None,
-                        "subagent_type": agent_name,
-                    }
-                    if state.pending_agent_launches is None:
-                        state.pending_agent_launches = []
-                    state.pending_agent_launches.append(launch)
-                    if call_id:
-                        state._tool_seen_ids.add(call_id)
-                    return
-                # Extraction failed: degrade to tool_status path
             hint = _extract_hint_data(canonical, args)
             state.pending_tool_status.append(
                 {"name": canonical, "hint_data": hint})

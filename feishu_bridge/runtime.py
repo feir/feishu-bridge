@@ -523,6 +523,25 @@ def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
         # Claude Code / Alma format: top-level description
         return (tool_input.get("description") or tool_input.get("_i") or "")[:40]
     if tool_name == "Subagent":
+        # Multi-task parallel dispatch: tasks=[{agent, task}, ...]
+        tasks = tool_input.get("tasks")
+        if isinstance(tasks, list) and tasks:
+            parts = []
+            for t in tasks:
+                if not isinstance(t, dict):
+                    continue
+                a = t.get("agent", "")
+                tk = t.get("task", "")
+                if a and tk:
+                    parts.append(f"{a}: {tk[:40]}")
+                elif a:
+                    parts.append(a)
+                elif tk:
+                    parts.append(tk[:40])
+            joined = ", ".join(parts)
+            if joined:
+                return joined[:60]
+        # Single agent+task path
         agent = tool_input.get("agent", "")
         task = tool_input.get("task", "")
         if agent and task:

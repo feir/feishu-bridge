@@ -2,6 +2,7 @@
 """Unit tests for the Pi runner integration."""
 
 import json
+import logging
 
 from feishu_bridge import main as bridge
 from feishu_bridge.runtime import StreamState
@@ -386,6 +387,44 @@ def test_extract_hint_subagent():
     assert _extract_hint_data("Subagent", {}) == ""
 
 
+def test_extract_hint_subagent_tasks_multi():
+    """Multi-task parallel Subagent dispatch (tasks=[]) → joined hint."""
+    from feishu_bridge.runtime import _extract_hint_data
+    assert _extract_hint_data("Subagent", {
+        "tasks": [
+            {"agent": "scout", "task": "分析认证流程"},
+            {"agent": "scout", "task": "分析路由结构"},
+        ],
+    }) == "scout: 分析认证流程, scout: 分析路由结构"
+
+    # Truncation at 60 chars (each task[:40], joined, then overall[:60])
+    long_task = "分析 1234567890123456789012345678901234567890"
+    result = _extract_hint_data("Subagent", {
+        "tasks": [
+            {"agent": "scout", "task": long_task},
+            {"agent": "developer", "task": "实现功能X"},
+        ],
+    })
+    assert len(result) <= 60
+    assert result.startswith("scout: 分析 ")
+
+    # Fallback: empty tasks list → original single-path logic
+    assert _extract_hint_data("Subagent", {
+        "tasks": [],
+        "agent": "scout",
+    }) == "scout"
+
+    # Fallback: tasks contains non-dict entries (ignored)
+    assert _extract_hint_data("Subagent", {
+        "tasks": ["bad entry", {"agent": "scout", "task": "分析"}],
+    }) == "scout: 分析"
+
+    # Only agent in task (no task field)
+    assert _extract_hint_data("Subagent", {
+        "tasks": [{"agent": "scout"}],
+    }) == "scout"
+
+
 def test_format_tool_hint_ls():
     """Ls renders the basename of its directory path, like Read/Write/Edit."""
     from feishu_bridge.ui import ResponseHandle
@@ -495,28 +534,46 @@ def test_subagent_normal_extract_to_agent_launches(tmp_path):
     assert "sub_1" in state._tool_seen_ids
 
 
-def test_subagent_missing_agent_degrades_to_tool_status(tmp_path):
-    """subagent without agent → degrades to pending_tool_status."""
+def test_subagent_missing_agent_logs_warning_and_skips(tmp_path, caplog):
+    """subagent without agent → logs warning, no tool_status or agent_launches."""
     runner = _runner(tmp_path)
     state = StreamState()
-    runner.parse_streaming_line(
-        _toolcall_event("toolcall_end", call_id="sub_2", name="subagent",
-                        arguments={"task": "分析代码"}), state)
+    with caplog.at_level(logging.WARNING):
+        runner.parse_streaming_line(
+            _toolcall_event("toolcall_end", call_id="sub_2", name="subagent",
+                            arguments={"task": "分析代码"}), state)
     assert state.pending_agent_launches is None
-    assert len(state.pending_tool_status) == 1
-    assert state.pending_tool_status[0]["name"] == "Subagent"
+    assert state.pending_tool_status == []
+    assert "sub_2" in state._tool_seen_ids
+    assert "Subagent toolcall with unrecognized args shape" in caplog.text
 
 
-def test_subagent_missing_task_degrades_to_tool_status(tmp_path):
-    """subagent without task → degrades to pending_tool_status."""
+def test_subagent_missing_task_logs_warning_and_skips(tmp_path, caplog):
+    """subagent without task → logs warning, no tool_status or agent_launches."""
     runner = _runner(tmp_path)
     state = StreamState()
-    runner.parse_streaming_line(
-        _toolcall_event("toolcall_end", call_id="sub_3", name="subagent",
-                        arguments={"agent": "scout"}), state)
+    with caplog.at_level(logging.WARNING):
+        runner.parse_streaming_line(
+            _toolcall_event("toolcall_end", call_id="sub_3", name="subagent",
+                            arguments={"agent": "scout"}), state)
     assert state.pending_agent_launches is None
-    assert len(state.pending_tool_status) == 1
-    assert state.pending_tool_status[0]["name"] == "Subagent"
+    assert state.pending_tool_status == []
+    assert "sub_3" in state._tool_seen_ids
+    assert "Subagent toolcall with unrecognized args shape" in caplog.text
+
+
+def test_subagent_missing_both_agent_and_task_logs_warning(tmp_path, caplog):
+    """subagent with unrecognized args → logs warning, no tool_status or agent_launches."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    with caplog.at_level(logging.WARNING):
+        runner.parse_streaming_line(
+            _toolcall_event("toolcall_end", call_id="sub_empty", name="subagent",
+                            arguments={"unknown": "x"}), state)
+    assert state.pending_agent_launches is None
+    assert state.pending_tool_status == []
+    assert "sub_empty" in state._tool_seen_ids
+    assert "Subagent toolcall with unrecognized args shape" in caplog.text
 
 
 def test_subagent_deferred_start_to_end(tmp_path):
@@ -573,3 +630,133 @@ def test_subagent_id_dedup(tmp_path):
 
 def test_normalize_pi_tool_subagent():
     assert PiRunner._normalize_pi_tool("subagent") == "Subagent"
+
+
+# ---- Subagent tasks[] multi-dispatch ----
+
+def test_subagent_tasks_multi_dispatches_agent_launches(tmp_path):
+    """tasks=[{agent, task}, ...] → multiple pending_agent_launches."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_m1", name="subagent",
+                        arguments={
+                            "tasks": [
+                                {"agent": "scout", "task": "分析认证流程"},
+                                {"agent": "scout", "task": "分析路由结构"},
+                            ],
+                        }), state)
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches == [
+        {"description": "分析认证流程", "name": None, "subagent_type": "scout"},
+        {"description": "分析路由结构", "name": None, "subagent_type": "scout"},
+    ]
+    assert "sub_m1" in state._tool_seen_ids
+
+
+def test_subagent_tasks_multi_ignores_invalid_entries(tmp_path):
+    """tasks[] with non-dict entries → only valid entries become launches."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_m2", name="subagent",
+                        arguments={
+                            "tasks": [
+                                "not a dict",
+                                {"agent": "scout", "task": "分析"},
+                                {"agent": "developer"},
+                            ],
+                        }), state)
+    assert state.pending_agent_launches == [
+        {"description": "分析", "name": None, "subagent_type": "scout"},
+        {"description": "developer", "name": None, "subagent_type": "developer"},
+    ]
+
+
+def test_subagent_tasks_empty_falls_back_to_single(tmp_path):
+    """Empty tasks[] → fallback to single agent+task path."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_m3", name="subagent",
+                        arguments={
+                            "tasks": [],
+                            "agent": "scout",
+                            "task": "分析",
+                        }), state)
+    assert state.pending_agent_launches == [
+        {"description": "分析", "name": None, "subagent_type": "scout"},
+    ]
+    assert state.pending_tool_status == []
+
+
+def test_subagent_tasks_multi_deferred_start_to_end(tmp_path):
+    """tasks[] args arriving on end after deferred start → still dispatches."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    # start with no args → deferred
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="sub_m4", name="subagent"), state)
+    assert state.pending_agent_launches is None
+    # end with tasks[] → fires
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_m4", name="subagent",
+                        arguments={
+                            "tasks": [
+                                {"agent": "developer", "task": "实现A"},
+                                {"agent": "git-ops", "task": "提交"},
+                            ],
+                        }), state)
+    assert state.pending_agent_launches == [
+        {"description": "实现A", "name": None, "subagent_type": "developer"},
+        {"description": "提交", "name": None, "subagent_type": "git-ops"},
+    ]
+    assert state.pending_tool_status == []
+
+
+# ---- Fix C: Subagent empty-args / non-dict-args paths ----
+
+def test_subagent_empty_args_on_end_logs_warning_no_status(tmp_path, caplog):
+    """Subagent args={} on end event → warning, no pending_tool_status or agent_launches."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    with caplog.at_level(logging.WARNING):
+        runner.parse_streaming_line(
+            _toolcall_event("toolcall_end", call_id="sub_empty_end",
+                            name="subagent", arguments={}), state)
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches is None
+    assert "sub_empty_end" in state._tool_seen_ids
+    assert "Subagent toolcall with unrecognized args shape" in caplog.text
+
+
+def test_subagent_non_dict_args_logs_warning(tmp_path, caplog):
+    """Subagent arguments=None or string → warning, no tool_status or agent_launches."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    with caplog.at_level(logging.WARNING):
+        runner.parse_streaming_line(
+            _toolcall_event("toolcall_end", call_id="sub_none",
+                            name="subagent", arguments=None), state)
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches is None
+    assert "sub_none" in state._tool_seen_ids
+    assert "Subagent toolcall with unrecognized args shape" in caplog.text
+
+
+def test_subagent_empty_args_on_start_defers(tmp_path, caplog):
+    """Subagent args={} on start → defer (no warning, no push, no seen_ids).
+
+    The end event may carry usable args; start must not consume the call_id.
+    """
+    runner = _runner(tmp_path)
+    state = StreamState()
+    with caplog.at_level(logging.WARNING):
+        runner.parse_streaming_line(
+            _toolcall_event("toolcall_start", call_id="sub_defer",
+                            name="subagent", arguments={}), state)
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches is None
+    assert "sub_defer" not in state._tool_seen_ids
+    # No warning logged for deferred start
+    assert "Subagent toolcall with unrecognized args shape" not in caplog.text

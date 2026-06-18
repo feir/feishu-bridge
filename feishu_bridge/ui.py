@@ -1229,11 +1229,6 @@ class ResponseHandle:
         """Update tool history and render progress."""
         if self._terminated or self._summary_updated:
             return
-        if not self.card_message_id:
-            if not self._ensure_card():
-                return
-        if not self._cardkit_card_id:
-            return
 
         for tc in tool_calls:
             if isinstance(tc, str):
@@ -1242,7 +1237,7 @@ class ResponseHandle:
                 name = tc.get("name", "")
                 hint_data = tc.get("hint_data", "")
 
-            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task"):
+            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task", "Subagent"):
                 continue
 
             if name.startswith("mcp__"):
@@ -1551,10 +1546,10 @@ class ResponseHandle:
         """Update agent list when new agents are dispatched."""
         if self._terminated:
             return
-        if not self._cardkit_card_id:
-            if not self._ensure_card():
-                return
-        # Dedupe by description to avoid double-counting from toolcall_start/end
+        # Always cache launches — they will be rendered once the CardKit card
+        # exists (created by stream_update or deliver). Deferring creation
+        # avoids a blank streaming card when the turn's first action is an
+        # agent dispatch without any text.
         existing = {a.get("description") for a in self._active_agents}
         for a in launches:
             if a.get("description") not in existing:
@@ -1566,7 +1561,8 @@ class ResponseHandle:
                     **a,
                 })
                 existing.add(a.get("description"))
-        self._render_progress()
+        if self._cardkit_card_id:
+            self._render_progress()
 
     def _mark_agents_completed(self):
         """Mark active agents as completed when text starts flowing."""
