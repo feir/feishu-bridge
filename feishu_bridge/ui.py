@@ -752,7 +752,8 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
                              project_label: str | None = None,
                              todos: list[dict] | None = None,
                              context_alert: str | None = None,
-                             tool_panels: list[dict] | None = None) -> dict:
+                             tool_panels: list[dict] | None = None,
+                             agents: list[dict] | None = None) -> dict:
     # P1: parse action markers BEFORE optimize (Finding 6 ordering fix)
     content, markers = parse_action_markers(content)
     content = optimize_markdown_style(content)
@@ -799,6 +800,28 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
                 "elements": url_buttons,
             }],
         })
+
+    # Subagent dispatch list (rendered before tool panels). Each agent entry
+    # shows the subagent type + task description, struck through when completed.
+    if agents:
+        agent_lines = []
+        for a in agents:
+            desc = a.get("description", "")
+            atype = a.get("subagent_type", "")
+            suffix = f" ({atype})" if atype else ""
+            if a.get("status") == "completed":
+                agent_lines.append(f"~~☑ {desc}{suffix}~~")
+                result = a.get("result_text")
+                if result:
+                    summary = str(result)[:500] + ("…" if len(str(result)) > 500 else "")
+                    agent_lines.append(f"  ── Output ──\n  {summary}")
+            else:
+                agent_lines.append(f"◉ **{desc}{suffix}**")
+        if agent_lines:
+            elements.append({
+                "tag": "markdown",
+                "content": "\n".join(agent_lines),
+            })
 
     # Tool collapsible panels (from Pi runner tool history)
     if tool_panels:
@@ -1013,6 +1036,11 @@ class ResponseHandle:
                     self.card_message_id = msg_id
                     log.info("CardKit card created (deferred): card_id=%s msg_id=%s",
                              card_id, msg_id)
+                    # Render any agents/todos/tools cached before the card existed.
+                    # Agent dispatches (Subagent tool calls) can arrive before any
+                    # text output — without this, they are cached in _active_agents
+                    # but never rendered (Bug #1).
+                    self._render_progress()
                     self._flush_ctrl = FlushController(self._perform_flush, use_cardkit=True)
                     self._flush_ctrl.set_card_ready()
                     if initial_content:
@@ -1126,7 +1154,8 @@ class ResponseHandle:
             chat_id=self.chat_id, bot_id=self.bot_id,
             model_name=model_name, project_label=project_label,
             todos=self._last_todos, context_alert=context_alert,
-            tool_panels=tool_panels)
+            tool_panels=tool_panels,
+            agents=self._active_agents if self._active_agents else None)
         card_data = json.dumps(final_card_json, ensure_ascii=False)
         log.info("CardKit card.update: card_id=%s content_len=%d payload_bytes=%d seq=%d",
                  card_id, len(content), len(card_data.encode("utf-8")), seq)
