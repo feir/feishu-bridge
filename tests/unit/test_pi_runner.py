@@ -335,7 +335,7 @@ def test_tool_status_single_emit_per_id(tmp_path):
          "result": {"isError": True}}, state)
 
     assert state.pending_tool_status == [
-        {"name": "Read", "hint_data": "/a/README.md"}]
+        {"name": "Read", "hint_data": "/a/README.md", "id": "toolu_1"}]
     assert state.is_error is False
     assert state.done is False
 
@@ -361,7 +361,7 @@ def test_emit_deferred_until_args(tmp_path):
     runner.parse_streaming_line(
         _toolcall_event("toolcall_end", call_id="toolu_9", name="bash",
                         arguments={"command": "ls -1"}), state)
-    assert state.pending_tool_status == [{"name": "Bash", "hint_data": "ls"}]
+    assert state.pending_tool_status == [{"name": "Bash", "hint_data": "ls", "id": "toolu_9"}]
 
 
 def test_two_blank_starts_no_miscorrelation(tmp_path):
@@ -379,8 +379,8 @@ def test_two_blank_starts_no_miscorrelation(tmp_path):
         _toolcall_event("toolcall_end", call_id="a", name="read",
                         arguments={"path": "/x/a.py"}), state)
     assert state.pending_tool_status == [
-        {"name": "Read", "hint_data": "/x/b.py"},
-        {"name": "Read", "hint_data": "/x/a.py"},
+        {"name": "Read", "hint_data": "/x/b.py", "id": "b"},
+        {"name": "Read", "hint_data": "/x/a.py", "id": "a"},
     ]
 
 
@@ -458,11 +458,11 @@ def test_format_tool_hint_ls():
 
 
 def test_tool_status_malformed_event_no_raise(tmp_path):
-    """Malformed events must not raise; degrade to a bare-name entry (spec:
-    never-raises → bare tool label), not silently dropped."""
+    """Malformed events must not raise; end without usable args and no
+    prior start → only pending_tool_end_ids (unmatched warning at drain)."""
     runner = _runner(tmp_path)
     state = StreamState()
-    # arguments not a dict, arriving on END (call resolving) → bare-name entry
+    # arguments not a dict, arriving on END (call resolving) → no bare entry
     runner.parse_streaming_line(
         _toolcall_event("toolcall_end", call_id="m1", name="read",
                         arguments="oops"), state)
@@ -474,7 +474,8 @@ def test_tool_status_malformed_event_no_raise(tmp_path):
             "partial": {"content": [{"type": "toolCall", "id": "m2"}]},
         },
     }, state)
-    assert state.pending_tool_status == [{"name": "Read", "hint_data": ""}]
+    assert state.pending_tool_status == []
+    assert state.pending_tool_end_ids == ["m1"]
 
 
 def test_create_runner_pi_builds_pi_runner(tmp_path):
@@ -548,13 +549,13 @@ def test_subagent_normal_extract_to_agent_launches(tmp_path):
     runner = _runner(tmp_path)
     state = StreamState()
     runner.parse_streaming_line(
-        _toolcall_event("toolcall_end", call_id="sub_1", name="subagent",
+        _toolcall_event("toolcall_start", call_id="sub_1", name="subagent",
                         arguments={"agent": "scout", "task": "分析代码"}), state)
     assert state.pending_tool_status == []
     assert state.pending_agent_launches == [
         {"description": "分析代码", "name": None, "subagent_type": "scout"},
     ]
-    assert "sub_1" in state._tool_seen_ids
+    assert "sub_1" in state._tool_seen_starts
 
 
 def test_subagent_missing_agent_logs_warning_and_skips(tmp_path, caplog):
@@ -563,11 +564,11 @@ def test_subagent_missing_agent_logs_warning_and_skips(tmp_path, caplog):
     state = StreamState()
     with caplog.at_level(logging.WARNING):
         runner.parse_streaming_line(
-            _toolcall_event("toolcall_end", call_id="sub_2", name="subagent",
+            _toolcall_event("toolcall_start", call_id="sub_2", name="subagent",
                             arguments={"task": "分析代码"}), state)
     assert state.pending_agent_launches is None
     assert state.pending_tool_status == []
-    assert "sub_2" in state._tool_seen_ids
+    assert "sub_2" in state._tool_seen_starts
     assert "Subagent toolcall with unrecognized args shape" in caplog.text
 
 
@@ -577,11 +578,11 @@ def test_subagent_missing_task_logs_warning_and_skips(tmp_path, caplog):
     state = StreamState()
     with caplog.at_level(logging.WARNING):
         runner.parse_streaming_line(
-            _toolcall_event("toolcall_end", call_id="sub_3", name="subagent",
+            _toolcall_event("toolcall_start", call_id="sub_3", name="subagent",
                             arguments={"agent": "scout"}), state)
     assert state.pending_agent_launches is None
     assert state.pending_tool_status == []
-    assert "sub_3" in state._tool_seen_ids
+    assert "sub_3" in state._tool_seen_starts
     assert "Subagent toolcall with unrecognized args shape" in caplog.text
 
 
@@ -591,16 +592,16 @@ def test_subagent_missing_both_agent_and_task_logs_warning(tmp_path, caplog):
     state = StreamState()
     with caplog.at_level(logging.WARNING):
         runner.parse_streaming_line(
-            _toolcall_event("toolcall_end", call_id="sub_empty", name="subagent",
+            _toolcall_event("toolcall_start", call_id="sub_empty", name="subagent",
                             arguments={"unknown": "x"}), state)
     assert state.pending_agent_launches is None
     assert state.pending_tool_status == []
-    assert "sub_empty" in state._tool_seen_ids
+    assert "sub_empty" in state._tool_seen_starts
     assert "Subagent toolcall with unrecognized args shape" in caplog.text
 
 
 def test_subagent_deferred_start_to_end(tmp_path):
-    """start(no args) → end(with args): deferred extraction fires agent_launch."""
+    """start(no args) defers; end returns early → no agent_launch (F-1)."""
     runner = _runner(tmp_path)
     state = StreamState()
     # start with no args → deferred
@@ -608,13 +609,11 @@ def test_subagent_deferred_start_to_end(tmp_path):
         _toolcall_event("toolcall_start", call_id="sub_4", name="subagent"), state)
     assert state.pending_tool_status == []
     assert state.pending_agent_launches is None
-    # end with args → fires
+    # end with args → skipped (Subagent end early-return)
     runner.parse_streaming_line(
         _toolcall_event("toolcall_end", call_id="sub_4", name="subagent",
                         arguments={"agent": "developer", "task": "实现功能"}), state)
-    assert state.pending_agent_launches == [
-        {"description": "实现功能", "name": None, "subagent_type": "developer"},
-    ]
+    assert state.pending_agent_launches is None
     assert state.pending_tool_status == []
 
 
@@ -638,15 +637,15 @@ def test_subagent_idless_start_only_no_duplicate(tmp_path):
 
 
 def test_subagent_id_dedup(tmp_path):
-    """Same call_id should not produce duplicate launches."""
+    """Same call_id should not produce duplicate launches (dedup via _tool_seen_starts)."""
     runner = _runner(tmp_path)
     state = StreamState()
     runner.parse_streaming_line(
-        _toolcall_event("toolcall_end", call_id="sub_5", name="subagent",
+        _toolcall_event("toolcall_start", call_id="sub_5", name="subagent",
                         arguments={"agent": "scout", "task": "分析"}), state)
     # Replay same id
     runner.parse_streaming_line(
-        _toolcall_event("toolcall_end", call_id="sub_5", name="subagent",
+        _toolcall_event("toolcall_start", call_id="sub_5", name="subagent",
                         arguments={"agent": "scout", "task": "分析"}), state)
     assert len(state.pending_agent_launches) == 1
 
@@ -662,7 +661,7 @@ def test_subagent_tasks_multi_dispatches_agent_launches(tmp_path):
     runner = _runner(tmp_path)
     state = StreamState()
     runner.parse_streaming_line(
-        _toolcall_event("toolcall_end", call_id="sub_m1", name="subagent",
+        _toolcall_event("toolcall_start", call_id="sub_m1", name="subagent",
                         arguments={
                             "tasks": [
                                 {"agent": "scout", "task": "分析认证流程"},
@@ -674,7 +673,7 @@ def test_subagent_tasks_multi_dispatches_agent_launches(tmp_path):
         {"description": "分析认证流程", "name": None, "subagent_type": "scout"},
         {"description": "分析路由结构", "name": None, "subagent_type": "scout"},
     ]
-    assert "sub_m1" in state._tool_seen_ids
+    assert "sub_m1" in state._tool_seen_starts
 
 
 def test_subagent_tasks_multi_ignores_invalid_entries(tmp_path):
@@ -682,7 +681,7 @@ def test_subagent_tasks_multi_ignores_invalid_entries(tmp_path):
     runner = _runner(tmp_path)
     state = StreamState()
     runner.parse_streaming_line(
-        _toolcall_event("toolcall_end", call_id="sub_m2", name="subagent",
+        _toolcall_event("toolcall_start", call_id="sub_m2", name="subagent",
                         arguments={
                             "tasks": [
                                 "not a dict",
@@ -701,7 +700,7 @@ def test_subagent_tasks_empty_falls_back_to_single(tmp_path):
     runner = _runner(tmp_path)
     state = StreamState()
     runner.parse_streaming_line(
-        _toolcall_event("toolcall_end", call_id="sub_m3", name="subagent",
+        _toolcall_event("toolcall_start", call_id="sub_m3", name="subagent",
                         arguments={
                             "tasks": [],
                             "agent": "scout",
@@ -714,14 +713,14 @@ def test_subagent_tasks_empty_falls_back_to_single(tmp_path):
 
 
 def test_subagent_tasks_multi_deferred_start_to_end(tmp_path):
-    """tasks[] args arriving on end after deferred start → still dispatches."""
+    """tasks[] args on end after deferred start → end is skipped (F-1)."""
     runner = _runner(tmp_path)
     state = StreamState()
     # start with no args → deferred
     runner.parse_streaming_line(
         _toolcall_event("toolcall_start", call_id="sub_m4", name="subagent"), state)
     assert state.pending_agent_launches is None
-    # end with tasks[] → fires
+    # end with tasks[] → skipped (Subagent end early-return)
     runner.parse_streaming_line(
         _toolcall_event("toolcall_end", call_id="sub_m4", name="subagent",
                         arguments={
@@ -730,17 +729,14 @@ def test_subagent_tasks_multi_deferred_start_to_end(tmp_path):
                                 {"agent": "git-ops", "task": "提交"},
                             ],
                         }), state)
-    assert state.pending_agent_launches == [
-        {"description": "实现A", "name": None, "subagent_type": "developer"},
-        {"description": "提交", "name": None, "subagent_type": "git-ops"},
-    ]
+    assert state.pending_agent_launches is None
     assert state.pending_tool_status == []
 
 
 # ---- Fix C: Subagent empty-args / non-dict-args paths ----
 
-def test_subagent_empty_args_on_end_logs_warning_no_status(tmp_path, caplog):
-    """Subagent args={} on end event → warning, no pending_tool_status or agent_launches."""
+def test_subagent_empty_args_on_end_skipped(tmp_path, caplog):
+    """Subagent args={} on end event → silently skipped (F-1 early return)."""
     runner = _runner(tmp_path)
     state = StreamState()
     with caplog.at_level(logging.WARNING):
@@ -749,12 +745,12 @@ def test_subagent_empty_args_on_end_logs_warning_no_status(tmp_path, caplog):
                             name="subagent", arguments={}), state)
     assert state.pending_tool_status == []
     assert state.pending_agent_launches is None
-    assert "sub_empty_end" in state._tool_seen_ids
-    assert "Subagent toolcall with unrecognized args shape" in caplog.text
+    # End is skipped before reaching the warning path.
+    assert "Subagent toolcall with unrecognized args shape" not in caplog.text
 
 
-def test_subagent_non_dict_args_logs_warning(tmp_path, caplog):
-    """Subagent arguments=None or string → warning, no tool_status or agent_launches."""
+def test_subagent_non_dict_args_end_skipped(tmp_path, caplog):
+    """Subagent arguments=None on end event → silently skipped (F-1 early return)."""
     runner = _runner(tmp_path)
     state = StreamState()
     with caplog.at_level(logging.WARNING):
@@ -763,14 +759,14 @@ def test_subagent_non_dict_args_logs_warning(tmp_path, caplog):
                             name="subagent", arguments=None), state)
     assert state.pending_tool_status == []
     assert state.pending_agent_launches is None
-    assert "sub_none" in state._tool_seen_ids
-    assert "Subagent toolcall with unrecognized args shape" in caplog.text
+    # End is skipped before reaching the warning path.
+    assert "Subagent toolcall with unrecognized args shape" not in caplog.text
 
 
 def test_subagent_empty_args_on_start_defers(tmp_path, caplog):
-    """Subagent args={} on start → defer (no warning, no push, no seen_ids).
+    """Subagent args={} on start → defer (no warning, no push, no seen_starts).
 
-    The end event may carry usable args; start must not consume the call_id.
+    With F-1, end events are skipped so the deferred call is silently dropped.
     """
     runner = _runner(tmp_path)
     state = StreamState()
@@ -780,6 +776,130 @@ def test_subagent_empty_args_on_start_defers(tmp_path, caplog):
                             name="subagent", arguments={}), state)
     assert state.pending_tool_status == []
     assert state.pending_agent_launches is None
-    assert "sub_defer" not in state._tool_seen_ids
+    assert "sub_defer" not in state._tool_seen_starts
     # No warning logged for deferred start
     assert "Subagent toolcall with unrecognized args shape" not in caplog.text
+
+
+# ---- F-1: Split dedup + pending_tool_end_ids ----
+
+def test_seen_starts_seen_ends_split(tmp_path):
+    """start id=A twice → 2nd dedup; end id=A twice → 2nd dedup;
+    start id=A + end id=A → each side independent (no cross-dedup)."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+
+    # start id=A twice → second dedup'd
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="A", name="read",
+                        arguments={"path": "/a.py"}), state)
+    assert len(state.pending_tool_status) == 1
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="A", name="read",
+                        arguments={"path": "/a.py"}), state)
+    assert len(state.pending_tool_status) == 1  # dedup'd
+    assert "A" in state._tool_seen_starts
+
+    # end id=A twice → second dedup'd; end after start does not
+    # re-emit pending_tool_status (case A fix).
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="A", name="read",
+                        arguments={"path": "/a.py"}), state)
+    assert len(state.pending_tool_status) == 1  # end does not re-emit status
+    assert "A" in state._tool_seen_ends
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="A", name="read",
+                        arguments={"path": "/a.py"}), state)
+    assert len(state.pending_tool_status) == 1  # 2nd end dedup'd
+
+    # pending_tool_end_ids has "A" exactly once (from the first end)
+    assert state.pending_tool_end_ids == ["A"]
+
+
+def test_toolcall_end_adds_to_pending_tool_end_ids(tmp_path):
+    """toolcall_end update (no prior start, deferred compensation) →
+    both pending_tool_status (one entry with id) and
+    pending_tool_end_ids have call_id."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+
+    status_before = len(state.pending_tool_status)
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="tid_1", name="read",
+                        arguments={"path": "/x.py"}), state)
+    # Tool status entry includes the id now (for tool_call_ids tracking)
+    assert len(state.pending_tool_status) == status_before + 1
+    assert state.pending_tool_status[-1]["id"] == "tid_1"
+    # End id appended to pending_tool_end_ids
+    assert state.pending_tool_end_ids == ["tid_1"]
+
+
+def test_toolcall_end_after_start_does_not_append_status_again(tmp_path):
+    """start(with args, id=A) → end(with same id) must NOT append a
+    second pending_tool_status entry (case A fix)."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+
+    # start with args
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="A", name="read",
+                        arguments={"path": "/a.py"}), state)
+    assert len(state.pending_tool_status) == 1
+    assert state.pending_tool_end_ids == []
+    assert "A" in state._tool_seen_starts
+
+    # end with same id → MUST NOT increase pending_tool_status
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="A", name="read",
+                        arguments={"path": "/a.py"}), state)
+    assert len(state.pending_tool_status) == 1  # unchanged
+    assert state.pending_tool_end_ids == ["A"]
+    assert "A" in state._tool_seen_ends
+
+
+def test_toolcall_end_after_deferred_start_emits_status_then_end(tmp_path):
+    """start(no args, id=A) deferred → end(with args, id=A) compensates
+    by emitting both pending_tool_status and pending_tool_end_ids."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+
+    # start with no args → deferred
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="A", name="read"), state)
+    assert state.pending_tool_status == []
+    assert "A" not in state._tool_seen_starts
+
+    # end with args → status emitted as compensation + end_id
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="A", name="read",
+                        arguments={"path": "/a.py"}), state)
+    assert len(state.pending_tool_status) == 1
+    assert state.pending_tool_status[0]["id"] == "A"
+    assert state.pending_tool_end_ids == ["A"]
+    assert "A" in state._tool_seen_starts  # compensated
+    assert "A" in state._tool_seen_ends
+
+
+def test_toolcall_end_without_args_no_status(tmp_path):
+    """end(no args, id=A) with no prior start → only pending_tool_end_ids,
+    no bare pending_tool_status entry (unmatched warning at drain)."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="A", name="read"), state)
+    assert state.pending_tool_status == []
+    assert state.pending_tool_end_ids == ["A"]
+    assert "A" in state._tool_seen_ends
+
+
+def test_subagent_end_not_in_pending_tool_end_ids(tmp_path):
+    """Subagent end events are skipped entirely → no pending_tool_end_ids."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_end", call_id="sub_end", name="subagent",
+                        arguments={"agent": "scout", "task": "分析"}), state)
+    assert state.pending_tool_end_ids == []
+    assert state.pending_agent_launches is None

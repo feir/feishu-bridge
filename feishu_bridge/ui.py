@@ -1237,10 +1237,12 @@ class ResponseHandle:
 
         for tc in tool_calls:
             if isinstance(tc, str):
-                name, hint_data = tc, ""
+                name, call_id = tc, None
+                hint_data = ""
             else:
                 name = tc.get("name", "")
                 hint_data = tc.get("hint_data", "")
+                call_id = tc.get("id")
 
             if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task", "Subagent"):
                 # Skipped tools (rendered elsewhere) still signal that prior tool
@@ -1274,12 +1276,18 @@ class ResponseHandle:
                     # Same tool repeating = new active invocation. If a prior skip
                     # (e.g. Subagent dispatch) marked it done, restore running.
                     last["status"] = "running"
+                    if call_id:
+                        last["tool_call_ids"].add(call_id)
                     continue
 
             # Mark previous entries as done
             for prev in self._tool_history:
                 prev["status"] = "done"
-            self._tool_history.append({"name": name, "label": label, "hint": hint, "count": 1, "status": "running"})
+            entry = {"name": name, "label": label, "hint": hint, "count": 1,
+                      "status": "running", "tool_call_ids": set()}
+            if call_id:
+                entry["tool_call_ids"].add(call_id)
+            self._tool_history.append(entry)
 
         if self._tool_history:
             latest = self._tool_history[-1]
@@ -1400,6 +1408,31 @@ class ResponseHandle:
             return
         panels = self._build_tool_panels_for_streaming()
         self._update_tool_card(panels)
+
+    def tool_status_end_update(self, end_ids: list[str]):
+        """Mark tool entries as done when their toolcall_end events arrive.
+
+        Each id is looked up in the ``tool_call_ids`` sets of history entries
+        (searched from tail — the common case).  When an entry's entire set is
+        exhausted (all ids have ended) its status is set to ``"done"``.
+        Unmatched ids log a warning (may arrive before their start event).
+        """
+        if not end_ids:
+            return
+        for eid in end_ids:
+            found = False
+            # Search from tail (most recent entries first — the common case).
+            for entry in reversed(self._tool_history):
+                ids = entry.get("tool_call_ids")
+                if isinstance(ids, set) and eid in ids:
+                    ids.discard(eid)
+                    if not ids:  # all call-ids for this entry have ended
+                        entry["status"] = "done"
+                    found = True
+                    break
+            if not found:
+                log.warning("tool_status_end_update: id %s not found in history", eid)
+        self._render_progress()
 
     def _build_tool_panels_for_streaming(self) -> list[dict]:
         """Build IM card collapsible_panel elements from tool_history during streaming."""

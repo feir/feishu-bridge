@@ -370,9 +370,13 @@ class StreamState:
     pending_silent_reset: bool = False
     # OMP todo state machine — rebuilt from ops deltas
     _todo_phases: list[dict] = field(default_factory=list)
-    # Pi tool-status: tool-call ids already emitted to pending_tool_status,
-    # so each call surfaces exactly once (id-correlated single emit).
-    _tool_seen_ids: set = field(default_factory=set)
+    # Pi tool-status: tool-call ids already emitted, split so a start never
+    # suppresses an end (Bug #4 root cause).
+    _tool_seen_starts: set = field(default_factory=set)
+    _tool_seen_ends: set = field(default_factory=set)
+
+    # Pi tool-call end ids ready for on_tool_end callback (drain loop).
+    pending_tool_end_ids: list[str] = field(default_factory=list)
 
     # ── Todo state machine (OMP ops format) ──
 
@@ -1041,7 +1045,8 @@ class BaseRunner(ABC):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            on_agent_update=None, env_extra: Optional[dict] = None,
+            on_agent_update=None, on_tool_end=None,
+            env_extra: Optional[dict] = None,
             fork_session: bool = False,
             fresh_context: Optional[str] = None,
             workspace_override: Optional[str] = None) -> dict:
@@ -1095,7 +1100,8 @@ class BaseRunner(ABC):
             result = self._run_streaming(proc, session_id, tag, on_output,
                                          on_tool_status=on_tool_status,
                                          on_todo_update=on_todo_update,
-                                         on_agent_update=on_agent_update)
+                                         on_agent_update=on_agent_update,
+                                         on_tool_end=on_tool_end)
         else:
             result = self._run_blocking(proc, session_id, tag)
 
@@ -1143,7 +1149,7 @@ class BaseRunner(ABC):
 
     def _run_streaming(self, proc, session_id, tag, on_output,
                         on_tool_status=None, on_todo_update=None,
-                        on_agent_update=None) -> dict:
+                        on_agent_update=None, on_tool_end=None) -> dict:
         state = StreamState(session_id=session_id)
         timed_out = False
         silent_timed_out = False
@@ -1280,6 +1286,13 @@ class BaseRunner(ABC):
                     if on_agent_update:
                         on_agent_update(state.pending_agent_launches)
                     state.pending_agent_launches = None
+                    liveness = True
+
+                # Drain pending_tool_end_ids → on_tool_end callback (F-1).
+                if state.pending_tool_end_ids:
+                    if on_tool_end:
+                        on_tool_end(list(state.pending_tool_end_ids))
+                    state.pending_tool_end_ids = []
                     liveness = True
 
                 # Runner tool-lifecycle heartbeat (pi tool_execution_start/end):
@@ -1760,7 +1773,8 @@ class CodexRunner(BaseRunner):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            on_agent_update=None, env_extra: Optional[dict] = None,
+            on_agent_update=None, on_tool_end=None,
+            env_extra: Optional[dict] = None,
             fork_session: bool = False,
             fresh_context: Optional[str] = None,
             workspace_override: Optional[str] = None) -> dict:
@@ -1788,6 +1802,7 @@ class CodexRunner(BaseRunner):
                 prompt, session_id=session_id, resume=resume,
                 tag=tag, on_output=on_output, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
+                on_tool_end=on_tool_end,
                 env_extra=env_extra,
                 fresh_context=None,
                 workspace_override=workspace_override,

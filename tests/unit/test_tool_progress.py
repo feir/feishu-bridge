@@ -1,9 +1,15 @@
 """Unit tests for tool progress display: _extract_hint_data, _format_tool_hint,
 _mcp_display_name, and tool_status_update dedup/normalization logic."""
 
+import logging
+import threading
+from collections import deque
+from unittest.mock import Mock
+
 import pytest
 
 from feishu_bridge.runtime import _extract_hint_data
+from feishu_bridge.ui import ResponseHandle
 
 
 class TestExtractHintData:
@@ -498,3 +504,95 @@ def test_send_tool_card_no_main_card_replies_with_collapsible_panel():
 
     # _tool_msg_id is set from the successful reply
     assert handle._tool_msg_id == "msg-tool-test-999"
+
+
+# ---- F-1: tool_status_end_update ----
+
+
+class TestToolStatusEndUpdate:
+    """Tests for ResponseHandle.tool_status_end_update."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._cardkit_card_id = None
+        h._tool_history = deque(maxlen=8)
+        h._tool_msg_id = None
+        h._seq_lock = threading.Lock()
+        h._terminated = False
+        h._summary_updated = False
+        h._active_agents = []
+        h._last_todos = None
+        # Minimal mock so _render_progress doesn't crash
+        h._update_tool_card = Mock()
+        h._update_element = Mock()
+        return h
+
+    def test_single_call_start_then_end(self, handle):
+        """start → status=running + tool_call_ids={"A"};
+        end_update(["A"]) → status=done + tool_call_ids=set()."""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a.py", "id": "A"},
+        ])
+        assert handle._tool_history[0]["status"] == "running"
+        assert handle._tool_history[0]["tool_call_ids"] == {"A"}
+
+        handle.tool_status_end_update(["A"])
+        assert handle._tool_history[0]["status"] == "done"
+        assert handle._tool_history[0]["tool_call_ids"] == set()
+
+    def test_aggregated_two_starts_then_ends(self, handle):
+        """Same label+hint ×2 → count=2 + tool_call_ids={"A","B"};
+        end A → still running (ids={"B"}); end B → done (ids=set())."""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/x.py", "id": "A"},
+        ])
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/x.py", "id": "B"},
+        ])
+        assert len(handle._tool_history) == 1
+        entry = handle._tool_history[0]
+        assert entry["count"] == 2
+        assert entry["tool_call_ids"] == {"A", "B"}
+        assert entry["status"] == "running"
+
+        handle.tool_status_end_update(["A"])
+        assert entry["status"] == "running"  # B still pending
+        assert entry["tool_call_ids"] == {"B"}
+
+        handle.tool_status_end_update(["B"])
+        assert entry["status"] == "done"
+        assert entry["tool_call_ids"] == set()
+
+    def test_id_not_found_no_raise(self, handle, caplog):
+        """end_update(["X"]) where X is not in any entry → log warning, no raise."""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a.py", "id": "A"},
+        ])
+        with caplog.at_level(logging.WARNING):
+            handle.tool_status_end_update(["X"])
+        assert "X not found in history" in caplog.text
+        # Original entry untouched
+        assert handle._tool_history[0]["status"] == "running"
+        assert handle._tool_history[0]["tool_call_ids"] == {"A"}
+
+    def test_empty_end_ids_noop(self, handle):
+        """Empty list → no-op."""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a.py", "id": "A"},
+        ])
+        handle.tool_status_end_update([])
+        assert handle._tool_history[0]["status"] == "running"
+
+    def test_start_without_id_then_end_without_id(self, handle, caplog):
+        """Entry without tool_call_id survives end_update (no matching)."""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a.py"},
+        ])
+        # Entry has empty tool_call_ids set (no id)
+        assert handle._tool_history[0]["tool_call_ids"] == set()
+        with caplog.at_level(logging.WARNING):
+            handle.tool_status_end_update(["nonexistent"])
+        assert "nonexistent not found in history" in caplog.text
+        # status unchanged (can't be marked done without end event; F-3 handles it)
+        assert handle._tool_history[0]["status"] == "running"

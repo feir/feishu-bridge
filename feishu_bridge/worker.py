@@ -1020,6 +1020,9 @@ def process_message(
         def on_agent_update(launches):
             handle.agent_list_update(launches)
 
+        def on_tool_end(end_ids):
+            handle.tool_status_end_update(end_ids)
+
         todo_task_id = item.get("_todo_task_id")
         if todo_task_id and not feishu_api_error_cls:
             log.debug(
@@ -1173,6 +1176,7 @@ def process_message(
                 text, session_id=existing_sid, resume=True, tag=tag,
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
+                on_tool_end=on_tool_end,
                 env_extra=env_extra,
                 fresh_context=None,
                 workspace_override=resolved_workspace,   # [Stage 2]
@@ -1195,6 +1199,7 @@ def process_message(
                 text, session_id=new_sid, resume=False, tag=tag,
                 on_output=on_stream, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
+                on_tool_end=on_tool_end,
                 env_extra=env_extra,
                 fresh_context=fresh_ctx or None,
                 workspace_override=resolved_workspace,
@@ -1264,6 +1269,7 @@ def process_message(
                     "继续", session_id=auto_sid, resume=True,
                     on_output=on_stream, on_tool_status=on_tool_status,
                     on_todo_update=on_todo_update, on_agent_update=on_agent_update,
+                    on_tool_end=on_tool_end,
                     env_extra=env_extra,
                 )
                 if result.get("silent_timeout"):
@@ -1296,6 +1302,7 @@ def process_message(
                     text, session_id=retry_sid, resume=False, tag=tag,
                     on_output=on_stream, on_tool_status=on_tool_status,
                     on_todo_update=on_todo_update, on_agent_update=on_agent_update,
+                    on_tool_end=on_tool_end,
                     env_extra=env_extra,
                     fresh_context=retry_fresh_ctx,
                     workspace_override=resolved_workspace,

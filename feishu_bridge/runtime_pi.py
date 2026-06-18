@@ -267,9 +267,10 @@ class PiRunner(BaseRunner):
         """Surface a pi tool call as one ``{name, hint_data}`` entry.
 
         Authoritative source for pi tool status (``message_update.toolcall_*``).
-        Each call is emitted exactly once — when its arguments first become
-        available — keyed by tool-call id (``state._tool_seen_ids``). Never
-        raises: extraction failures degrade to skipping this status update.
+        Start and end events are deduped independently (``_tool_seen_starts`` /
+        ``_tool_seen_ends``) so a start never suppresses an end (Bug #4 fix).
+        End events push the call-id into ``pending_tool_end_ids`` for the
+        drain-loop ``on_tool_end`` callback (F-1). Never raises.
         """
         try:
             tc = self._tool_call_from_update(update)
@@ -279,7 +280,9 @@ class PiRunner(BaseRunner):
             if not name:
                 return
             call_id = tc.get("id")
-            if call_id and call_id in state._tool_seen_ids:
+            # Dedup: start and end tracked separately.
+            seen_set = state._tool_seen_starts if is_start else state._tool_seen_ends
+            if call_id and call_id in seen_set:
                 return
             if not call_id and not is_start:
                 # id-less call: act on start only to avoid start+end double.
@@ -294,8 +297,12 @@ class PiRunner(BaseRunner):
                 args = {}
 
             # Subagent always routes through pending_agent_launches OR
-            # warning; never reaches pending_tool_status.
+            # warning; never reaches pending_tool_status.  End events are
+            # skipped — Subagent already emitted to pending_agent_launches
+            # on start (F-1).
             if canonical == "Subagent":
+                if not is_start:
+                    return
                 # Multi-task parallel dispatch: tasks=[{agent, task}, ...]
                 tasks_list = args.get("tasks")
                 if isinstance(tasks_list, list) and tasks_list:
@@ -325,7 +332,7 @@ class PiRunner(BaseRunner):
                             emitted = True
                     if emitted:
                         if call_id:
-                            state._tool_seen_ids.add(call_id)
+                            state._tool_seen_starts.add(call_id)
                         return
                     # fall through to single-shot try then warning
 
@@ -341,7 +348,7 @@ class PiRunner(BaseRunner):
                         "subagent_type": agent_name,
                     })
                     if call_id:
-                        state._tool_seen_ids.add(call_id)
+                        state._tool_seen_starts.add(call_id)
                     return
 
                 # All extraction failed (including empty args).
@@ -351,28 +358,55 @@ class PiRunner(BaseRunner):
                     return
                 log.warning("Subagent toolcall with unrecognized args shape: %s", args)
                 if call_id:
-                    state._tool_seen_ids.add(call_id)
+                    state._tool_seen_starts.add(call_id)
                 return
 
             # Non-Subagent: original general path
+            start_already_emitted = bool(
+                call_id and call_id in state._tool_seen_starts)
             if not args:
                 # No usable arguments. With an id on a *start* event, defer —
-                # a later toolcall_end may carry them. Otherwise the call is
-                # resolving without extractable args: degrade to a bare-name
-                # entry (still useful: "执行命令"/"读取文件") rather than
-                # dropping the status (spec contract: never-raises → bare label).
+                # a later toolcall_end may carry them. Otherwise:
+                # - start without call_id → bare label (never-raises contract)
+                # - end with call_id → only pending_tool_end_ids (no bare
+                #   status entry; unmatched warning at drain time)
                 if call_id and is_start:
                     return
-                state.pending_tool_status.append(
-                    {"name": canonical, "hint_data": ""})
+                if not is_start and call_id:
+                    # End without args: only end-id (unmatched warning path).
+                    state.pending_tool_end_ids.append(call_id)
+                    state._tool_seen_ends.add(call_id)
+                    return
+                # Start without call_id or bare start (id but no args,
+                # not deferred above because !is_start path already returned).
+                entry = {"name": canonical, "hint_data": ""}
                 if call_id:
-                    state._tool_seen_ids.add(call_id)
+                    entry["id"] = call_id
+                state.pending_tool_status.append(entry)
+                if call_id:
+                    state._tool_seen_starts.add(call_id)
                 return
+
             hint = _extract_hint_data(canonical, args)
-            state.pending_tool_status.append(
-                {"name": canonical, "hint_data": hint})
+            entry = {"name": canonical, "hint_data": hint}
             if call_id:
-                state._tool_seen_ids.add(call_id)
+                entry["id"] = call_id
+
+            if is_start:
+                # Normal start with args → one status entry.
+                state.pending_tool_status.append(entry)
+                if call_id:
+                    state._tool_seen_starts.add(call_id)
+            else:
+                # End with args.
+                if call_id:
+                    state.pending_tool_end_ids.append(call_id)
+                    state._tool_seen_ends.add(call_id)
+                    if not start_already_emitted:
+                        # Deferred start: end carries the args → emit status
+                        # as compensation (UI gets entry + immediate done).
+                        state.pending_tool_status.append(entry)
+                        state._tool_seen_starts.add(call_id)
         except Exception as e:  # never-raises hot path
             log.debug("pi tool-status extract failed: %s", e)
 
