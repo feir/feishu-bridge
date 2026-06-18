@@ -204,7 +204,12 @@ class PiRunner(BaseRunner):
             return None
 
         usage = state.last_call_usage or {}
-        model_name = self.display_default_model() or "(cli-default)"
+        provider = message.get("provider")
+        actual_model = message.get("model")
+        if provider and actual_model:
+            model_name = f"{provider}/{actual_model}"
+        else:
+            model_name = actual_model or self.display_default_model() or "(cli-default)"
 
         return {
             "result": text,

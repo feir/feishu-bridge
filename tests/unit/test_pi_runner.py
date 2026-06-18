@@ -212,6 +212,26 @@ def test_pi_result_exposes_configured_model_for_footer(tmp_path):
     }
 
 
+def test_pi_result_uses_actual_jsonl_model_for_footer(tmp_path):
+    runner = _runner(tmp_path, model="configured-before-fallback")
+    state = StreamState(session_id="bridge-sid")
+
+    runner.parse_streaming_line({
+        "type": "turn_end",
+        "message": {
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "stopReason": "stop",
+            "content": [{"type": "text", "text": "OK"}],
+            "usage": {"input": 10, "output": 2},
+        },
+    }, state)
+
+    result = runner._build_streaming_result(state, "bridge-sid")
+
+    assert list(result["modelUsage"].keys()) == ["deepseek/deepseek-v4-pro"]
+
+
 def test_pi_parse_provider_error(tmp_path):
     runner = _runner(tmp_path)
     state = StreamState(session_id="bridge-sid")
