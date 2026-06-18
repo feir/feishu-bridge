@@ -220,7 +220,6 @@ class TestToolStatusUpdateDedup:
         h._update_summary = MagicMock()
         h._render_progress = MagicMock()
         h._ensure_card = MagicMock(return_value=True)
-        h._loading_icon_cleared = True
         return h
 
     def test_dict_input_accumulates(self, handle):

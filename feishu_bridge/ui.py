@@ -350,9 +350,7 @@ MAX_CARD_PAYLOAD_BYTES = 28 * 1024
 COMPACT_MAX_CHARS = 4_000
 
 CARDKIT_ELEMENT_ID = "streaming_output"
-CARDKIT_LOADING_ELEMENT_ID = "loading_icon"
-CARDKIT_LOADING_ICON_IMG_KEY = "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
-CARDKIT_TODO_ELEMENT_ID = "todo_progress"
+CARDKIT_AGENT_ELEMENT_ID = "agent_status"
 CARDKIT_THROTTLE_MS = 100
 PATCH_THROTTLE_MS = 1500
 GAP_THRESHOLD_MS = 2000
@@ -695,18 +693,8 @@ def build_cardkit_streaming_card() -> dict:
                 },
                 {
                     "tag": "markdown",
-                    "content": " ",
-                    "icon": {
-                        "tag": "custom_icon",
-                        "img_key": CARDKIT_LOADING_ICON_IMG_KEY,
-                        "size": "16px 16px",
-                    },
-                    "element_id": CARDKIT_LOADING_ELEMENT_ID,
-                },
-                {
-                    "tag": "markdown",
+                    "element_id": CARDKIT_AGENT_ELEMENT_ID,
                     "content": "",
-                    "element_id": CARDKIT_TODO_ELEMENT_ID,
                 },
             ],
         },
@@ -960,7 +948,9 @@ class ResponseHandle:
         self._card_fallback_timeout = 8
         self._summary_updated = False
         self._terminated = False
-        self._loading_icon_cleared = False
+        self._tool_msg_id: Optional[str] = None
+        self._tool_card_first: bool = True
+        self._last_tool_card_update: float = 0.0
         self._handle_start_time: float = time.time()
         self._runner: Optional[ClaudeRunner] = None
         self._runner_tag: Optional[str] = None
@@ -1277,7 +1267,10 @@ class ResponseHandle:
                     last["count"] += 1
                     continue
 
-            self._tool_history.append({"name": name, "label": label, "hint": hint, "count": 1})
+            # Mark previous entries as done
+            for prev in self._tool_history:
+                prev["status"] = "done"
+            self._tool_history.append({"name": name, "label": label, "hint": hint, "count": 1, "status": "running"})
 
         if self._tool_history:
             latest = self._tool_history[-1]
@@ -1352,37 +1345,19 @@ class ResponseHandle:
                 lines.append(f"☐ {content}")
         return "\n".join(lines)
 
-    def _clear_loading_icon(self):
-        """Clear loading icon element (called once when todo list appears)."""
-        if self._loading_icon_cleared or not self._cardkit_card_id:
-            return
-        self._loading_icon_cleared = True
-        self._update_element(CARDKIT_LOADING_ELEMENT_ID, "")
-
-    _MAX_TOOL_HISTORY_DISPLAY = 8
-
     def _render_progress(self):
-        """Render combined tool history + agent + todo progress."""
+        """Render tool progress (IM card) + agent/todo status (CardKit element)."""
+        # Tool progress → IM card with collapsible panels
+        self._render_tool_progress()
+
+        # Agent + todo status → CardKit agent element
+        self._render_agent_progress()
+
+    def _render_agent_progress(self):
+        """Render agent + todo status to the CardKit agent element."""
         if not self._cardkit_card_id:
             return
         parts = []
-
-        # Tool history: show last N, collapse prefix for older
-        max_display = self._MAX_TOOL_HISTORY_DISPLAY
-        total = len(self._tool_history)
-        visible = self._tool_history[-max_display:] if total > max_display else self._tool_history
-        if total > max_display:
-            parts.append(f"... 前 {total - max_display} 次操作已折叠")
-        for entry in visible:
-            label = entry["label"]
-            hint = entry["hint"]
-            count = entry["count"]
-            line = f"▸ {label}"
-            if hint:
-                line += f" `{hint}`"
-            if count > 1:
-                line += f" ×{count}"
-            parts.append(line)
 
         for a in self._active_agents:
             desc = a.get("description", "")
@@ -1392,10 +1367,8 @@ class ResponseHandle:
                 parts.append(f"~~☑ {desc}{suffix}~~")
                 result = a.get("result_text")
                 if result:
-                    # Show first 500 chars inline
                     summary = result[:500] + ("…" if len(result) > 500 else "")
                     parts.append(f"  ── Output ──\n  {summary}")
-                # Activity lines (from runner subagent tracking)
                 activities = a.get("activities")
                 if activities:
                     parts.append("  " + "\n  ".join(activities[:8]))
@@ -1410,8 +1383,169 @@ class ResponseHandle:
                 parts.append("")
             parts.append(self._format_todos(self._last_todos))
 
-        self._clear_loading_icon()
-        self._update_element(CARDKIT_TODO_ELEMENT_ID, "\n".join(parts))
+        self._update_element(CARDKIT_AGENT_ELEMENT_ID, "\n".join(parts))
+
+    def _render_tool_progress(self):
+        """Build and send/update the tool progress IM card."""
+        if not self._tool_history:
+            return
+        panels = self._build_tool_panels_for_streaming()
+        self._update_tool_card(panels)
+
+    def _build_tool_panels_for_streaming(self) -> list[dict]:
+        """Build IM card collapsible_panel elements from tool_history during streaming."""
+        if not self._tool_history:
+            return []
+
+        entries = list(self._tool_history)
+        total = len(entries)
+        max_display = self._MAX_TOOL_PANELS
+        visible = entries[-max_display:] if total > max_display else entries
+
+        panels = []
+        if total > max_display:
+            panels.append({
+                "tag": "markdown",
+                "content": f"... 前 {total - max_display} 次操作已折叠",
+            })
+
+        for entry in visible:
+            label = entry["label"]
+            hint = entry.get("hint", "")
+            name = entry.get("name", label)
+            count = entry.get("count", 1)
+            status = entry.get("status", "running")
+
+            detail = f" · {hint}" if hint else ""
+            if status == "running":
+                title = f"⏳ **{label}**{detail}"
+            else:
+                title = f"✅ ~~{label}~~ {detail}"
+            if count > 1:
+                title += f" ×{count}"
+
+            panels.append({
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                    "title": {"tag": "markdown", "content": title},
+                    "icon": {
+                        "tag": "standard_icon",
+                        "token": "down-small-ccm_outlined",
+                        "size": "16px 16px",
+                    },
+                    "icon_position": "right",
+                    "icon_expanded_angle": -180,
+                },
+                "border": {"color": "grey", "corner_radius": "5px"},
+                "vertical_spacing": "8px",
+                "padding": "8px 8px 8px 8px",
+                "elements": [
+                    {"tag": "markdown", "content": f"**工具名**: {name}"},
+                    *([{"tag": "markdown", "content": f"**参数摘要**: `{hint}`"}] if hint else []),
+                ],
+            })
+
+        return panels
+
+    def _send_tool_card(self, panels: list[dict]) -> Optional[str]:
+        """Send initial tool progress card via IM API. Returns message_id."""
+        running = len(self._tool_history)
+        status_text = f"**执行中 ({running})**" if running else "**工具调用**"
+
+        card = {
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": status_text},
+                    *panels,
+                ]
+            }
+        }
+
+        card_json = json.dumps(card, ensure_ascii=False)
+        try:
+            if self.source_message_id:
+                from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+                reply_body = ReplyMessageRequestBody.builder() \
+                    .msg_type("interactive") \
+                    .content(card_json) \
+                    .reply_in_thread(bool(self.thread_id)) \
+                    .build()
+                req = ReplyMessageRequest.builder() \
+                    .message_id(self.source_message_id) \
+                    .request_body(reply_body) \
+                    .build()
+                resp = self.client.im.v1.message.reply(req)
+            else:
+                msg_body = CreateMessageRequestBody.builder() \
+                    .receive_id(self.chat_id) \
+                    .msg_type("interactive") \
+                    .content(card_json) \
+                    .build()
+                req = CreateMessageRequest.builder() \
+                    .receive_id_type("chat_id") \
+                    .request_body(msg_body) \
+                    .build()
+                resp = self.client.im.v1.message.create(req)
+            if resp.success():
+                return resp.data.message_id
+            log.error("Tool card send failed: code=%s msg=%s", resp.code, resp.msg)
+        except Exception:
+            log.exception("Tool card send error")
+        return None
+
+    _TOOL_CARD_THROTTLE_S = 0.8
+
+    def _update_tool_card(self, panels: list[dict]):
+        """Update or create the tool progress card via IM API.
+
+        Throttled to at most one patch per _TOOL_CARD_THROTTLE_S seconds.
+        """
+        if not panels:
+            return
+
+        if not self._tool_msg_id:
+            msg_id = self._send_tool_card(panels)
+            if msg_id:
+                self._tool_msg_id = msg_id
+                self._last_tool_card_update = time.monotonic()
+            return
+
+        now = time.monotonic()
+        if now - self._last_tool_card_update < self._TOOL_CARD_THROTTLE_S:
+            return
+        self._last_tool_card_update = now
+
+        running = len(self._tool_history)
+        status_text = f"**执行中 ({running})**"
+
+        card = {
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": status_text},
+                    *panels,
+                ]
+            }
+        }
+
+        card_json = json.dumps(card, ensure_ascii=False)
+        try:
+            resp = self.client.im.message.patch(
+                PatchMessageRequest.builder()
+                    .message_id(self._tool_msg_id)
+                    .request_body(
+                        PatchMessageRequestBody.builder()
+                            .content(card_json)
+                            .build()
+                    )
+                    .build()
+            )
+            if not resp.success():
+                log.error("Tool card patch failed: code=%s msg=%s", resp.code, resp.msg)
+        except Exception:
+            log.exception("Tool card patch error")
 
     def agent_list_update(self, launches: list[dict]):
         """Update agent list when new agents are dispatched."""
