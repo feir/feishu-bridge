@@ -16,7 +16,7 @@ from feishu_bridge.parsers import (
     fetch_forward_messages,
     fetch_quoted_message,
 )
-from feishu_bridge.quota import WINDOW_LABELS
+from feishu_bridge.quota import WINDOW_LABELS, fetch_codex_quota, fetch_deepseek_balance
 from feishu_bridge.runtime import (
     BaseRunner, SessionMap, TOOL_ACTIVE_SILENT_TIMEOUT,
     build_fresh_context_prompt, pick_primary_model, resolve_dotclaude_root,
@@ -339,11 +339,43 @@ def start_media_cleanup_timer(workspace: str, interval: int = 600):
              interval, _MEDIA_MAX_AGE_SECS)
 
 
-def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
+# ponytail: module-level caches, TTL matches Claude poll interval
+_codex_quota_cache: dict = {"snap": None, "ts": 0}
+_deepseek_balance_cache: dict = {"snap": None, "ts": 0}
+_CODEX_CACHE_TTL = 300
+
+
+def _get_codex_quota_cached():
+    now = time.time()
+    if _codex_quota_cache["snap"] and (now - _codex_quota_cache["ts"]) < _CODEX_CACHE_TTL:
+        return _codex_quota_cache["snap"]
+    snap = fetch_codex_quota()
+    _codex_quota_cache["snap"] = snap
+    _codex_quota_cache["ts"] = now
+    return snap
+
+
+def _get_deepseek_balance_cached():
+    now = time.time()
+    if _deepseek_balance_cache["snap"] and (now - _deepseek_balance_cache["ts"]) < _CODEX_CACHE_TTL:
+        return _deepseek_balance_cache["snap"]
+    snap = fetch_deepseek_balance()
+    _deepseek_balance_cache["snap"] = snap
+    _deepseek_balance_cache["ts"] = now
+    return snap
+
+
+def _build_quota_alert(result: dict, quota_snapshot=None, runner=None,
+                       primary_model: str | None = None) -> str:
     """Build quota alert string from stream event + API snapshot.
 
     Priority: stream event ``status=rejected`` is authoritative (real-time).
     For utilization percentages, prefer API snapshot (stream event lacks them).
+
+    Routes API snapshot by runner type:
+      - codex → Codex quota (cached 5min one-shot)
+      - claude → Claude QuotaPoller snapshot
+      - pi    → route by primary model name (claude vs gpt/codex)
     """
     import time as _time
 
@@ -383,24 +415,56 @@ def _build_quota_alert(result: dict, quota_snapshot=None) -> str:
             parts.append(f"⚠️ {label}配额 {util:.0%}{reset_str}")
             covered_windows.add(win_key)
 
-    # 3. API snapshot: add utilization for all windows above threshold
-    if quota_snapshot and quota_snapshot.available and not quota_snapshot.stale:
-        for key, label in WINDOW_LABELS.items():
-            if key in covered_windows:
-                continue
-            w = quota_snapshot.windows.get(key)
-            if not w:
-                continue
-            util_pct = w.utilization  # already in percentage (e.g. 18.0)
-            if util_pct >= 50:
-                icon = "🔴" if util_pct >= 80 else "🟡"
-                remaining = max(0, w.resets_at_epoch - _time.time())
-                hours, mins = divmod(int(remaining) // 60, 60)
-                reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
-                parts.append(f"{icon} {label}: {util_pct:.0f}%{reset_str}")
+    # 3. API snapshot — route by runner type
+    rt = _derive_runner_type(runner) if runner else "unknown"
+    is_deepseek = bool(primary_model and "deepseek" in primary_model.lower())
+    is_codex_model = bool(primary_model and ("codex" in primary_model.lower()
+                                            or "gpt" in primary_model.lower()))
+    if rt == "codex" or (rt == "pi" and is_codex_model):
+        # Codex path
+        codex_snap = _get_codex_quota_cached()
+        if codex_snap and codex_snap.available:
+            for key, label, pct, reset_epoch in [
+                ("five_hour", "5h", codex_snap.primary_used_pct,
+                 codex_snap.primary_resets_at),
+                ("seven_day", "7d", codex_snap.secondary_used_pct,
+                 codex_snap.secondary_resets_at),
+            ]:
+                if key in covered_windows:
+                    continue
+                if pct >= 50:
+                    icon = "🔴" if pct >= 80 else "🟡"
+                    remaining = max(0, reset_epoch - _time.time())
+                    hours, mins = divmod(int(remaining) // 60, 60)
+                    reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
+                    parts.append(f"{icon} {label}: {pct:.0f}%{reset_str}")
+    elif is_deepseek:
+        # DeepSeek path — prepaid balance, warn when low
+        ds = _get_deepseek_balance_cached()
+        if ds and ds.available:
+            if ds.balance <= 0:
+                parts.append("🔴 DeepSeek 余额已耗尽")
+            elif ds.balance < 50:
+                parts.append(f"⚠️ DeepSeek 余额 ¥{ds.balance:.2f}，建议充值")
+    elif rt in ("claude", "pi"):
+        # Claude path (pi defaults here unless primary model is Codex/DeepSeek)
+        if quota_snapshot and quota_snapshot.available and not quota_snapshot.stale:
+            for key, label in WINDOW_LABELS.items():
+                if key in covered_windows:
+                    continue
+                w = quota_snapshot.windows.get(key)
+                if not w:
+                    continue
+                util_pct = w.utilization  # already in percentage (e.g. 18.0)
+                if util_pct >= 50:
+                    icon = "🔴" if util_pct >= 80 else "🟡"
+                    remaining = max(0, w.resets_at_epoch - _time.time())
+                    hours, mins = divmod(int(remaining) // 60, 60)
+                    reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
+                    parts.append(f"{icon} {label}: {util_pct:.0f}%{reset_str}")
 
-    # 4. Cookie expiry warning (only in card alert, not every message)
-    if quota_snapshot:
+    # 4. Cookie expiry warning (Claude only)
+    if rt in ("claude", "pi") and not is_deepseek and quota_snapshot:
         cookie_warn = quota_snapshot.cookie_expiry_warning
         if cookie_warn:
             parts.append(cookie_warn)
@@ -430,7 +494,8 @@ def _context_health_alert(result: dict, quota_snapshot=None, runner=None) -> str
     primary = pick_primary_model(model_usage, configured)
     max_ctx = int(model_usage.get(primary, {}).get("contextWindow", 0) or 0) if primary else 0
 
-    rate_alert = _build_quota_alert(result, quota_snapshot)
+    rate_alert = _build_quota_alert(result, quota_snapshot, runner=runner,
+                                   primary_model=primary)
 
     if max_ctx == 0:
         return rate_alert or None

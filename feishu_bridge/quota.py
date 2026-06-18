@@ -405,6 +405,100 @@ def fetch_codex_quota(auth_path: Path | None = None) -> CodexQuotaSnapshot:
     )
 
 
+# ── DeepSeek balance ─────────────────────────────────────────────────
+
+_DEEPSEEK_ENV_PATH = Path.home() / ".pi" / "agent" / ".env"
+_DEEPSEEK_KEY_VAR = "DEEPSEEK_API_KEY"
+_DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+
+
+@dataclass
+class DeepseekBalanceSnapshot:
+    """Point-in-time DeepSeek account balance."""
+    timestamp: float = 0.0
+    balance: float = 0.0
+    currency: str = "CNY"
+    is_available: bool = True
+    error: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return not self.error
+
+    @property
+    def stale(self) -> bool:
+        return (time.time() - self.timestamp) > _DEFAULT_POLL_INTERVAL * 2
+
+
+def _read_env_key(env_path: Path, key_var: str) -> str | None:
+    """Read a single key=value from a dotenv file."""
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == key_var:
+                    return v.strip().strip('"').strip("'")
+        return None
+    except Exception:
+        return None
+
+
+def fetch_deepseek_balance(env_path: Path | None = None,
+                           key_var: str | None = None) -> DeepseekBalanceSnapshot:
+    """One-shot fetch of DeepSeek account balance.
+
+    Reads ``DEEPSEEK_API_KEY`` from ``~/.pi/agent/.env``, calls
+    ``api.deepseek.com/user/balance``, returns snapshot.
+    """
+    ep = env_path or _DEEPSEEK_ENV_PATH
+    kv = key_var or _DEEPSEEK_KEY_VAR
+    api_key = _read_env_key(ep, kv)
+    if not api_key:
+        return DeepseekBalanceSnapshot(
+            timestamp=time.time(),
+            error=f"{kv} not found in {ep}",
+        )
+
+    req = urllib.request.Request(_DEEPSEEK_BALANCE_URL)
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Accept", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
+            data = _json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:200]
+        return DeepseekBalanceSnapshot(
+            timestamp=time.time(),
+            error=f"HTTP {e.code}: {body}",
+        )
+    except Exception as e:
+        return DeepseekBalanceSnapshot(timestamp=time.time(), error=str(e))
+
+    is_available = data.get("is_available", True)
+    if not is_available:
+        return DeepseekBalanceSnapshot(
+            timestamp=time.time(),
+            is_available=False,
+            error="account not available",
+        )
+
+    balance_infos = data.get("balance_infos") or []
+    bi = balance_infos[0] if balance_infos else {}
+    total_balance = float(bi.get("total_balance", "0") or "0")
+    currency = bi.get("currency", "CNY")
+
+    return DeepseekBalanceSnapshot(
+        timestamp=time.time(),
+        balance=total_balance,
+        currency=currency,
+        is_available=True,
+    )
+
+
 # ── CLI entry point (`python -m feishu_bridge.quota claude [--json]`) ──
 
 def _claude_quota_cli(cookie_path: Path | None = None, json_out: bool = True) -> str:
