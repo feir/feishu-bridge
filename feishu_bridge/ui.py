@@ -1390,6 +1390,18 @@ class ResponseHandle:
             suffix = f" ({atype})" if atype else ""
             if a.get("status") == "completed":
                 parts.append(f"~~☑ {desc}{suffix}~~")
+                result = a.get("result_text")
+                if result:
+                    # Show first 500 chars inline
+                    summary = result[:500] + ("…" if len(result) > 500 else "")
+                    parts.append(f"  ── Output ──\n  {summary}")
+                # Activity lines (from runner subagent tracking)
+                activities = a.get("activities")
+                if activities:
+                    parts.append("  " + "\n  ".join(activities[:8]))
+                usage = a.get("usage")
+                if usage:
+                    parts.append(f"  {usage}")
             else:
                 parts.append(f"◉ **{desc}{suffix}**")
 
@@ -1412,7 +1424,13 @@ class ResponseHandle:
         existing = {a.get("description") for a in self._active_agents}
         for a in launches:
             if a.get("description") not in existing:
-                self._active_agents.append({"status": "in_progress", **a})
+                self._active_agents.append({
+                    "status": "in_progress",
+                    "result_text": None,
+                    "activities": None,
+                    "usage": None,
+                    **a,
+                })
                 existing.add(a.get("description"))
         self._render_progress()
 
