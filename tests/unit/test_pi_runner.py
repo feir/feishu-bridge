@@ -304,6 +304,18 @@ def test_normalize_pi_tool():
     assert PiRunner._normalize_pi_tool("") == ""
 
 
+def test_normalize_pi_tool_web_search():
+    assert PiRunner._normalize_pi_tool("web_search") == "WebSearch"
+
+
+def test_normalize_pi_tool_web_fetch():
+    assert PiRunner._normalize_pi_tool("web_fetch") == "WebFetch"
+
+
+def test_normalize_pi_tool_get_subagent_result():
+    assert PiRunner._normalize_pi_tool("get_subagent_result") == "GetSubagentResult"
+
+
 def test_tool_status_single_emit_per_id(tmp_path):
     """toolcall_* is authoritative; tool_execution_* is a no-op; one entry."""
     runner = _runner(tmp_path)
@@ -385,6 +397,17 @@ def test_extract_hint_subagent():
     assert _extract_hint_data("Subagent", {"agent": "scout"}) == "scout"
     assert _extract_hint_data("Subagent", {"task": "分析代码"}) == "分析代码"
     assert _extract_hint_data("Subagent", {}) == ""
+
+
+def test_extract_hint_get_subagent_result():
+    from feishu_bridge.runtime import _extract_hint_data
+    result = _extract_hint_data("GetSubagentResult", {"subagentId": "subagent-abc-def-ghi-jkl"})
+    assert result == "subagent-abc-def-ghi-jkl"
+    assert len(result) <= 60
+    # subagent_id alias
+    assert _extract_hint_data("GetSubagentResult", {"subagent_id": "sb-123"}) == "sb-123"
+    # empty
+    assert _extract_hint_data("GetSubagentResult", {}) == ""
 
 
 def test_extract_hint_subagent_tasks_multi():

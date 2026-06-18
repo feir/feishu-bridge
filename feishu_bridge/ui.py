@@ -1195,6 +1195,7 @@ class ResponseHandle:
         "Debug": "调试程序",
         "Search": "搜索代码",
         "Resolve": "确认操作",
+        "GetSubagentResult": "查询后台任务",
     }
 
     @staticmethod
@@ -1215,6 +1216,10 @@ class ResponseHandle:
                 return host
             except Exception:
                 return hint_data[:40]
+        if tool_name == "WebSearch":
+            return (hint_data or "")[:40]
+        if tool_name == "GetSubagentResult":
+            return (hint_data[:16] + "…") if len(hint_data) > 16 else hint_data
         return hint_data
 
     @staticmethod
@@ -1238,6 +1243,12 @@ class ResponseHandle:
                 hint_data = tc.get("hint_data", "")
 
             if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task", "Subagent"):
+                # Skipped tools (rendered elsewhere) still signal that prior tool
+                # work has moved on — mark any in-flight entries done so the user
+                # sees ✅ instead of a permanently ⌛ on the last real tool.
+                for prev in self._tool_history:
+                    if prev["status"] == "running":
+                        prev["status"] = "done"
                 continue
 
             if name.startswith("mcp__"):
@@ -1260,6 +1271,9 @@ class ResponseHandle:
                 last = self._tool_history[-1]
                 if last["label"] == label and last["hint"] == hint:
                     last["count"] += 1
+                    # Same tool repeating = new active invocation. If a prior skip
+                    # (e.g. Subagent dispatch) marked it done, restore running.
+                    last["status"] = "running"
                     continue
 
             # Mark previous entries as done

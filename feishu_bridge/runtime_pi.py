@@ -30,12 +30,12 @@ class PiRunner(BaseRunner):
         "write": "Write",
         "edit": "Edit",
         "ls": "Ls",
-        "list": "Ls",
         "grep": "Grep",
-        "search": "Grep",
         "find": "Find",
-        "glob": "Glob",
         "subagent": "Subagent",
+        "web_search": "WebSearch",
+        "web_fetch": "WebFetch",
+        "get_subagent_result": "GetSubagentResult",
     }
 
     @classmethod

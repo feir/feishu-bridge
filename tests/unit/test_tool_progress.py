@@ -181,6 +181,19 @@ class TestFormatToolHint:
     def test_webfetch_host_only(self, fmt):
         assert fmt("WebFetch", "https://example.com/") == "example.com"
 
+    def test_websearch_truncates(self, fmt):
+        assert fmt("WebSearch", "short query") == "short query"
+        long_query = "a" * 60
+        assert fmt("WebSearch", long_query) == "a" * 40
+
+    def test_get_subagent_result_truncates(self, fmt):
+        short = "subagent-abc"
+        assert fmt("GetSubagentResult", short) == "subagent-abc"
+        long = "subagent-01234567-89ab-cdef-0123-456789abcdef"
+        result = fmt("GetSubagentResult", long)
+        assert result == "subagent-0123456…"
+        assert len(result) == 17  # 16 chars + …
+
 
 class TestMcpDisplayName:
     """Tests for ResponseHandle._mcp_display_name (static method)."""
@@ -338,6 +351,23 @@ class TestToolStatusUpdateDedup:
         ])
         assert len(handle._tool_history) == 0
 
+    def test_tool_status_update_skip_marks_prior_running_as_done(self, handle):
+        """When a skipped tool (Subagent, etc.) arrives, prior in-flight
+        tool entries should be marked done, not left as running forever."""
+        # Push WebFetch tool_call → 1 entry status=running
+        handle.tool_status_update([
+            {"name": "WebFetch", "hint_data": "https://example.com"},
+        ])
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["status"] == "running"
+        # Push Subagent tool_call → skipped, but marks prior running → done
+        handle.tool_status_update([
+            {"name": "Subagent", "hint_data": ""},
+        ])
+        # History still has 1 entry (Subagent skipped), but WebFetch is done
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["status"] == "done"
+
     def test_tool_status_update_without_main_card_accumulates_history(self, handle):
         """tool_status_update accumulates _tool_history even when no main card exists.
 
@@ -367,6 +397,31 @@ class TestToolStatusUpdateDedup:
         assert len(handle._tool_history) == 1
         assert handle._tool_history[0]["label"] == "执行命令"
         handle._render_progress.assert_called_once()
+
+    def test_repeat_after_skip_restores_running(self, handle):
+        """When a skipped tool (Subagent) marks a prior entry done,
+        repeating the same tool should restore running status."""
+        # Step 1: WebFetch → entry status=running, count=1
+        handle.tool_status_update([
+            {"name": "WebFetch", "hint_data": "https://example.com"},
+        ])
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["status"] == "running"
+        assert handle._tool_history[0]["count"] == 1
+        # Step 2: Subagent → skip, marks prior running → done
+        handle.tool_status_update([
+            {"name": "Subagent", "hint_data": ""},
+        ])
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["status"] == "done"
+        assert handle._tool_history[0]["count"] == 1
+        # Step 3: WebFetch (same hint) → repeat entry, restore running
+        handle.tool_status_update([
+            {"name": "WebFetch", "hint_data": "https://example.com"},
+        ])
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["status"] == "running"
+        assert handle._tool_history[0]["count"] == 2
 
     def test_mark_agents_completed_marks_not_clears(self, handle):
         """_mark_agents_completed should mark agents as completed, not clear them."""

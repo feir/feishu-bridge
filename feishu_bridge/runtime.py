@@ -555,6 +555,8 @@ def _extract_hint_data(tool_name: str, tool_input: dict) -> str:
         return (tool_input.get("query") or "")[:40]
     if tool_name == "WebFetch":
         return (tool_input.get("url") or "")[:60]
+    if tool_name == "GetSubagentResult":
+        return (tool_input.get("subagentId") or tool_input.get("subagent_id") or "")[:60]
     if tool_name == "Ls":
         # Pi `ls` tool: single directory path.
         return (tool_input.get("path") or tool_input.get("file_path") or "")
