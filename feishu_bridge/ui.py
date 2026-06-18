@@ -950,7 +950,7 @@ class ResponseHandle:
         self._terminated = False
         self._tool_msg_id: Optional[str] = None
         self._tool_card_first: bool = True
-        self._last_tool_card_update: float = 0.0
+        self._tool_card_finalized: bool = False
         self._handle_start_time: float = time.time()
         self._runner: Optional[ClaudeRunner] = None
         self._runner_tag: Optional[str] = None
@@ -1052,31 +1052,34 @@ class ResponseHandle:
         mark the outbox row as sent, else the user never sees the reply and
         the watcher stops retrying.
         """
-        if self._card_fallback_timer:
-            self._card_fallback_timer.cancel()
-            self._card_fallback_timer = None
-        if self._terminated:
-            log.info("Deliver skipped: message unavailable (recalled/deleted)")
-            return False
-        if self._typing_reaction_id and self.source_message_id:
-            remove_typing_indicator(
-                self.client, self.source_message_id, self._typing_reaction_id)
-            self._typing_reaction_id = None
-        if not self.card_message_id:
-            self._ensure_card()
-        if self._flush_ctrl:
-            self._flush_ctrl.drain()
-        log.info("Deliver: content_len=%d is_error=%s cardkit=%s",
-                 len(content), is_error,
-                 bool(self._use_cardkit and self._cardkit_card_id))
-        if self._use_cardkit and self._cardkit_card_id:
-            return self._deliver_cardkit(content, is_error,
-                                         last_call_usage=last_call_usage,
-                                         model_name=model_name,
-                                         project_label=project_label,
-                                         context_alert=context_alert)
-        return self._deliver_im_patch(content, is_error,
-                                      context_alert=context_alert)
+        try:
+            if self._card_fallback_timer:
+                self._card_fallback_timer.cancel()
+                self._card_fallback_timer = None
+            if self._terminated:
+                log.info("Deliver skipped: message unavailable (recalled/deleted)")
+                return False
+            if self._typing_reaction_id and self.source_message_id:
+                remove_typing_indicator(
+                    self.client, self.source_message_id, self._typing_reaction_id)
+                self._typing_reaction_id = None
+            if not self.card_message_id:
+                self._ensure_card()
+            if self._flush_ctrl:
+                self._flush_ctrl.drain()
+            log.info("Deliver: content_len=%d is_error=%s cardkit=%s",
+                     len(content), is_error,
+                     bool(self._use_cardkit and self._cardkit_card_id))
+            if self._use_cardkit and self._cardkit_card_id:
+                return self._deliver_cardkit(content, is_error,
+                                             last_call_usage=last_call_usage,
+                                             model_name=model_name,
+                                             project_label=project_label,
+                                             context_alert=context_alert)
+            return self._deliver_im_patch(content, is_error,
+                                          context_alert=context_alert)
+        finally:
+            self._finalize_tool_card()
 
     def _deliver_cardkit(self, content: str, is_error: bool,
                          last_call_usage: dict | None = None,
@@ -1113,7 +1116,10 @@ class ResponseHandle:
 
         elapsed_s = time.time() - self._handle_start_time
         seq = self._next_seq()
-        tool_panels = self._build_tool_panels() if self._tool_history else None
+        tool_panels = None
+        if not self._tool_msg_id and self._tool_history:
+            # Independent tool card was never created → fallback embed
+            tool_panels = self._build_tool_panels()
         final_card_json = build_cardkit_final_card(
             content, is_error, elapsed_s=elapsed_s,
             last_call_usage=last_call_usage,
@@ -1537,12 +1543,10 @@ class ResponseHandle:
             log.exception("Tool card send error")
         return None
 
-    _TOOL_CARD_THROTTLE_S = 0.8
-
     def _update_tool_card(self, panels: list[dict]):
         """Update or create the tool progress card via IM API.
 
-        Throttled to at most one patch per _TOOL_CARD_THROTTLE_S seconds.
+        No throttle — every update is sent immediately.
         """
         if not panels:
             return
@@ -1551,13 +1555,7 @@ class ResponseHandle:
             msg_id = self._send_tool_card(panels)
             if msg_id:
                 self._tool_msg_id = msg_id
-                self._last_tool_card_update = time.monotonic()
             return
-
-        now = time.monotonic()
-        if now - self._last_tool_card_update < self._TOOL_CARD_THROTTLE_S:
-            return
-        self._last_tool_card_update = now
 
         running = len(self._tool_history)
         status_text = f"**执行中 ({running})**"
@@ -1588,6 +1586,61 @@ class ResponseHandle:
                 log.error("Tool card patch failed: code=%s msg=%s", resp.code, resp.msg)
         except Exception:
             log.exception("Tool card patch error")
+
+    def _force_patch_tool_card(self, panels: list[dict], status_text: str):
+        """Force-patch the standalone tool card without any throttle/gate checks.
+
+        Used only by ``_finalize_tool_card`` for the terminal done state.
+        Errors are logged but never raised.
+        """
+        try:
+            card = {
+                "schema": "2.0",
+                "body": {
+                    "elements": [
+                        {"tag": "markdown", "content": status_text},
+                        *panels,
+                    ]
+                }
+            }
+            card_json = json.dumps(card, ensure_ascii=False)
+            resp = self.client.im.message.patch(
+                PatchMessageRequest.builder()
+                    .message_id(self._tool_msg_id)
+                    .request_body(
+                        PatchMessageRequestBody.builder()
+                            .content(card_json)
+                            .build()
+                    )
+                    .build()
+            )
+            if not resp.success():
+                log.error("Tool card final force patch failed: code=%s msg=%s", resp.code, resp.msg)
+        except Exception:
+            log.warning("Tool card final force patch error", exc_info=True)
+
+    def _finalize_tool_card(self):
+        """Mark all tool entries as done and force-patch the standalone tool card.
+
+        Idempotent — double-call is safe (second call no-ops).
+        Called from ``deliver()`` finally to guarantee the tool card shows
+        terminal done state regardless of how deliver exits.
+        """
+        if self._tool_card_finalized:
+            return
+        self._tool_card_finalized = True
+
+        # Mark all entries as done (guards against missing end events).
+        for entry in self._tool_history:
+            entry["status"] = "done"
+            entry.setdefault("tool_call_ids", set()).clear()
+
+        if not self._tool_msg_id or not self._tool_history:
+            return
+
+        panels = self._build_tool_panels_for_streaming()
+        status_text = f"**完成 ({len(self._tool_history)})**"
+        self._force_patch_tool_card(panels, status_text)
 
     def agent_list_update(self, launches: list[dict]):
         """Update agent list when new agents are dispatched."""

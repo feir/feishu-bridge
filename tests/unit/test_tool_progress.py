@@ -1,10 +1,11 @@
 """Unit tests for tool progress display: _extract_hint_data, _format_tool_hint,
 _mcp_display_name, and tool_status_update dedup/normalization logic."""
 
+import json
 import logging
 import threading
 from collections import deque
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -596,3 +597,369 @@ class TestToolStatusEndUpdate:
         assert "nonexistent not found in history" in caplog.text
         # status unchanged (can't be marked done without end event; F-3 handles it)
         assert handle._tool_history[0]["status"] == "running"
+
+
+# ---- F-3: throttle removal / _update_tool_card immediate ----
+
+
+class TestUpdateToolCardNoThrottle:
+    """F-3.2: _update_tool_card patches immediately, no throttle."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._tool_history = deque(maxlen=8)
+        h._tool_msg_id = "om_tool_existing"
+        h._terminated = False
+        h.client = MagicMock()
+        # Mock patch to succeed
+        mock_resp = MagicMock()
+        mock_resp.success.return_value = True
+        h.client.im.message.patch.return_value = mock_resp
+        return h
+
+    def test_update_tool_card_no_throttle_patches_every_update(self, handle):
+        """5 consecutive _update_tool_card calls → 5 patch calls (no throttle)."""
+        mock_patch = handle.client.im.message.patch
+
+        for i in range(5):
+            panels = [{"tag": "markdown", "content": f"panel_{i}"}]
+            handle._update_tool_card(panels)
+
+        assert mock_patch.call_count == 5
+        # Last call should contain the 5th panel
+        last_call = mock_patch.call_args_list[-1]
+        req = last_call[0][0]
+        body_content = req.request_body.content
+        assert "panel_4" in body_content
+
+
+# ---- F-3: _finalize_tool_card ----
+
+
+class TestFinalizeToolCard:
+    """F-3.3: _finalize_tool_card marks done and force-patches once."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._tool_history = deque(maxlen=8)
+        h._tool_msg_id = "om_tool_final"
+        h._tool_card_finalized = False
+        h._terminated = False
+        h._seq_lock = threading.Lock()
+        h._cardkit_card_id = None
+        h._active_agents = []
+        h.client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.success.return_value = True
+        h.client.im.message.patch.return_value = mock_resp
+        return h
+
+    def test_finalize_tool_card_marks_done_and_force_patches_once(self, handle):
+        """2 running entries → finalize marks done, force-patches once."""
+        # Set up 2 running entries with tool_call_ids
+        handle._tool_history.append({
+            "name": "Read", "label": "读取文件", "hint": "foo.py",
+            "count": 1, "status": "running",
+            "tool_call_ids": {"A"},
+        })
+        handle._tool_history.append({
+            "name": "Bash", "label": "执行命令", "hint": "git status",
+            "count": 1, "status": "running",
+            "tool_call_ids": {"B"},
+        })
+
+        # Call twice — second should no-op
+        handle._finalize_tool_card()
+        handle._finalize_tool_card()
+
+        # All entries marked done
+        assert handle._tool_history[0]["status"] == "done"
+        assert handle._tool_history[0]["tool_call_ids"] == set()
+        assert handle._tool_history[1]["status"] == "done"
+        assert handle._tool_history[1]["tool_call_ids"] == set()
+
+        # Patch called only once
+        mock_patch = handle.client.im.message.patch
+        assert mock_patch.call_count == 1
+
+        # status_text = "**完成 (2)**"
+        call = mock_patch.call_args
+        req = call[0][0]
+        body_content = req.request_body.content
+        assert "**完成 (2)**" in body_content
+
+    def test_finalize_tool_card_no_msg_id_noop(self, handle):
+        """When _tool_msg_id is None, finalize still marks done but no patch."""
+        handle._tool_msg_id = None
+        handle._tool_history.append({
+            "name": "Read", "label": "读取文件", "hint": "foo.py",
+            "count": 1, "status": "running",
+            "tool_call_ids": {"A"},
+        })
+        handle._finalize_tool_card()
+        assert handle._tool_history[0]["status"] == "done"
+        handle.client.im.message.patch.assert_not_called()
+
+    def test_finalize_no_history_no_patch(self, handle):
+        """Empty history → no patch."""
+        handle._finalize_tool_card()
+        handle.client.im.message.patch.assert_not_called()
+
+
+# ---- F-3: deliver() finally calls _finalize_tool_card ----
+
+
+class TestDeliverCallsFinalize:
+    """F-3.4: All deliver paths call _finalize_tool_card in finally."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._use_cardkit = False
+        h._cardkit_card_id = None
+        h.card_message_id = "om_main"
+        h._terminated = False
+        h._typing_reaction_id = None
+        h._flush_ctrl = None
+        h._card_fallback_timer = None
+        h._tool_card_finalized = False
+        h._tool_msg_id = None
+        h._tool_history = deque(maxlen=8)
+        h._handle_start_time = 1000.0
+        h._seq_lock = threading.Lock()
+        h._cardkit_seq = 0
+        h.source_message_id = "om_src"
+        h.thread_id = None
+        h.chat_id = "oc_chat"
+        h.bot_id = "bot_1"
+        h._last_todos = None
+        h._active_agents = []
+        h.client = MagicMock()
+        # Mock _try_patch to succeed
+        h._try_patch = MagicMock(return_value=True)
+        # Capture _finalize_tool_card
+        h._finalize_tool_card = MagicMock()
+        h._deliver_im_patch = MagicMock(return_value=True)
+        return h
+
+    def test_deliver_calls_finalize_on_im_patch_path(self, handle):
+        """Non-cardkit deliver → _finalize_tool_card called once."""
+        handle.deliver("hello")
+        handle._finalize_tool_card.assert_called_once()
+
+    def test_deliver_calls_finalize_on_cardkit_success(self, handle):
+        """CardKit deliver success path → _finalize_tool_card called once."""
+        handle._use_cardkit = True
+        handle._cardkit_card_id = "ck_card_1"
+
+        # Mock cardkit settings + update to succeed
+        mock_settings_resp = MagicMock()
+        mock_settings_resp.success.return_value = True
+        handle.client.cardkit.v1.card.settings.return_value = mock_settings_resp
+
+        mock_update_resp = MagicMock()
+        mock_update_resp.success.return_value = True
+        handle.client.cardkit.v1.card.update.return_value = mock_update_resp
+
+        handle.deliver("hello")
+        handle._finalize_tool_card.assert_called_once()
+
+    def test_deliver_calls_finalize_on_cardkit_settings_failure_fallback(self, handle):
+        """CardKit settings fail → fallback to IM → _finalize_tool_card."""
+        handle._use_cardkit = True
+        handle._cardkit_card_id = "ck_card_1"
+
+        mock_resp = MagicMock()
+        mock_resp.success.return_value = False
+        mock_resp.code = -1
+        mock_resp.msg = "error"
+        handle.client.cardkit.v1.card.settings.return_value = mock_resp
+
+        handle.deliver("hello")
+        handle._finalize_tool_card.assert_called_once()
+        # Fallback to IM was called
+        handle._deliver_im_patch.assert_called_once()
+
+    def test_deliver_calls_finalize_on_cardkit_update_failure_fallback(self, handle):
+        """CardKit update fails → fallback to IM → _finalize_tool_card."""
+        handle._use_cardkit = True
+        handle._cardkit_card_id = "ck_card_1"
+
+        mock_settings_resp = MagicMock()
+        mock_settings_resp.success.return_value = True
+        handle.client.cardkit.v1.card.settings.return_value = mock_settings_resp
+
+        mock_update_resp = MagicMock()
+        mock_update_resp.success.return_value = False
+        mock_update_resp.code = -1
+        mock_update_resp.msg = "update error"
+        handle.client.cardkit.v1.card.update.return_value = mock_update_resp
+
+        handle.deliver("hello")
+        handle._finalize_tool_card.assert_called_once()
+        # Fallback to IM was called
+        handle._deliver_im_patch.assert_called_once()
+
+
+# ---- F-5: main card tool panel fallback ----
+
+
+class TestMainCardToolPanelFallback:
+    """F-5: Main card only embeds tool panels on fallback (no standalone tool card)."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._use_cardkit = True
+        h._cardkit_card_id = "ck_card_1"
+        h.card_message_id = "om_main"
+        h._handle_start_time = 1000.0
+        h._seq_lock = threading.Lock()
+        h._cardkit_seq = 0
+        h._terminated = False
+        h._typing_reaction_id = None
+        h._flush_ctrl = None
+        h._card_fallback_timer = None
+        h._tool_msg_id = None
+        h._tool_history = deque(maxlen=8)
+        h._tool_card_finalized = False
+        h.source_message_id = "om_src"
+        h.thread_id = None
+        h.chat_id = "oc_chat"
+        h.bot_id = "bot_1"
+        h._last_todos = None
+        h._active_agents = []
+        h.client = MagicMock()
+        # Mock _try_patch to succeed
+        h._try_patch = MagicMock(return_value=True)
+        # Capture build_cardkit_final_card for inspection
+        return h
+
+    def test_deliver_final_card_no_tool_panels_when_tool_card_exists(
+            self, handle, monkeypatch):
+        """When _tool_msg_id exists, final card has no tool collapsible_panel."""
+        handle._tool_msg_id = "om_tool"
+        handle._tool_history.append({
+            "name": "Bash", "label": "执行命令", "hint": "git",
+            "count": 1, "status": "running",
+            "tool_call_ids": {"A"},
+        })
+
+        # Mock cardkit settings + update to succeed
+        mock_settings_resp = MagicMock()
+        mock_settings_resp.success.return_value = True
+        handle.client.cardkit.v1.card.settings.return_value = mock_settings_resp
+
+        captured_card = {}
+
+        def fake_update(req):
+            captured_card["data"] = json.loads(req.request_body.card.data)
+            mock_resp = MagicMock()
+            mock_resp.success.return_value = True
+            return mock_resp
+
+        handle.client.cardkit.v1.card.update = fake_update
+
+        handle.deliver("hello")
+
+        body_elements = captured_card["data"].get("body", {}).get("elements", [])
+        contains_collapsible = any(
+            el.get("tag") == "collapsible_panel" for el in body_elements
+        )
+        assert not contains_collapsible, (
+            "Final card should NOT contain tool collapsible_panel "
+            "when standalone tool card exists"
+        )
+
+    def test_deliver_final_card_fallback_embeds_tool_panels_when_no_tool_card(
+            self, handle, monkeypatch):
+        """When _tool_msg_id=None, final card includes tool collapsible_panel."""
+        handle._tool_msg_id = None
+        handle._tool_history.append({
+            "name": "Bash", "label": "执行命令", "hint": "git",
+            "count": 1, "status": "running",
+            "tool_call_ids": {"A"},
+        })
+
+        mock_settings_resp = MagicMock()
+        mock_settings_resp.success.return_value = True
+        handle.client.cardkit.v1.card.settings.return_value = mock_settings_resp
+
+        captured_card = {}
+
+        def fake_update(req):
+            captured_card["data"] = json.loads(req.request_body.card.data)
+            mock_resp = MagicMock()
+            mock_resp.success.return_value = True
+            return mock_resp
+
+        handle.client.cardkit.v1.card.update = fake_update
+
+        handle.deliver("hello")
+
+        body_elements = captured_card["data"].get("body", {}).get("elements", [])
+        contains_collapsible = any(
+            el.get("tag") == "collapsible_panel" for el in body_elements
+        )
+        assert contains_collapsible, (
+            "Final card SHOULD contain tool collapsible_panel "
+            "as fallback when standalone tool card was never created"
+        )
+
+
+# ---- F-3.6: _build_tool_panels_for_streaming header dynamic ----
+
+
+class TestBuildToolPanelsForStreamingHeaders:
+    """F-3.6: Panel headers show ✅ for done, ⏳ for running."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._tool_history = deque(maxlen=8)
+        return h
+
+    def test_build_tool_panels_for_streaming_done_headers(self, handle):
+        """Done entry → header content contains ✅; running → ⏳."""
+        handle._tool_history.append({
+            "name": "Read", "label": "读取文件", "hint": "a.py",
+            "count": 1, "status": "running",
+            "tool_call_ids": set(),
+        })
+        handle._tool_history.append({
+            "name": "Bash", "label": "执行命令", "hint": "git",
+            "count": 1, "status": "done",
+            "tool_call_ids": set(),
+        })
+
+        panels = handle._build_tool_panels_for_streaming()
+        assert len(panels) == 2
+
+        # First panel (running) → ⏳
+        header_0 = panels[0]["header"]["title"]["content"]
+        assert "⏳" in header_0
+
+        # Second panel (done) → ✅
+        header_1 = panels[1]["header"]["title"]["content"]
+        assert "✅" in header_1
+
+    def test_all_done_panels_have_checkmark(self, handle):
+        """After _finalize_tool_card, all panels show ✅."""
+        handle._tool_history.append({
+            "name": "Read", "label": "读取文件", "hint": "a.py",
+            "count": 1, "status": "done",
+            "tool_call_ids": set(),
+        })
+        handle._tool_history.append({
+            "name": "Bash", "label": "执行命令", "hint": "git",
+            "count": 1, "status": "done",
+            "tool_call_ids": set(),
+        })
+
+        panels = handle._build_tool_panels_for_streaming()
+        for p in panels:
+            header = p["header"]["title"]["content"]
+            assert "✅" in header
+            assert "⏳" not in header
