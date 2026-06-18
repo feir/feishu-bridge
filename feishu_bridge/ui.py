@@ -763,7 +763,8 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
                              model_name: str | None = None,
                              project_label: str | None = None,
                              todos: list[dict] | None = None,
-                             context_alert: str | None = None) -> dict:
+                             context_alert: str | None = None,
+                             tool_panels: list[dict] | None = None) -> dict:
     # P1: parse action markers BEFORE optimize (Finding 6 ordering fix)
     content, markers = parse_action_markers(content)
     content = optimize_markdown_style(content)
@@ -810,6 +811,10 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
                 "elements": url_buttons,
             }],
         })
+
+    # Tool collapsible panels (from Pi runner tool history)
+    if tool_panels:
+        elements.extend(tool_panels)
 
     # Footer: all status info in one notation-sized element
     # Line 1: ✅ 9/9 tasks · model · elapsed · tokens · project
@@ -1118,12 +1123,14 @@ class ResponseHandle:
 
         elapsed_s = time.time() - self._handle_start_time
         seq = self._next_seq()
+        tool_panels = self._build_tool_panels() if self._tool_history else None
         final_card_json = build_cardkit_final_card(
             content, is_error, elapsed_s=elapsed_s,
             last_call_usage=last_call_usage,
             chat_id=self.chat_id, bot_id=self.bot_id,
             model_name=model_name, project_label=project_label,
-            todos=self._last_todos, context_alert=context_alert)
+            todos=self._last_todos, context_alert=context_alert,
+            tool_panels=tool_panels)
         card_data = json.dumps(final_card_json, ensure_ascii=False)
         log.info("CardKit card.update: card_id=%s content_len=%d payload_bytes=%d seq=%d",
                  card_id, len(content), len(card_data.encode("utf-8")), seq)
@@ -1270,7 +1277,7 @@ class ResponseHandle:
                     last["count"] += 1
                     continue
 
-            self._tool_history.append({"label": label, "hint": hint, "count": 1})
+            self._tool_history.append({"name": name, "label": label, "hint": hint, "count": 1})
 
         if self._tool_history:
             latest = self._tool_history[-1]
@@ -1352,13 +1359,21 @@ class ResponseHandle:
         self._loading_icon_cleared = True
         self._update_element(CARDKIT_LOADING_ELEMENT_ID, "")
 
+    _MAX_TOOL_HISTORY_DISPLAY = 8
+
     def _render_progress(self):
         """Render combined tool history + agent + todo progress."""
         if not self._cardkit_card_id:
             return
         parts = []
 
-        for entry in self._tool_history:
+        # Tool history: show last N, collapse prefix for older
+        max_display = self._MAX_TOOL_HISTORY_DISPLAY
+        total = len(self._tool_history)
+        visible = self._tool_history[-max_display:] if total > max_display else self._tool_history
+        if total > max_display:
+            parts.append(f"... 前 {total - max_display} 次操作已折叠")
+        for entry in visible:
             label = entry["label"]
             hint = entry["hint"]
             count = entry["count"]
@@ -1422,6 +1437,55 @@ class ResponseHandle:
         self._last_todos = todos
         self._render_progress()
 
+    _MAX_TOOL_PANELS = 10
+    _MAX_PANEL_RESULT_CHARS = 2000
+
+    def _build_tool_panels(self) -> list[dict]:
+        """Build CardKit v2 collapsible_panel elements from tool_history.
+
+        Returns a list of element dicts ready for card body.elements.
+        Only the last MAX_TOOL_PANELS entries are included.
+        """
+        if not self._tool_history:
+            return []
+
+        entries = list(self._tool_history)
+        total = len(entries)
+        visible = entries[-self._MAX_TOOL_PANELS:] if total > self._MAX_TOOL_PANELS else entries
+
+        panels: list[dict] = []
+        if total > self._MAX_TOOL_PANELS:
+            panels.append({
+                "tag": "markdown",
+                "content": f"... 前 {total - self._MAX_TOOL_PANELS} 次操作已折叠",
+                "text_size": "notation",
+            })
+
+        for entry in visible:
+            panel = {
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                    "title": {
+                        "tag": "markdown",
+                        "content": f"▸ **{entry['label']}**"
+                                   + (f" `{entry['hint']}`" if entry.get("hint") else "")
+                                   + (f" ×{entry['count']}" if entry.get("count", 1) > 1 else ""),
+                    },
+                },
+                "elements": [
+                    {"tag": "markdown", "content": "**工具名**: " + entry.get("name", entry["label"])},
+                ],
+            }
+            if entry.get("hint"):
+                panel["elements"].append({
+                    "tag": "markdown",
+                    "content": f"**参数摘要**: `{entry['hint']}`",
+                })
+            panels.append(panel)
+
+        return panels
+
     def _update_summary_to_typing(self):
         """Switch CardKit summary from '思考中...' to '输入中...' on first content."""
         if self._summary_updated or not self._cardkit_card_id:
@@ -1431,9 +1495,8 @@ class ResponseHandle:
 
     def _perform_flush(self, text: str):
         if self._use_cardkit and self._cardkit_card_id:
-            if self._tool_history:
-                self._tool_history.clear()
-                self._render_progress()
+            # ponytail: keep tool_history visible during streaming;
+            # previously cleared here, now _render_progress limits display.
             self._mark_agents_completed()
             self._update_summary_to_typing()
             text = strip_action_markers(text)
