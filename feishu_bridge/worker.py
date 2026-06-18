@@ -446,8 +446,8 @@ def _build_quota_alert(result: dict, quota_snapshot=None, runner=None,
                 parts.append("🔴 DeepSeek 余额已耗尽")
             elif ds.balance < 50:
                 parts.append(f"⚠️ DeepSeek 余额 ¥{ds.balance:.2f}，建议充值")
-    elif rt in ("claude", "pi"):
-        # Claude path (pi defaults here unless primary model is Codex/DeepSeek)
+    else:
+        # Claude path — default / pi / unknown / backward-compat
         if quota_snapshot and quota_snapshot.available and not quota_snapshot.stale:
             for key, label in WINDOW_LABELS.items():
                 if key in covered_windows:
@@ -463,8 +463,8 @@ def _build_quota_alert(result: dict, quota_snapshot=None, runner=None,
                     reset_str = f" 重置 {hours}h{mins:02d}m" if remaining > 0 else ""
                     parts.append(f"{icon} {label}: {util_pct:.0f}%{reset_str}")
 
-    # 4. Cookie expiry warning (Claude only)
-    if rt in ("claude", "pi") and not is_deepseek and quota_snapshot:
+    # 4. Cookie expiry warning (skip for codex/deepseek routes)
+    if rt not in ("codex",) and not is_deepseek and quota_snapshot:
         cookie_warn = quota_snapshot.cookie_expiry_warning
         if cookie_warn:
             parts.append(cookie_warn)
