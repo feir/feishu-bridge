@@ -30,9 +30,9 @@ class TestLoad:
 
     def test_partial_load(self, tmp_path):
         p = tmp_path / "state.json"
-        p.write_text('{"agent_type": "alma"}')
+        p.write_text('{"agent_type": "claude"}')
         state = RuntimeState.load(p)
-        assert state.agent_type == "alma"
+        assert state.agent_type == "claude"
         assert state.provider is None
         assert state.model_override is None
 
@@ -120,7 +120,7 @@ class TestSave:
 
     def test_omit_none_keys(self, tmp_path):
         p = tmp_path / "state.json"
-        RuntimeState(agent_type="alma").save(p)
+        RuntimeState(agent_type="claude").save(p)
         data = json.loads(p.read_text())
         assert "agent_type" in data
         assert "provider" not in data
@@ -152,7 +152,7 @@ class TestSave:
 
 
 class TestValidate:
-    RUNNER_CLASSES = {"claude": object, "codex": object, "alma": object}
+    RUNNER_CLASSES = {"claude": object, "codex": object}
     PROVIDER_PROFILES = {"default": {}, "omlx": {}, "pi-local": {}}
 
     def test_valid_all_fields(self):

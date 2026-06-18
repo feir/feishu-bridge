@@ -1266,8 +1266,14 @@ class ResponseHandle:
         return tool_name
 
     def tool_status_update(self, tool_calls: list):
-        """Update tool history and render progress."""
-        if self._terminated or self._summary_updated:
+        """Update tool history and render progress.
+
+        Note: only guards on ``_terminated``. ``_summary_updated`` is a one-shot
+        flag for the CardKit summary text patch (思考中→输入中); gating tool
+        history on it silently dropped every tool call after the first text
+        chunk, so the user saw no tool card and an empty tool history (Bug X).
+        """
+        if self._terminated:
             return
 
         for tc in tool_calls:
@@ -1278,6 +1284,28 @@ class ResponseHandle:
                 name = tc.get("name", "")
                 hint_data = tc.get("hint_data", "")
                 call_id = tc.get("id")
+
+            # ── tool_execution_start backfill: store execution args ──
+            if isinstance(tc, dict) and "_exec_args" in tc:
+                if call_id and self._tool_history:
+                    exec_args = tc["_exec_args"]
+                    for entry in reversed(self._tool_history):
+                        if call_id in entry.get("tool_call_ids", set()):
+                            entry["exec_args"] = exec_args
+                            break
+                continue
+
+            # ── tool_execution_end backfill: store execution result ──
+            if isinstance(tc, dict) and "_exec_result" in tc:
+                if call_id and self._tool_history:
+                    exec_result = tc["_exec_result"]
+                    is_err = tc.get("_is_error", False)
+                    for entry in reversed(self._tool_history):
+                        if call_id in entry.get("tool_call_ids", set()):
+                            entry["exec_result"] = exec_result
+                            entry["result_is_error"] = is_err
+                            break
+                continue
 
             if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task", "Subagent"):
                 # Skipped tools (rendered elsewhere) still signal that prior tool
@@ -1469,6 +1497,79 @@ class ResponseHandle:
                 log.warning("tool_status_end_update: id %s not found in history", eid)
         self._render_progress()
 
+    # ── Exec args/result truncation limits ──
+    _MAX_EXEC_ARGS_CHARS = 800
+    _MAX_EXEC_RESULT_CHARS = 1500
+
+    @classmethod
+    def _extract_result_text(cls, result) -> str:
+        """Extract readable text from pi's result envelope.
+
+        pi wraps tool output as
+        ``{"content": [{"type": "text", "text": "..."}]}``.
+        Falls back to ``repr()`` for unexpected shapes.
+        """
+        if not isinstance(result, dict):
+            return str(result)[:cls._MAX_EXEC_RESULT_CHARS]
+        content = result.get("content", [])
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text", "")
+                    if text:
+                        parts.append(str(text))
+            if parts:
+                return "\n".join(parts)
+        return json.dumps(result, ensure_ascii=False)
+
+    def _build_tool_panel_elements(
+        self, entry: dict, name: str, hint: str
+    ) -> list[dict]:
+        """Build the ``elements`` list for a single collapsible tool panel.
+
+        pi-feishu parity: displays tool name, parameter summary, input
+        args (JSON block), and output result (code block) when available.
+        """
+        elements: list[dict] = [
+            {"tag": "markdown", "content": f"**工具名**: {name}"},
+        ]
+        if hint:
+            elements.append(
+                {"tag": "markdown", "content": f"**参数摘要**: `{hint}`"})
+
+        # Input args (from tool_execution_start).
+        exec_args = entry.get("exec_args")
+        if exec_args:
+            args_json = json.dumps(exec_args, ensure_ascii=False, indent=2)
+            if len(args_json) > self._MAX_EXEC_ARGS_CHARS:
+                args_json = (
+                    args_json[:self._MAX_EXEC_ARGS_CHARS - 3] + "...")
+            elements.append({
+                "tag": "markdown",
+                "content": f"**输入参数**\n```json\n{args_json}\n```",
+            })
+
+        # Output result (from tool_execution_end).
+        exec_result = entry.get("exec_result")
+        if exec_result:
+            result_text = self._extract_result_text(exec_result)
+            if len(result_text) > self._MAX_EXEC_RESULT_CHARS:
+                result_text = (
+                    result_text[:self._MAX_EXEC_RESULT_CHARS - 3] + "...")
+            if entry.get("result_is_error"):
+                elements.append({
+                    "tag": "markdown",
+                    "content": f"**输出结果** ❌\n```\n{result_text}\n```",
+                })
+            else:
+                elements.append({
+                    "tag": "markdown",
+                    "content": f"**输出结果**\n```\n{result_text}\n```",
+                })
+
+        return elements
+
     def _build_tool_panels_for_streaming(self) -> list[dict]:
         """Build IM card collapsible_panel elements from tool_history during streaming."""
         if not self._tool_history:
@@ -1517,10 +1618,7 @@ class ResponseHandle:
                 "border": {"color": "grey", "corner_radius": "5px"},
                 "vertical_spacing": "8px",
                 "padding": "8px 8px 8px 8px",
-                "elements": [
-                    {"tag": "markdown", "content": f"**工具名**: {name}"},
-                    *([{"tag": "markdown", "content": f"**参数摘要**: `{hint}`"}] if hint else []),
-                ],
+                "elements": self._build_tool_panel_elements(entry, name, hint),
             })
 
         return panels
@@ -1601,7 +1699,7 @@ class ResponseHandle:
 
         card_json = json.dumps(card, ensure_ascii=False)
         try:
-            resp = self.client.im.message.patch(
+            resp = self.client.im.v1.message.patch(
                 PatchMessageRequest.builder()
                     .message_id(self._tool_msg_id)
                     .request_body(
@@ -1633,7 +1731,7 @@ class ResponseHandle:
                 }
             }
             card_json = json.dumps(card, ensure_ascii=False)
-            resp = self.client.im.message.patch(
+            resp = self.client.im.v1.message.patch(
                 PatchMessageRequest.builder()
                     .message_id(self._tool_msg_id)
                     .request_body(

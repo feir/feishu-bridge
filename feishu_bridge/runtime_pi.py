@@ -106,22 +106,42 @@ class PiRunner(BaseRunner):
             self._handle_message_update(event, state)
             return
 
-        if etype in ("tool_execution_start", "tool_execution_end"):
-            # No UI status here: these coarse lifecycle events carry only
-            # `toolName` (no tool-call id, no arguments). The authoritative, rich
-            # UI source is `message_update.toolcall_*` (id + name + arguments),
-            # handled in _handle_message_update — emitting here would duplicate.
-            #
-            # They ARE the liveness signal: a tool is mid-execution, so the bridge
-            # raises the silent budget (TOOL_ACTIVE_SILENT_TIMEOUT) instead of
-            # mistaking a long single tool for a hang. Best-effort — events lack an
-            # id and may be unbalanced (error / cancel / missing end), so the count
-            # is clamped ≥0 here and reset to 0 on turn_end/error below.
-            if etype == "tool_execution_start":
-                state.tool_active_count += 1
-            else:
-                state.tool_active_count = max(0, state.tool_active_count - 1)
+        if etype == "tool_execution_start":
+            state.tool_active_count += 1
             state.pending_silent_reset = True
+            # pi's JSON output (≥v3) carries toolCallId + args in
+            # tool_execution_start.  Forward them as a pending status
+            # entry so the UI can render rich input-argument blocks
+            # alongside the tool label (like pi-feishu does).
+            tool_name = event.get("toolName")
+            call_id = event.get("toolCallId")
+            exec_args = event.get("args")
+            if tool_name and call_id and isinstance(exec_args, dict):
+                state.pending_tool_status.append({
+                    "name": self._normalize_pi_tool(tool_name),
+                    "hint_data": "",
+                    "id": call_id,
+                    "_exec_args": exec_args,
+                })
+            return
+
+        if etype == "tool_execution_end":
+            state.tool_active_count = max(0, state.tool_active_count - 1)
+            state.pending_silent_reset = True
+            # Forward execution result to UI for rich output display
+            # (pi-feishu parity: args in the expandable card).
+            tool_name = event.get("toolName")
+            call_id = event.get("toolCallId")
+            result = event.get("result")
+            is_error = event.get("isError", False)
+            if tool_name and call_id:
+                state.pending_tool_status.append({
+                    "name": self._normalize_pi_tool(tool_name),
+                    "hint_data": "",
+                    "id": call_id,
+                    "_exec_result": result,
+                    "_is_error": is_error,
+                })
             return
 
         if etype == "turn_end":

@@ -310,10 +310,16 @@ class TestToolStatusUpdateDedup:
         handle.tool_status_update([{"name": "Read", "hint_data": "/a.py"}])
         assert len(handle._tool_history) == 0
 
-    def test_summary_updated_skips(self, handle):
+    def test_summary_updated_does_not_skip(self, handle):
+        """Regression: ``_summary_updated`` is one-shot for the CardKit summary
+        text patch (思考中→输入中). It must NOT gate tool history updates;
+        every tool call after the first ``text_delta`` had been silently
+        dropped, so the user saw no tool card.
+        """
         handle._summary_updated = True
         handle.tool_status_update([{"name": "Read", "hint_data": "/a.py"}])
-        assert len(handle._tool_history) == 0
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["name"] == "Read"
 
     def test_backfill_updates_empty_hint(self, handle):
         """_backfill entries update the last matching entry with empty hint."""
@@ -612,15 +618,15 @@ class TestUpdateToolCardNoThrottle:
         h._tool_msg_id = "om_tool_existing"
         h._terminated = False
         h.client = MagicMock()
-        # Mock patch to succeed
+        # Mock patch to succeed (correct path is im.v1.message.patch)
         mock_resp = MagicMock()
         mock_resp.success.return_value = True
-        h.client.im.message.patch.return_value = mock_resp
+        h.client.im.v1.message.patch.return_value = mock_resp
         return h
 
     def test_update_tool_card_no_throttle_patches_every_update(self, handle):
         """5 consecutive _update_tool_card calls → 5 patch calls (no throttle)."""
-        mock_patch = handle.client.im.message.patch
+        mock_patch = handle.client.im.v1.message.patch
 
         for i in range(5):
             panels = [{"tag": "markdown", "content": f"panel_{i}"}]
@@ -653,7 +659,7 @@ class TestFinalizeToolCard:
         h.client = MagicMock()
         mock_resp = MagicMock()
         mock_resp.success.return_value = True
-        h.client.im.message.patch.return_value = mock_resp
+        h.client.im.v1.message.patch.return_value = mock_resp
         return h
 
     def test_finalize_tool_card_marks_done_and_force_patches_once(self, handle):
@@ -681,7 +687,7 @@ class TestFinalizeToolCard:
         assert handle._tool_history[1]["tool_call_ids"] == set()
 
         # Patch called only once
-        mock_patch = handle.client.im.message.patch
+        mock_patch = handle.client.im.v1.message.patch
         assert mock_patch.call_count == 1
 
         # status_text = "**完成 (2)**"
@@ -700,12 +706,12 @@ class TestFinalizeToolCard:
         })
         handle._finalize_tool_card()
         assert handle._tool_history[0]["status"] == "done"
-        handle.client.im.message.patch.assert_not_called()
+        handle.client.im.v1.message.patch.assert_not_called()
 
     def test_finalize_no_history_no_patch(self, handle):
         """Empty history → no patch."""
         handle._finalize_tool_card()
-        handle.client.im.message.patch.assert_not_called()
+        handle.client.im.v1.message.patch.assert_not_called()
 
 
 # ---- F-3: deliver() finally calls _finalize_tool_card ----
@@ -963,3 +969,332 @@ class TestBuildToolPanelsForStreamingHeaders:
             header = p["header"]["title"]["content"]
             assert "✅" in header
             assert "⏳" not in header
+
+
+# ============================================================
+# Regression: bridge live bugs (2026-06-18)
+# ============================================================
+
+
+class TestToolStatusUpdateNotGatedBySummary:
+    """Regression: ``_summary_updated`` must NOT silently drop tool updates.
+
+    The flag is one-shot for the CardKit summary patch (思考中→输入中). Earlier
+    the same flag also gated ``tool_status_update``, so every tool that fired
+    AFTER the first ``text_delta`` was silently dropped — the user saw no tool
+    card and the standalone tool card was never created. Their ``toolcall_end``
+    counterparts then logged ``id ... not found in history`` warnings.
+    """
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._tool_history = deque(maxlen=8)
+        h._tool_msg_id = None
+        h._terminated = False
+        h._summary_updated = True  # first text_delta already streamed
+        h._cardkit_card_id = None
+        h._active_agents = []
+        h._last_todos = None
+        h._seq_lock = threading.Lock()
+        h.client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.success.return_value = True
+        h.client.im.v1.message.create.return_value = mock_resp
+        h.client.im.v1.message.create.return_value.data.message_id = "om_tool_new"
+        # _send_tool_card is the slow path; stub it out so we just check history
+        h._send_tool_card = MagicMock(return_value="om_tool_new")
+        return h
+
+    def test_tool_status_update_runs_after_summary_updated(self, handle):
+        """summary_updated=True must NOT skip; entry lands in history."""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a/b.py", "id": "call_a"},
+        ])
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["name"] == "Read"
+        assert "call_a" in handle._tool_history[0]["tool_call_ids"]
+
+    def test_end_id_found_when_start_came_after_summary(self, handle):
+        """start (post-summary) → end-id finds entry, marks done; no warning."""
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "ls", "id": "call_b"},
+        ])
+        handle.tool_status_end_update(["call_b"])
+        entry = handle._tool_history[0]
+        assert entry["status"] == "done"
+        assert entry["tool_call_ids"] == set()
+
+
+class TestToolCardUsesV1ImApi:
+    """Regression: tool card patches must hit ``client.im.v1.message.patch``.
+
+    The Lark Python SDK exposes ``client.im.v1.message`` for v1 IM endpoints;
+    ``client.im.message`` does not exist and raises ``AttributeError`` at
+    runtime. The earlier code path silently logged ``Tool card patch error``
+    for every update and every finalize, so the standalone tool card froze
+    at ⏳ forever and never moved to ✅. A ``spec=`` mock catches the typo.
+    """
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._tool_history = deque(maxlen=8)
+        h._tool_msg_id = "om_tool_existing"
+        h._tool_card_finalized = False
+        h._terminated = False
+        h._seq_lock = threading.Lock()
+        h._cardkit_card_id = None
+        h._active_agents = []
+
+        # spec-based client: only the documented v1 path exists.  Any access
+        # to ``client.im.message`` raises AttributeError → bug reappears.
+        from types import SimpleNamespace
+        message_ns = MagicMock()
+        message_ns.patch.return_value = MagicMock()
+        message_ns.patch.return_value.success.return_value = True
+        v1_ns = SimpleNamespace(message=message_ns)
+        im_ns = SimpleNamespace(v1=v1_ns)
+        h.client = SimpleNamespace(im=im_ns)
+        return h
+
+    def test_update_tool_card_calls_v1_patch(self, handle):
+        handle._update_tool_card([{"tag": "markdown", "content": "x"}])
+        handle.client.im.v1.message.patch.assert_called_once()
+
+    def test_force_patch_tool_card_calls_v1_patch(self, handle):
+        handle._tool_history.append({
+            "name": "Read", "label": "读取文件", "hint": "a.py",
+            "count": 1, "status": "done", "tool_call_ids": set(),
+        })
+        handle._force_patch_tool_card(
+            [{"tag": "markdown", "content": "x"}], "**完成 (1)**")
+        handle.client.im.v1.message.patch.assert_called_once()
+
+
+# ============================================================
+# pi-feishu parity: exec_args / exec_result rich tool cards
+# ============================================================
+
+
+class TestExecArgsBackfill:
+    """tool_status_update receives _exec_args→backfills matching entry."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._tool_history = deque(maxlen=8)
+        h._tool_msg_id = None
+        h._terminated = False
+        h._cardkit_card_id = None
+        h._active_agents = []
+        h._last_todos = None
+        h._seq_lock = threading.Lock()
+        return h
+
+    def test_exec_args_backfills_existing_entry(self, handle):
+        """_exec_args with matching id writes exec_args on the entry."""
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "ls", "id": "call_a"},
+        ])
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "", "id": "call_a",
+             "_exec_args": {"command": "ls -la"}},
+        ])
+        entry = handle._tool_history[0]
+        assert entry["exec_args"] == {"command": "ls -la"}
+        # status unaffected by exec_args backfill
+        assert entry["status"] == "running"
+
+    def test_exec_args_no_matching_id_noop(self, handle):
+        """_exec_args with unmatched id → no state change."""
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "ls", "id": "call_a"},
+        ])
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "", "id": "call_z",
+             "_exec_args": {"command": "ls"}},
+        ])
+        assert "exec_args" not in handle._tool_history[0]
+
+    def test_exec_args_before_entry_no_crash(self, handle):
+        """_exec_args with empty history → no crash."""
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "", "id": "call_x",
+             "_exec_args": {"command": "ls"}},
+        ])
+        assert len(handle._tool_history) == 0  # no entry created
+
+
+class TestExecResultBackfill:
+    """tool_status_update receives _exec_result→backfills matching entry."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._tool_history = deque(maxlen=8)
+        h._tool_msg_id = None
+        h._terminated = False
+        h._cardkit_card_id = None
+        h._active_agents = []
+        h._last_todos = None
+        h._seq_lock = threading.Lock()
+        return h
+
+    def test_exec_result_backfills_existing_entry(self, handle):
+        """_exec_result with matching id writes result on the entry."""
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "/a.py", "id": "call_r1"},
+        ])
+        result = {"content": [{"type": "text", "text": "line1\nline2"}]}
+        handle.tool_status_update([
+            {"name": "Read", "hint_data": "", "id": "call_r1",
+             "_exec_result": result, "_is_error": False},
+        ])
+        entry = handle._tool_history[0]
+        assert entry["exec_result"] is result
+        assert entry["result_is_error"] is False
+
+    def test_exec_result_error_flag(self, handle):
+        """_exec_result with _is_error=True sets result_is_error."""
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "x", "id": "call_e"},
+        ])
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "", "id": "call_e",
+             "_exec_result": {"content": [{"type": "text", "text": "fail"}]},
+             "_is_error": True},
+        ])
+        assert handle._tool_history[0]["result_is_error"] is True
+
+    def test_exec_result_aggregated_entry_uses_tool_call_ids(self, handle):
+        """exec_result matches via tool_call_ids set, not just last entry."""
+        # Two same-label entries create aggregation (count++), sharing tool_call_ids.
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "ls", "id": "call1"},
+        ])
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "ls", "id": "call2"},
+        ])
+        # call1 should be in the aggregated entry's tool_call_ids
+        assert len(handle._tool_history) == 1
+        assert "call1" in handle._tool_history[0]["tool_call_ids"]
+        assert "call2" in handle._tool_history[0]["tool_call_ids"]
+
+        result1 = {"content": [{"type": "text", "text": "out1"}]}
+        handle.tool_status_update([
+            {"name": "Bash", "hint_data": "", "id": "call1",
+             "_exec_result": result1},
+        ])
+        assert handle._tool_history[0]["exec_result"] is result1
+
+
+class TestExtractResultText:
+    """_extract_result_text extracts readable text from pi result envelope."""
+
+    def test_single_text_block(self):
+        result = {"content": [{"type": "text", "text": "hello world"}]}
+        text = ResponseHandle._extract_result_text(result)
+        assert text == "hello world"
+
+    def test_multiple_text_blocks(self):
+        result = {
+            "content": [
+                {"type": "text", "text": "line1"},
+                {"type": "text", "text": "line2"},
+            ]
+        }
+        text = ResponseHandle._extract_result_text(result)
+        assert text == "line1\nline2"
+
+    def test_empty_content(self):
+        result = {"content": []}
+        text = ResponseHandle._extract_result_text(result)
+        assert isinstance(text, str)
+
+    def test_non_dict_fallback(self):
+        text = ResponseHandle._extract_result_text("plain string")
+        assert text == "plain string"
+
+    def test_no_text_content_falls_back_to_json(self):
+        result = {"key": "val"}
+        text = ResponseHandle._extract_result_text(result)
+        assert '"key"' in text
+
+
+class TestBuildToolPanelElements:
+    """_build_tool_panel_elements renders args/result in collapsible panels."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._tool_history = deque(maxlen=8)
+        h._tool_msg_id = None
+        h._terminated = False
+        h._cardkit_card_id = None
+        h._active_agents = []
+        h._last_todos = None
+        h._seq_lock = threading.Lock()
+        return h
+
+    def test_basic_entry_no_exec_data(self, handle):
+        """Entry without exec_args/exec_result → only tool name + hint."""
+        elements = handle._build_tool_panel_elements(
+            {"name": "Read", "label": "读取文件", "hint": "foo.py"},
+            "Read", "foo.py",
+        )
+        # Tool name always present
+        assert any("**工具名**: Read" in e["content"] for e in elements)
+        # Hint present
+        assert any("foo.py" in e["content"] for e in elements)
+        # No args/result blocks
+        contents = " ".join(e["content"] for e in elements)
+        assert "输入参数" not in contents
+        assert "输出结果" not in contents
+
+    def test_entry_with_exec_args(self, handle):
+        """Entry with exec_args renders 输入参数 block."""
+        elements = handle._build_tool_panel_elements(
+            {"name": "Bash", "label": "执行命令", "hint": "echo",
+             "exec_args": {"command": "echo hello"}},
+            "Bash", "echo",
+        )
+        contents = " ".join(e["content"] for e in elements)
+        assert "输入参数" in contents
+        assert '"command"' in contents
+        assert "echo hello" in contents
+
+    def test_entry_with_exec_result(self, handle):
+        """Entry with exec_result renders 输出结果 block."""
+        elements = handle._build_tool_panel_elements(
+            {"name": "Read", "label": "读取文件", "hint": "a.py",
+             "exec_result": {"content": [{"type": "text", "text": "abc123"}]}},
+            "Read", "a.py",
+        )
+        contents = " ".join(e["content"] for e in elements)
+        assert "输出结果" in contents
+        assert "abc123" in contents
+
+    def test_entry_with_error_result(self, handle):
+        """Entry with error result shows ❌ marker."""
+        elements = handle._build_tool_panel_elements(
+            {"name": "Bash", "label": "执行命令", "hint": "x",
+             "exec_result": {"content": [{"type": "text", "text": "fail"}]},
+             "result_is_error": True},
+            "Bash", "x",
+        )
+        contents = " ".join(e["content"] for e in elements)
+        assert "输出结果" in contents
+        assert "❌" in contents
+
+    def test_entry_with_both_args_and_result(self, handle):
+        """Entry with both exec_args and exec_result renders both blocks."""
+        elements = handle._build_tool_panel_elements(
+            {"name": "Read", "label": "读取文件", "hint": "/x",
+             "exec_args": {"path": "/x"},
+             "exec_result": {"content": [{"type": "text", "text": "content"}]}},
+            "Read", "/x",
+        )
+        contents = " ".join(e["content"] for e in elements)
+        assert "输入参数" in contents
+        assert "输出结果" in contents

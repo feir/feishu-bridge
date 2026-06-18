@@ -903,3 +903,100 @@ def test_subagent_end_not_in_pending_tool_end_ids(tmp_path):
                         arguments={"agent": "scout", "task": "分析"}), state)
     assert state.pending_tool_end_ids == []
     assert state.pending_agent_launches is None
+
+
+# ── tool_execution_start / tool_execution_end → pending_tool_status ──
+# pi-feishu parity: forward execution args/result for rich tool-card display.
+
+
+def test_tool_execution_start_emits_exec_args(tmp_path):
+    """tool_execution_start with toolCallId+args → _exec_args in pending."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line({
+        "type": "tool_execution_start",
+        "toolCallId": "call_exec_01",
+        "toolName": "bash",
+        "args": {"command": "echo hi"},
+    }, state)
+    assert len(state.pending_tool_status) == 1
+    entry = state.pending_tool_status[0]
+    assert entry["id"] == "call_exec_01"
+    assert entry["name"] == "Bash"
+    assert entry["_exec_args"] == {"command": "echo hi"}
+    assert state.tool_active_count == 1
+    assert state.pending_silent_reset is True
+
+
+def test_tool_execution_start_without_id_no_emit(tmp_path):
+    """tool_execution_start without callId is a no-op for UI (liveness only)."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line({
+        "type": "tool_execution_start",
+        "toolName": "bash",
+        "args": {"command": "x"},
+    }, state)
+    assert state.pending_tool_status == []
+    assert state.tool_active_count == 1
+
+
+def test_tool_execution_start_empty_args_no_emit(tmp_path):
+    """tool_execution_start without args dict is a no-op for UI."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line({
+        "type": "tool_execution_start",
+        "toolCallId": "call_exec_02",
+        "toolName": "read",
+    }, state)
+    assert state.pending_tool_status == []
+
+
+def test_tool_execution_end_emits_exec_result(tmp_path):
+    """tool_execution_end with toolCallId+result → _exec_result in pending."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    result = {"content": [{"type": "text", "text": "hello world"}]}
+    runner.parse_streaming_line({
+        "type": "tool_execution_end",
+        "toolCallId": "call_exec_03",
+        "toolName": "bash",
+        "result": result,
+        "isError": False,
+    }, state)
+    assert len(state.pending_tool_status) == 1
+    entry = state.pending_tool_status[0]
+    assert entry["id"] == "call_exec_03"
+    assert entry["name"] == "Bash"
+    assert entry["_exec_result"] is result
+    assert entry["_is_error"] is False
+    assert state.tool_active_count == 0
+
+
+def test_tool_execution_end_with_error(tmp_path):
+    """tool_execution_end with isError=True propagates _is_error flag."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    state.tool_active_count = 1  # pre-condition
+    runner.parse_streaming_line({
+        "type": "tool_execution_end",
+        "toolCallId": "call_exec_err",
+        "toolName": "bash",
+        "result": {"content": [{"type": "text", "text": "permission denied"}]},
+        "isError": True,
+    }, state)
+    assert state.pending_tool_status[0]["_is_error"] is True
+    assert state.tool_active_count == 0
+
+
+def test_tool_execution_end_without_id_no_emit(tmp_path):
+    """tool_execution_end without callId is a no-op for UI."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line({
+        "type": "tool_execution_end",
+        "toolName": "bash",
+        "result": {},
+    }, state)
+    assert state.pending_tool_status == []
