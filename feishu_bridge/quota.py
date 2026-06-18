@@ -403,3 +403,110 @@ def fetch_codex_quota(auth_path: Path | None = None) -> CodexQuotaSnapshot:
         secondary_used_pct=sw.get("used_percent", 0),
         secondary_resets_at=sw.get("reset_at", 0),
     )
+
+
+# ── CLI entry point (`python -m feishu_bridge.quota claude [--json]`) ──
+
+def _claude_quota_cli(cookie_path: Path | None = None, json_out: bool = True) -> str:
+    """One-shot Claude quota fetch, returns JSON string.
+
+    If ``json_out`` is True (default), output is always JSON.
+    Otherwise, human-readable text.
+    """
+    cp = Path(cookie_path) if cookie_path else _DEFAULT_COOKIE_PATH
+
+    # Check cookie file exists
+    if not cp.exists():
+        result = {"error": f"cookie file not found: {cp}", "available": False}
+        if json_out:
+            return _json.dumps(result, ensure_ascii=False)
+        return f"Error: {result['error']}"
+
+    # Load session key
+    session_key, expires = _load_session_key(cp)
+    if not session_key:
+        result = {"error": "no sessionKey in cookie file", "available": False}
+        if json_out:
+            return _json.dumps(result, ensure_ascii=False)
+        return f"Error: {result['error']}"
+
+    poller = QuotaPoller(cookie_path=cp)
+    poller._session_key = session_key
+    poller._session_key_expires = expires
+    try:
+        snap = poller.force_refresh()
+    except Exception as e:
+        result = {"error": str(e), "available": False}
+        if json_out:
+            return _json.dumps(result, ensure_ascii=False)
+        return f"Error: {e}"
+
+    if snap.error:
+        result = {
+            "error": snap.error,
+            "available": False,
+        }
+        if json_out:
+            return _json.dumps(result, ensure_ascii=False)
+        return f"Error: {snap.error}"
+
+    # Build output
+    utilization: dict[str, float] = {}
+    resets_at: dict[str, float] = {}
+    for key, w in snap.windows.items():
+        utilization[key] = w.utilization
+        resets_at[key] = w.resets_at_epoch
+
+    result = {
+        "available": True,
+        "utilization": utilization,
+        "resets_at": resets_at,
+        "extra_usage_enabled": snap.extra_usage_enabled,
+        "cookie_expires_at": snap.cookie_expires_at or 0,
+        "raw": snap.raw,
+    }
+    if json_out:
+        return _json.dumps(result, ensure_ascii=False, default=str)
+
+    # Human-readable
+    lines = ["Claude usage:"]
+    for key, w in sorted(snap.windows.items()):
+        label = WINDOW_LABELS.get(key, key)
+        lines.append(f"  {label}: {w.utilization:.1f}% (resets {w.resets_at})")
+    if snap.extra_usage_enabled:
+        lines.append("  Extra usage: enabled")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python -m feishu_bridge.quota claude [--json]", file=sys.stderr)
+        sys.exit(2)
+
+    subcmd = sys.argv[1]
+    if subcmd != "claude":
+        print(f"Unknown subcommand: {subcmd}", file=sys.stderr)
+        print("Usage: python -m feishu_bridge.quota claude [--json]", file=sys.stderr)
+        sys.exit(2)
+
+    use_json = "--json" in sys.argv
+    cookie_arg: str | None = None
+    for i, arg in enumerate(sys.argv[2:], 2):
+        if arg.startswith("--cookie="):
+            cookie_arg = arg.split("=", 1)[1]
+            break
+
+    cookie_path = Path(cookie_arg) if cookie_arg else None
+
+    try:
+        output = _claude_quota_cli(cookie_path=cookie_path, json_out=use_json)
+        print(output)
+    except Exception as e:
+        err = {"error": str(e), "available": False}
+        if use_json:
+            print(_json.dumps(err, ensure_ascii=False))
+        else:
+            print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)

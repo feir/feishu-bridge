@@ -4,11 +4,15 @@ import time
 
 import pytest
 
+import json as _json
+from unittest.mock import patch
+
 from feishu_bridge.quota import (
     CodexQuotaSnapshot,
     QuotaSnapshot,
     QuotaWindow,
     WINDOW_LABELS,
+    _claude_quota_cli,
     _load_session_key,
     _parse_iso_to_epoch,
     _parse_response,
@@ -389,3 +393,104 @@ def test_fetch_codex_quota_empty_token(tmp_path):
     snap = fetch_codex_quota(auth_path=auth_file)
     assert not snap.available
     assert "no access_token" in snap.error
+
+
+# ── _claude_quota_cli (Task 2.1–2.2) ───────────────────────────────
+
+
+def test_claude_quota_cli_happy_path(tmp_path):
+    """Happy path: valid cookie + successful API response → JSON output."""
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".claude.ai\tTRUE\t/\tTRUE\t1900000000\tsessionKey\tsk-ant-test-123\n"
+    )
+
+    fake_snap = QuotaSnapshot(
+        timestamp=time.time(),
+        windows={
+            "five_hour": QuotaWindow(utilization=15.0, resets_at="2026-03-22T21:00:00+00:00",
+                                     resets_at_epoch=1767229200.0),
+            "seven_day": QuotaWindow(utilization=42.0, resets_at="2026-03-28T04:00:00+00:00",
+                                     resets_at_epoch=1767693600.0),
+        },
+        extra_usage_enabled=False,
+        raw={"five_hour": {"utilization": 15.0}, "seven_day": {"utilization": 42.0}},
+        cookie_expires_at=1900000000.0,
+    )
+
+    with patch("feishu_bridge.quota.QuotaPoller.force_refresh", return_value=fake_snap):
+        output = _claude_quota_cli(cookie_path=cookie_file, json_out=True)
+        data = _json.loads(output)
+        assert data["available"] is True
+        assert "error" not in data
+        assert data["utilization"]["five_hour"] == 15.0
+        assert data["utilization"]["seven_day"] == 42.0
+        assert data["resets_at"]["five_hour"] == 1767229200.0
+        assert data["cookie_expires_at"] == 1900000000.0
+        assert "raw" in data
+
+
+def test_claude_quota_cli_cookie_missing(tmp_path):
+    """Cookie file does not exist → JSON error output (no traceback)."""
+    nonexistent = tmp_path / "nonexistent.txt"
+
+    # Should not raise
+    output = _claude_quota_cli(cookie_path=nonexistent, json_out=True)
+    data = _json.loads(output)
+    assert data["available"] is False
+    assert "error" in data
+    assert "not found" in data["error"]
+
+
+def test_claude_quota_cli_no_session_key(tmp_path):
+    """Cookie file exists but no sessionKey → JSON error."""
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".claude.ai\tTRUE\t/\tTRUE\t1900000000\tother\tvalue\n"
+    )
+    output = _claude_quota_cli(cookie_path=cookie_file, json_out=True)
+    data = _json.loads(output)
+    assert data["available"] is False
+    assert "sessionKey" in data["error"]
+
+
+def test_claude_quota_cli_network_failure(tmp_path):
+    """Network failure / API error → JSON error output."""
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".claude.ai\tTRUE\t/\tTRUE\t1900000000\tsessionKey\tsk-ant-test-123\n"
+    )
+
+    error_snap = QuotaSnapshot(
+        timestamp=time.time(),
+        error="HTTP 503: Service Unavailable",
+    )
+
+    with patch("feishu_bridge.quota.QuotaPoller.force_refresh", return_value=error_snap):
+        output = _claude_quota_cli(cookie_path=cookie_file, json_out=True)
+        data = _json.loads(output)
+        assert data["available"] is False
+        assert "503" in data["error"]
+
+
+def test_claude_quota_cli_curl_cffi_missing(tmp_path):
+    """curl_cffi not installed → force_refresh returns error snapshot (no exception)."""
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".claude.ai\tTRUE\t/\tTRUE\t1900000000\tsessionKey\tsk-ant-test-123\n"
+    )
+
+    error_snap = QuotaSnapshot(
+        timestamp=time.time(),
+        error="curl_cffi not installed",
+    )
+
+    with patch("feishu_bridge.quota.QuotaPoller.force_refresh", return_value=error_snap):
+        output = _claude_quota_cli(cookie_path=cookie_file, json_out=True)
+        data = _json.loads(output)
+        assert data["available"] is False
+        assert "curl_cffi" in data["error"]
