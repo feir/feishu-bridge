@@ -1000,3 +1000,55 @@ def test_tool_execution_end_without_id_no_emit(tmp_path):
         "result": {},
     }, state)
     assert state.pending_tool_status == []
+
+
+def test_tool_call_from_update_uses_content_index(tmp_path):
+    """Multi-tool turn: contentIndex picks the correct toolCall, not the first."""
+    runner = _runner(tmp_path)
+    # Simulate a partial with 2 toolCalls — start for the second tool.
+    update = {
+        "type": "toolcall_start",
+        "contentIndex": 1,
+        "partial": {
+            "content": [
+                {"type": "toolCall", "id": "first", "name": "read",
+                 "arguments": {"path": "/a"}},
+                {"type": "toolCall", "id": "second", "name": "bash",
+                 "arguments": {"command": "ls"}},
+            ]
+        }
+    }
+    tc = PiRunner._tool_call_from_update(update)
+    # Must return the SECOND tool (contentIndex=1), not the first.
+    assert tc["id"] == "second"
+    assert tc["name"] == "bash"
+
+
+def test_tool_call_from_update_falls_back_to_scan(tmp_path):
+    """Without contentIndex, fall back to scanning content for first toolCall."""
+    runner = _runner(tmp_path)
+    update = {
+        "type": "toolcall_start",
+        "partial": {
+            "content": [
+                {"type": "toolCall", "id": "only", "name": "read",
+                 "arguments": {"path": "/x"}},
+            ]
+        }
+    }
+    tc = PiRunner._tool_call_from_update(update)
+    assert tc["id"] == "only"
+
+
+def test_tool_call_from_update_toolcall_end_prefers_top_level(tmp_path):
+    """toolcall_end with top-level toolCall → returns it (ignoring content)."""
+    runner = _runner(tmp_path)
+    update = {
+        "type": "toolcall_end",
+        "contentIndex": 0,
+        "toolCall": {"type": "toolCall", "id": "end_id", "name": "bash",
+                      "arguments": {"command": "ls"}},
+        "partial": {"content": []},
+    }
+    tc = PiRunner._tool_call_from_update(update)
+    assert tc["id"] == "end_id"

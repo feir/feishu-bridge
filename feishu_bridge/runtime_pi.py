@@ -439,6 +439,18 @@ class PiRunner(BaseRunner):
         partial = update.get("partial") or {}
         content = partial.get("content") or []
         if isinstance(content, list):
+            # Prefer the toolCall at the update's own contentIndex.
+            # Without this, multi-tool turns return the *first* toolCall for
+            # every start event, causing subsequent starts to be deduped (id
+            # already in _tool_seen_starts) and their entries silently lost.
+            content_index = update.get("contentIndex")
+            if isinstance(content_index, int) and 0 <= content_index < len(content):
+                item = content[content_index]
+                if (isinstance(item, dict)
+                        and item.get("type") == "toolCall"
+                        and item.get("name")):
+                    return item
+            # Legacy fallback for events that lack contentIndex.
             for item in content:
                 if (isinstance(item, dict)
                         and item.get("type") == "toolCall"
