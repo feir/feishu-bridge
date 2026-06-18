@@ -1287,24 +1287,40 @@ class ResponseHandle:
 
             # ── tool_execution_start backfill: store execution args ──
             if isinstance(tc, dict) and "_exec_args" in tc:
-                if call_id and self._tool_history:
+                if self._tool_history:
                     exec_args = tc["_exec_args"]
+                    # Prefer exact call_id match; fall back to name match on
+                    # the most recent entry (handles entries with empty
+                    # tool_call_ids caused by deferred-start edge cases).
                     for entry in reversed(self._tool_history):
-                        if call_id in entry.get("tool_call_ids", set()):
+                        if call_id and call_id in entry.get("tool_call_ids", set()):
                             entry["exec_args"] = exec_args
                             break
+                    else:
+                        name = tc.get("name", "")
+                        for entry in reversed(self._tool_history):
+                            if entry.get("name") == name:
+                                entry["exec_args"] = exec_args
+                                break
                 continue
 
             # ── tool_execution_end backfill: store execution result ──
             if isinstance(tc, dict) and "_exec_result" in tc:
-                if call_id and self._tool_history:
+                if self._tool_history:
                     exec_result = tc["_exec_result"]
                     is_err = tc.get("_is_error", False)
                     for entry in reversed(self._tool_history):
-                        if call_id in entry.get("tool_call_ids", set()):
+                        if call_id and call_id in entry.get("tool_call_ids", set()):
                             entry["exec_result"] = exec_result
                             entry["result_is_error"] = is_err
                             break
+                    else:
+                        name = tc.get("name", "")
+                        for entry in reversed(self._tool_history):
+                            if entry.get("name") == name:
+                                entry["exec_result"] = exec_result
+                                entry["result_is_error"] = is_err
+                                break
                 continue
 
             if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task", "Subagent"):

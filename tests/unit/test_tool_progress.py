@@ -1106,8 +1106,8 @@ class TestExecArgsBackfill:
         # status unaffected by exec_args backfill
         assert entry["status"] == "running"
 
-    def test_exec_args_no_matching_id_noop(self, handle):
-        """_exec_args with unmatched id → no state change."""
+    def test_exec_args_fallback_name_match(self, handle):
+        """exec_args with unmatched id falls back to name match on last entry."""
         handle.tool_status_update([
             {"name": "Bash", "hint_data": "ls", "id": "call_a"},
         ])
@@ -1115,7 +1115,8 @@ class TestExecArgsBackfill:
             {"name": "Bash", "hint_data": "", "id": "call_z",
              "_exec_args": {"command": "ls"}},
         ])
-        assert "exec_args" not in handle._tool_history[0]
+        # Should match by name "Bash" on the entry (fallback after id mismatch)
+        assert handle._tool_history[0]["exec_args"] == {"command": "ls"}
 
     def test_exec_args_before_entry_no_crash(self, handle):
         """_exec_args with empty history → no crash."""
