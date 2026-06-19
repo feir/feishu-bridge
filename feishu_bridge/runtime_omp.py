@@ -151,7 +151,7 @@ class OmpRpcRunner(BaseRunner):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            on_agent_update=None, on_tool_end=None,
+            on_agent_update=None, on_tool_end=None, on_agent_end=None,
             env_extra: Optional[dict] = None,
             fork_session: bool = False,
             fresh_context: Optional[str] = None,

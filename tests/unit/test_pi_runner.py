@@ -21,6 +21,34 @@ def _runner(tmp_path, **kwargs):
     return PiRunner(**params)
 
 
+def test_run_forwards_on_agent_end_callback(tmp_path, monkeypatch):
+    """BaseRunner.run must pass on_agent_end into _run_streaming."""
+    runner = _runner(tmp_path)
+
+    class FakeProc:
+        stdout = iter([])
+        stderr = iter([])
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr("feishu_bridge.runtime.subprocess.Popen", lambda *a, **k: FakeProc())
+    marker = object()
+    captured = {}
+
+    def fake_streaming(proc, session_id, tag, on_output, **kwargs):
+        captured["on_agent_end"] = kwargs.get("on_agent_end")
+        return {"result": "ok", "session_id": session_id, "is_error": False}
+
+    monkeypatch.setattr(runner, "_run_streaming", fake_streaming)
+    result = runner.run("hello", session_id="sid", on_output=lambda _text: None,
+                        on_agent_end=marker)
+
+    assert result["result"] == "ok"
+    assert captured["on_agent_end"] is marker
+
+
 def test_pi_build_args_defaults_to_json_no_tool_injection_and_session(tmp_path):
     runner = _runner(
         tmp_path,
@@ -602,7 +630,8 @@ def test_subagent_normal_extract_to_agent_launches(tmp_path):
                         arguments={"agent": "scout", "task": "分析代码"}), state)
     assert state.pending_tool_status == []
     assert state.pending_agent_launches == [
-        {"description": "分析代码", "name": None, "subagent_type": "scout"},
+        {"description": "分析代码", "name": None, "subagent_type": "scout",
+         "tool_call_id": "sub_1"},
     ]
     assert "sub_1" in state._tool_seen_starts
 
@@ -719,8 +748,10 @@ def test_subagent_tasks_multi_dispatches_agent_launches(tmp_path):
                         }), state)
     assert state.pending_tool_status == []
     assert state.pending_agent_launches == [
-        {"description": "分析认证流程", "name": None, "subagent_type": "scout"},
-        {"description": "分析路由结构", "name": None, "subagent_type": "scout"},
+        {"description": "分析认证流程", "name": None, "subagent_type": "scout",
+         "tool_call_id": "sub_m1:0"},
+        {"description": "分析路由结构", "name": None, "subagent_type": "scout",
+         "tool_call_id": "sub_m1:1"},
     ]
     assert "sub_m1" in state._tool_seen_starts
 
@@ -739,8 +770,10 @@ def test_subagent_tasks_multi_ignores_invalid_entries(tmp_path):
                             ],
                         }), state)
     assert state.pending_agent_launches == [
-        {"description": "分析", "name": None, "subagent_type": "scout"},
-        {"description": "developer", "name": None, "subagent_type": "developer"},
+        {"description": "分析", "name": None, "subagent_type": "scout",
+         "tool_call_id": "sub_m2:1"},
+        {"description": "developer", "name": None, "subagent_type": "developer",
+         "tool_call_id": "sub_m2:2"},
     ]
 
 
@@ -756,7 +789,8 @@ def test_subagent_tasks_empty_falls_back_to_single(tmp_path):
                             "task": "分析",
                         }), state)
     assert state.pending_agent_launches == [
-        {"description": "分析", "name": None, "subagent_type": "scout"},
+        {"description": "分析", "name": None, "subagent_type": "scout",
+         "tool_call_id": "sub_m3"},
     ]
     assert state.pending_tool_status == []
 
@@ -1346,3 +1380,63 @@ def test_cross_turn_flag_reset_prevents_leak(tmp_path):
     assert state.cumulative_input == 30 + 40
     assert state.cumulative_output == 3 + 4
     assert state.cumulative_cost_total == 0.03 + 0.04
+
+
+# ── Subagent tool_execution_end → pending_agent_results ──
+
+
+def test_subagent_tool_execution_end_routes_to_agent_results(tmp_path):
+    """Subagent tool_execution_end routes result to pending_agent_results,
+    NOT pending_tool_status."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    state.tool_active_count = 1
+    result = {"content": [{"type": "text", "text": "分析完成：3个文件"}]}
+    runner.parse_streaming_line({
+        "type": "tool_execution_end",
+        "toolCallId": "sub_call_a",
+        "toolName": "subagent",
+        "result": result,
+        "isError": False,
+    }, state)
+    # Routed to pending_agent_results, NOT pending_tool_status
+    assert state.pending_tool_status == []
+    assert state.pending_agent_results == [
+        {"toolCallId": "sub_call_a", "result": result, "isError": False},
+    ]
+    assert state.tool_active_count == 0
+    assert state.pending_silent_reset is True
+
+
+def test_subagent_tool_execution_end_with_error_flag(tmp_path):
+    """Subagent tool_execution_end with isError=True sets isError flag."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    state.tool_active_count = 1
+    runner.parse_streaming_line({
+        "type": "tool_execution_end",
+        "toolCallId": "sub_call_err",
+        "toolName": "subagent",
+        "result": {"content": [{"type": "text", "text": "失败"}]},
+        "isError": True,
+    }, state)
+    assert state.pending_agent_results[0]["isError"] is True
+    assert state.tool_active_count == 0
+
+
+def test_non_subagent_tool_execution_end_still_routes_to_tool_status(tmp_path):
+    """Non-subagent tool_execution_end still routes to pending_tool_status (no regression)."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    state.tool_active_count = 1
+    runner.parse_streaming_line({
+        "type": "tool_execution_end",
+        "toolCallId": "bash_call_1",
+        "toolName": "bash",
+        "result": {"content": [{"type": "text", "text": "ok"}]},
+        "isError": False,
+    }, state)
+    assert state.pending_agent_results == []
+    assert len(state.pending_tool_status) == 1
+    assert state.pending_tool_status[0]["id"] == "bash_call_1"
+    assert state.pending_tool_status[0]["_exec_result"] is not None

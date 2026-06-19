@@ -1299,3 +1299,199 @@ class TestBuildToolPanelElements:
         contents = " ".join(e["content"] for e in elements)
         assert "输入参数" in contents
         assert "输出结果" in contents
+
+
+# ============================================================
+# Subagent agent_result_update (T2.1)
+# ============================================================
+
+
+class TestAgentResultUpdate:
+    """Tests for ResponseHandle.agent_result_update."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h._active_agents = []
+        h._cardkit_card_id = "card-1"
+        h._terminated = False
+        h._tool_history = []
+        h._last_todos = None
+        h._seq_lock = threading.Lock()
+        h._cardkit_seq = 0
+        h._render_progress = Mock()
+        h._render_agent_progress = Mock()
+        return h
+
+    def _add_agent(self, handle, desc, subagent_type, tool_call_id=None,
+                   status="in_progress"):
+        a = {"description": desc, "subagent_type": subagent_type,
+             "status": status, "result_text": None, "name": None}
+        if tool_call_id:
+            a["tool_call_id"] = tool_call_id
+        handle._active_agents.append(a)
+        return a
+
+    def test_matches_by_tool_call_id_single(self, handle):
+        """Single agent matched by exact tool_call_id."""
+        self._add_agent(handle, "分析代码", "scout", tool_call_id="call_a")
+        result = {"content": [{"type": "text", "text": "done"}]}
+        handle.agent_result_update([
+            {"toolCallId": "call_a", "result": result, "isError": False},
+        ])
+        a = handle._active_agents[0]
+        assert a["status"] == "completed"
+        assert a["result_text"] == "done"
+        handle._render_progress.assert_called_once()
+
+    def test_matches_parallel_batch_by_call_id_prefix(self, handle):
+        """Parallel batch: call_id:index entries match end event's bare call_id."""
+        self._add_agent(handle, "分析认证", "scout", tool_call_id="batch_1:0")
+        self._add_agent(handle, "分析路由", "scout", tool_call_id="batch_1:1")
+        self._add_agent(handle, "分析数据", "scout", tool_call_id="batch_2:0")
+        result = {"content": [{"type": "text", "text": "batch done"}]}
+        handle.agent_result_update([
+            {"toolCallId": "batch_1", "result": result, "isError": False},
+        ])
+        # Agents with batch_1:* → completed
+        assert handle._active_agents[0]["status"] == "completed"
+        assert handle._active_agents[1]["status"] == "completed"
+        # Agent with batch_2:* → still in_progress
+        assert handle._active_agents[2]["status"] == "in_progress"
+
+    def test_sets_error_status(self, handle):
+        """isError=True → status='error'."""
+        self._add_agent(handle, "失败任务", "developer", tool_call_id="call_e")
+        result = {"content": [{"type": "text", "text": "failed"}]}
+        handle.agent_result_update([
+            {"toolCallId": "call_e", "result": result, "isError": True},
+        ])
+        assert handle._active_agents[0]["status"] == "error"
+        assert handle._active_agents[0]["result_text"] == "failed"
+
+    def test_description_fallback_single_candidate(self, handle):
+        """No tool_call_id match → description fallback with 1 candidate."""
+        self._add_agent(handle, "分析代码", "scout")
+        result = {"content": [{"type": "text", "text": "ok"}]}
+        handle.agent_result_update([
+            {"toolCallId": "unknown", "result": result, "isError": False,
+             "description": "分析代码"},
+        ])
+        # tool_call_id not matched, but description matches single candidate
+        assert handle._active_agents[0]["status"] == "completed"
+
+    def test_description_fallback_ambiguous_skips(self, handle):
+        """Description matches multiple candidates → skip (don't guess)."""
+        self._add_agent(handle, "分析", "scout", tool_call_id="call_x")
+        self._add_agent(handle, "分析", "developer", tool_call_id="call_y")
+        result = {"content": [{"type": "text", "text": "ok"}]}
+        handle.agent_result_update([
+            {"toolCallId": "unknown", "result": result, "isError": False,
+             "description": "分析"},
+        ])
+        # Ambiguous: both still in_progress
+        assert handle._active_agents[0]["status"] == "in_progress"
+        assert handle._active_agents[1]["status"] == "in_progress"
+        # render_progress NOT called (no change)
+        handle._render_progress.assert_not_called()
+
+    def test_empty_results_noop(self, handle):
+        """Empty results list → no-op."""
+        self._add_agent(handle, "任务", "scout")
+        handle.agent_result_update([])
+        assert handle._active_agents[0]["status"] == "in_progress"
+
+    def test_terminated_skips(self, handle):
+        """When terminated, agent_result_update is skipped."""
+        self._add_agent(handle, "任务", "scout", tool_call_id="call_a")
+        handle._terminated = True
+        handle.agent_result_update([
+            {"toolCallId": "call_a", "result": {}, "isError": False},
+        ])
+        assert handle._active_agents[0]["status"] == "in_progress"
+
+
+class TestAgentListUpdateEnsureCard:
+    """T2.2: agent_list_update proactively creates card when none exists."""
+
+    @pytest.fixture
+    def handle(self):
+        h = ResponseHandle.__new__(ResponseHandle)
+        h.card_message_id = None
+        h._cardkit_card_id = None
+        h._active_agents = []
+        h._terminated = False
+        h._render_progress = Mock()
+        h._ensure_card = Mock(return_value=True)
+        # Simulate card creation succeeded
+        h._ensure_card.return_value = True
+        h._cardkit_card_id = None  # _ensure_card mock bypasses real creation
+        return h
+
+    def test_agent_list_update_calls_ensure_card_when_no_card(self, handle):
+        """No card_message_id → _ensure_card("") is called."""
+        handle.agent_list_update([
+            {"description": "分析代码", "subagent_type": "scout",
+             "tool_call_id": "call_a"},
+        ])
+        handle._ensure_card.assert_called_once_with("")
+
+    def test_agent_list_update_skips_ensure_card_when_card_exists(self, handle):
+        """Card already exists → _ensure_card is NOT called."""
+        handle.card_message_id = "msg-1"
+        handle.agent_list_update([
+            {"description": "分析代码", "subagent_type": "scout",
+             "tool_call_id": "call_a"},
+        ])
+        handle._ensure_card.assert_not_called()
+
+    def test_agent_list_update_terminated_skips_all(self, handle):
+        """When terminated, skip everything (no card creation, no agent add)."""
+        handle._terminated = True
+        handle.agent_list_update([
+            {"description": "分析代码", "subagent_type": "scout"},
+        ])
+        handle._ensure_card.assert_not_called()
+        assert handle._active_agents == []
+
+
+class TestFormatAgentsMarkdown:
+    """T3.1: _format_agents_markdown shared formatter."""
+
+    def test_empty_agents_returns_empty(self):
+        from feishu_bridge.ui import ResponseHandle
+        assert ResponseHandle._format_agents_markdown([]) == ""
+        assert ResponseHandle._format_agents_markdown(None) == ""
+
+    def test_in_progress_agent(self):
+        from feishu_bridge.ui import ResponseHandle
+        agents = [{"description": "分析", "subagent_type": "scout",
+                   "status": "in_progress", "name": None}]
+        md = ResponseHandle._format_agents_markdown(agents)
+        assert "◉ **分析 (scout)**" in md
+
+    def test_completed_agent_with_result(self):
+        from feishu_bridge.ui import ResponseHandle
+        agents = [{"description": "分析", "subagent_type": "scout",
+                   "status": "completed", "name": None,
+                   "result_text": "done"}]
+        md = ResponseHandle._format_agents_markdown(agents)
+        assert "~~☑ 分析 (scout)~~" in md
+        assert "done" in md
+
+    def test_completed_without_subagent_type(self):
+        from feishu_bridge.ui import ResponseHandle
+        agents = [{"description": "任务", "subagent_type": "",
+                   "status": "completed", "name": None}]
+        md = ResponseHandle._format_agents_markdown(agents)
+        # No suffix in parens
+        assert "~~☑ 任务~~" in md
+
+    def test_error_agent_with_result(self):
+        from feishu_bridge.ui import ResponseHandle
+        agents = [{"description": "失败", "subagent_type": "developer",
+                   "status": "error", "name": None,
+                   "result_text": "boom"}]
+        md = ResponseHandle._format_agents_markdown(agents)
+        assert "❌ **失败 (developer)**" in md
+        assert "boom" in md

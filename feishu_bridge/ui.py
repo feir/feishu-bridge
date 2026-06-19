@@ -9,7 +9,6 @@ import threading
 import time
 import urllib.parse
 import uuid
-from collections import deque
 from typing import Optional
 
 from lark_oapi.api.cardkit.v1 import (
@@ -868,23 +867,11 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
     # Subagent dispatch list (rendered before tool panels). Each agent entry
     # shows the subagent type + task description, struck through when completed.
     if agents:
-        agent_lines = []
-        for a in agents:
-            desc = a.get("description", "")
-            atype = a.get("subagent_type", "")
-            suffix = f" ({atype})" if atype else ""
-            if a.get("status") == "completed":
-                agent_lines.append(f"~~☑ {desc}{suffix}~~")
-                result = a.get("result_text")
-                if result:
-                    summary = str(result)[:500] + ("…" if len(str(result)) > 500 else "")
-                    agent_lines.append(f"  ── Output ──\n  {summary}")
-            else:
-                agent_lines.append(f"◉ **{desc}{suffix}**")
-        if agent_lines:
+        agent_md = ResponseHandle._format_agents_markdown(agents)
+        if agent_md:
             elements.append({
                 "tag": "markdown",
-                "content": "\n".join(agent_lines),
+                "content": agent_md,
             })
 
     # Tool collapsible panels (from Pi runner tool history)
@@ -1045,7 +1032,8 @@ class ResponseHandle:
         self._runner_tag: Optional[str] = None
         self._last_todos: list[dict] | None = None
         self._active_agents: list[dict] = []
-        self._tool_history: deque[dict] = deque(maxlen=8)
+        self._tool_history: list[dict] = []
+        self._element_failure_count: int = 0
 
     def _next_seq(self) -> int:
         with self._seq_lock:
@@ -1162,6 +1150,9 @@ class ResponseHandle:
                 self._ensure_card()
             if self._flush_ctrl:
                 self._flush_ctrl.drain()
+            # Final-fallback: mark any in_progress agents completed
+            # (agents that never received a tool_execution_end event).
+            self._mark_agents_completed()
             log.info("Deliver: content_len=%d is_error=%s cardkit=%s",
                      len(content), is_error,
                      bool(self._use_cardkit and self._cardkit_card_id))
@@ -1256,9 +1247,36 @@ class ResponseHandle:
             return self._deliver_im_patch(content, is_error,
                                           context_alert=context_alert)
 
+    @classmethod
+    def _format_agents_markdown(cls, agents: list[dict]) -> str:
+        """Format active agents as markdown lines. Returns "" when empty."""
+        if not agents:
+            return ""
+        lines = []
+        for a in agents:
+            desc = a.get("description", "")
+            atype = a.get("subagent_type", "")
+            suffix = f" ({atype})" if atype else ""
+            status = a.get("status")
+            if status == "completed":
+                lines.append(f"~~☑ {desc}{suffix}~~")
+            elif status == "error":
+                lines.append(f"❌ **{desc}{suffix}**")
+            else:
+                lines.append(f"◉ **{desc}{suffix}**")
+            result = a.get("result_text")
+            if result and status in ("completed", "error"):
+                summary = result[:500] + ("…" if len(result) > 500 else "")
+                lines.append(f"  ── Output ──\n  {summary}")
+        return "\n".join(lines)
+
     def _deliver_im_patch(self, content: str, is_error: bool,
                           context_alert: str | None = None) -> bool:
-        # IM patch has no structured footer; append alerts to content body
+        # IM patch has no structured footer; append alerts + agents to content body
+        if self._active_agents:
+            agent_md = self._format_agents_markdown(self._active_agents)
+            if agent_md:
+                content = content + "\n\n---\n" + agent_md
         if context_alert:
             content = content + "\n\n---\n" + context_alert
         card = build_card(content, is_error)
@@ -1486,13 +1504,27 @@ class ResponseHandle:
                 .build()
             resp = self.client.cardkit.v1.card_element.content(req)
             if not resp.success():
-                log.debug("Element update failed (%s): code=%s msg=%s",
-                          element_id, resp.code, resp.msg)
+                self._element_failure_count += 1
+                log.warning("Element update failed (%s): code=%s msg=%s",
+                            element_id, resp.code, resp.msg)
+                self._check_element_stall(element_id)
                 return False
+            self._element_failure_count = 0
             return True
         except Exception:
-            log.debug("Element update error (%s)", element_id, exc_info=True)
+            self._element_failure_count += 1
+            log.warning("Element update error (%s)", element_id, exc_info=True)
+            self._check_element_stall(element_id)
             return False
+
+    def _check_element_stall(self, element_id: str) -> None:
+        """Emit stall warning at threshold transitions."""
+        c = self._element_failure_count
+        if c == 3 or (c > 3 and c % 10 == 0):
+            log.warning(
+                "CardKit element update: %d consecutive failures for %s "
+                "— streaming/agent_status may be stalled", c, element_id,
+            )
 
     @staticmethod
     def _format_todos(todos: list[dict]) -> str:
@@ -1525,24 +1557,19 @@ class ResponseHandle:
             return
         parts = []
 
+        # Shared agent markdown (status + result_text)
+        agent_md = self._format_agents_markdown(self._active_agents)
+        if agent_md:
+            parts.append(agent_md)
+
+        # Streaming-only extras: activities + usage per agent
         for a in self._active_agents:
-            desc = a.get("description", "")
-            atype = a.get("subagent_type", "")
-            suffix = f" ({atype})" if atype else ""
-            if a.get("status") == "completed":
-                parts.append(f"~~☑ {desc}{suffix}~~")
-                result = a.get("result_text")
-                if result:
-                    summary = result[:500] + ("…" if len(result) > 500 else "")
-                    parts.append(f"  ── Output ──\n  {summary}")
-                activities = a.get("activities")
-                if activities:
-                    parts.append("  " + "\n  ".join(activities[:8]))
-                usage = a.get("usage")
-                if usage:
-                    parts.append(f"  {usage}")
-            else:
-                parts.append(f"◉ **{desc}{suffix}**")
+            activities = a.get("activities")
+            if activities:
+                parts.append("  " + "\n  ".join(activities[:8]))
+            usage = a.get("usage")
+            if usage:
+                parts.append(f"  {usage}")
 
         if self._last_todos:
             if parts:
@@ -1859,31 +1886,103 @@ class ResponseHandle:
         """Update agent list when new agents are dispatched."""
         if self._terminated:
             return
-        # Always cache launches — they will be rendered once the CardKit card
-        # exists (created by stream_update or deliver). Deferring creation
-        # avoids a blank streaming card when the turn's first action is an
-        # agent dispatch without any text.
-        existing = {a.get("description") for a in self._active_agents}
+        # Proactive card creation: a pure-subagent turn that starts with agent
+        # launches would never create a streaming card otherwise (Bug #1).
+        if not self.card_message_id:
+            self._ensure_card("")
+        # Cache launches — they will be rendered once the CardKit card exists.
+        # Dedup: prefer tool_call_id, fall back to description.
+        existing_ids = {a.get("tool_call_id") for a in self._active_agents
+                        if a.get("tool_call_id")}
+        existing_descs = {a.get("description") for a in self._active_agents}
         for a in launches:
-            if a.get("description") not in existing:
-                self._active_agents.append({
-                    "status": "in_progress",
-                    "result_text": None,
-                    "activities": None,
-                    "usage": None,
-                    **a,
-                })
-                existing.add(a.get("description"))
+            tc_id = a.get("tool_call_id")
+            desc = a.get("description")
+            if (tc_id and tc_id in existing_ids) or (not tc_id and desc in existing_descs):
+                continue
+            self._active_agents.append({
+                "status": "in_progress",
+                "result_text": None,
+                "activities": None,
+                "usage": None,
+                **a,
+            })
+            if tc_id:
+                existing_ids.add(tc_id)
+            if desc:
+                existing_descs.add(desc)
         if self._cardkit_card_id:
             self._render_progress()
+        elif self.card_message_id:
+            agent_md = self._format_agents_markdown(self._active_agents)
+            if agent_md:
+                self._try_patch(self.card_message_id, build_streaming_card(agent_md))
+
+    def agent_result_update(self, results: list[dict]):
+        """Mark agents completed/error based on subagent tool_execution_end results.
+
+        Each result dict: ``{toolCallId, result, isError}``.
+        - Primary: match by ``tool_call_id`` (all entries with that id)
+        - Fallback: description match on unmatched agents (single candidate only)
+        """
+        if self._terminated or not results:
+            return
+        changed = False
+        for r in results:
+            tc_id = r.get("toolCallId")
+            matched = False
+            # Primary: tool_call_id match. Parallel tasks store call_id:index;
+            # tool_execution_end carries only call_id, so match that prefix too.
+            if tc_id:
+                prefix = f"{tc_id}:"
+                for a in self._active_agents:
+                    agent_id = a.get("tool_call_id")
+                    if (agent_id == tc_id or (isinstance(agent_id, str) and agent_id.startswith(prefix))) and a.get("status") == "in_progress":
+                        a["status"] = "error" if r.get("isError") else "completed"
+                        result = r.get("result")
+                        if result:
+                            a["result_text"] = self._extract_result_text(result)
+                        matched = True
+                        changed = True
+                if matched:
+                    continue
+            # Fallback: description match on unmatched agents only
+            desc = r.get("description")
+            if not desc:
+                continue
+            candidates = [a for a in self._active_agents
+                          if a.get("description") == desc
+                          and a.get("status") == "in_progress"]
+            if len(candidates) == 1:
+                a = candidates[0]
+                a["status"] = "error" if r.get("isError") else "completed"
+                result = r.get("result")
+                if result:
+                    a["result_text"] = self._extract_result_text(result)
+                changed = True
+            elif len(candidates) > 1:
+                log.debug("agent_result_update: ambiguous description %r (%d candidates); "
+                          "leaving unresolved for final fallback", desc, len(candidates))
+        if changed:
+            if self._cardkit_card_id:
+                self._render_progress()
+            elif self.card_message_id:
+                agent_md = self._format_agents_markdown(self._active_agents)
+                if agent_md:
+                    self._try_patch(self.card_message_id, build_streaming_card(agent_md))
 
     def _mark_agents_completed(self):
-        """Mark active agents as completed when text starts flowing."""
+        """Final-fallback: mark any remaining in_progress agents as completed.
+
+        No longer called from _perform_flush (which was the first-text trigger).
+        Only invoked from deliver() as a safety net for agents that never
+        received a tool_execution_end event.
+        """
         if not self._active_agents:
             return
         changed = False
         for a in self._active_agents:
-            if a.get("status") != "completed":
+            if a.get("status") == "in_progress":
                 a["status"] = "completed"
                 changed = True
         if changed:
@@ -1958,7 +2057,6 @@ class ResponseHandle:
         if self._use_cardkit and self._cardkit_card_id:
             # ponytail: keep tool_history visible during streaming;
             # previously cleared here, now _render_progress limits display.
-            self._mark_agents_completed()
             self._update_summary_to_typing()
             text = strip_action_markers(text)
             text = optimize_markdown_style(text)

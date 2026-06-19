@@ -360,6 +360,7 @@ class StreamState:
     pending_tool_status: list = field(default_factory=list)
     pending_todo_update: list[dict] | None = None
     pending_agent_launches: list[dict] | None = None
+    pending_agent_results: list[dict] = field(default_factory=list)
     bg_agent_running: bool = False
     # Number of runner tools currently mid-execution (pi tool_execution_start/end).
     # >0 raises the silent budget to TOOL_ACTIVE_SILENT_TIMEOUT so a long single tool
@@ -1055,7 +1056,7 @@ class BaseRunner(ABC):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            on_agent_update=None, on_tool_end=None,
+            on_agent_update=None, on_tool_end=None, on_agent_end=None,
             env_extra: Optional[dict] = None,
             fork_session: bool = False,
             fresh_context: Optional[str] = None,
@@ -1111,7 +1112,8 @@ class BaseRunner(ABC):
                                          on_tool_status=on_tool_status,
                                          on_todo_update=on_todo_update,
                                          on_agent_update=on_agent_update,
-                                         on_tool_end=on_tool_end)
+                                         on_tool_end=on_tool_end,
+                                         on_agent_end=on_agent_end)
         else:
             result = self._run_blocking(proc, session_id, tag)
 
@@ -1159,7 +1161,8 @@ class BaseRunner(ABC):
 
     def _run_streaming(self, proc, session_id, tag, on_output,
                         on_tool_status=None, on_todo_update=None,
-                        on_agent_update=None, on_tool_end=None) -> dict:
+                        on_agent_update=None, on_tool_end=None,
+                        on_agent_end=None) -> dict:
         state = StreamState(session_id=session_id)
         timed_out = False
         silent_timed_out = False
@@ -1296,6 +1299,13 @@ class BaseRunner(ABC):
                     if on_agent_update:
                         on_agent_update(state.pending_agent_launches)
                     state.pending_agent_launches = None
+                    liveness = True
+
+                # Drain pending_agent_results → on_agent_end callback.
+                if state.pending_agent_results:
+                    if on_agent_end:
+                        on_agent_end(list(state.pending_agent_results))
+                    state.pending_agent_results.clear()
                     liveness = True
 
                 # Drain pending_tool_end_ids → on_tool_end callback (F-1).
@@ -1783,7 +1793,7 @@ class CodexRunner(BaseRunner):
     def run(self, prompt: str, session_id: Optional[str] = None,
             resume: bool = False, tag: Optional[str] = None,
             on_output=None, on_tool_status=None, on_todo_update=None,
-            on_agent_update=None, on_tool_end=None,
+            on_agent_update=None, on_tool_end=None, on_agent_end=None,
             env_extra: Optional[dict] = None,
             fork_session: bool = False,
             fresh_context: Optional[str] = None,
@@ -1812,7 +1822,7 @@ class CodexRunner(BaseRunner):
                 prompt, session_id=session_id, resume=resume,
                 tag=tag, on_output=on_output, on_tool_status=on_tool_status,
                 on_todo_update=on_todo_update, on_agent_update=on_agent_update,
-                on_tool_end=on_tool_end,
+                on_tool_end=on_tool_end, on_agent_end=on_agent_end,
                 env_extra=env_extra,
                 fresh_context=None,
                 workspace_override=workspace_override,

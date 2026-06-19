@@ -128,12 +128,21 @@ class PiRunner(BaseRunner):
         if etype == "tool_execution_end":
             state.tool_active_count = max(0, state.tool_active_count - 1)
             state.pending_silent_reset = True
-            # Forward execution result to UI for rich output display
-            # (pi-feishu parity: args in the expandable card).
             tool_name = event.get("toolName")
             call_id = event.get("toolCallId")
             result = event.get("result")
             is_error = event.get("isError", False)
+            # Subagent results route to pending_agent_results for precise
+            # per-agent completion tracking (not the collapsible tool panel).
+            if self._normalize_pi_tool(tool_name or "") == "Subagent" and call_id:
+                state.pending_agent_results.append({
+                    "toolCallId": call_id,
+                    "result": result,
+                    "isError": is_error,
+                })
+                return
+            # Forward execution result to UI for rich output display
+            # (pi-feishu parity: args in the expandable card).
             if tool_name and call_id:
                 state.pending_tool_status.append({
                     "name": self._normalize_pi_tool(tool_name),
@@ -360,28 +369,25 @@ class PiRunner(BaseRunner):
                 tasks_list = args.get("tasks")
                 if isinstance(tasks_list, list) and tasks_list:
                     emitted = False
-                    for entry in tasks_list:
+                    for idx, entry in enumerate(tasks_list):
                         if not isinstance(entry, dict):
                             continue
                         agent_name = entry.get("agent", "")
                         task_text = entry.get("task", "")
+                        launch = {"name": None, "subagent_type": agent_name}
+                        if call_id:
+                            launch["tool_call_id"] = f"{call_id}:{idx}"
                         if agent_name and task_text:
                             if state.pending_agent_launches is None:
                                 state.pending_agent_launches = []
-                            state.pending_agent_launches.append({
-                                "description": task_text,
-                                "name": None,
-                                "subagent_type": agent_name,
-                            })
+                            launch["description"] = task_text
+                            state.pending_agent_launches.append(launch)
                             emitted = True
                         elif agent_name:
                             if state.pending_agent_launches is None:
                                 state.pending_agent_launches = []
-                            state.pending_agent_launches.append({
-                                "description": agent_name,
-                                "name": None,
-                                "subagent_type": agent_name,
-                            })
+                            launch["description"] = agent_name
+                            state.pending_agent_launches.append(launch)
                             emitted = True
                     if emitted:
                         if call_id:
@@ -395,11 +401,14 @@ class PiRunner(BaseRunner):
                 if agent_name and task_text:
                     if state.pending_agent_launches is None:
                         state.pending_agent_launches = []
-                    state.pending_agent_launches.append({
+                    launch = {
                         "description": task_text,
                         "name": None,
                         "subagent_type": agent_name,
-                    })
+                    }
+                    if call_id:
+                        launch["tool_call_id"] = call_id
+                    state.pending_agent_launches.append(launch)
                     if call_id:
                         state._tool_seen_starts.add(call_id)
                     return
