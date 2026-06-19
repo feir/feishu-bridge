@@ -151,9 +151,18 @@ class PiRunner(BaseRunner):
             # not stay extended into a text-only tail.
             state.tool_active_count = 0
             message = event.get("message") or {}
-            self._update_usage(message.get("usage"), state)
             stop_reason = message.get("stopReason")
-            if stop_reason and stop_reason != "toolUse":
+            terminating = bool(stop_reason) and stop_reason != "toolUse"
+            # Fallback accumulation: if message_end didn't accumulate yet
+            # (error/aborted path) and this turn is terminating, do it now.
+            if terminating and not state._current_message_accumulated:
+                self._update_usage(message.get("usage"), state,
+                                   event_message=message, accumulate=True)
+                state._current_message_accumulated = True
+            else:
+                self._update_usage(message.get("usage"), state,
+                                   event_message=message)
+            if terminating:
                 text = self._message_text(message)
                 if text:
                     should_emit = text != state.accumulated_text
@@ -162,6 +171,8 @@ class PiRunner(BaseRunner):
                         state.pending_output.append(state.accumulated_text)
                 state.is_error = stop_reason in {"error", "aborted"}
                 state.done = True
+                # Reset for next turn so the flag doesn't leak across turns.
+                state._current_message_accumulated = False
             return
 
         if etype == "error":
@@ -182,7 +193,9 @@ class PiRunner(BaseRunner):
 
         if etype == "message_end":
             message = event.get("message") or {}
-            self._update_usage(message.get("usage"), state)
+            self._update_usage(message.get("usage"), state,
+                               event_message=message, accumulate=True)
+            state._current_message_accumulated = True
             return
 
     def _build_streaming_result(self, state: StreamState,
@@ -211,6 +224,20 @@ class PiRunner(BaseRunner):
         else:
             model_name = actual_model or self.display_default_model() or "(cli-default)"
 
+        # pi footer data: cumulative usage + context + provider info
+        pi_footer_data = {
+            "cumulative_input": state.cumulative_input,
+            "cumulative_output": state.cumulative_output,
+            "cumulative_cache_read": state.cumulative_cache_read,
+            "cumulative_cache_write": state.cumulative_cache_write,
+            "cumulative_cost_total": state.cumulative_cost_total,
+            "latest_cache_hit_rate": state.latest_cache_hit_rate,
+            "context_window": state.context_window,
+            "context_tokens": state.peak_context_tokens,
+            "is_oauth": (provider or "").strip().lower() in {"anthropic", "openai-codex"},
+            "model": actual_model or None,
+        }
+
         return {
             "result": text,
             "session_id": state.session_id or session_id,
@@ -230,6 +257,7 @@ class PiRunner(BaseRunner):
             },
             "peak_context_tokens": state.peak_context_tokens,
             "compact_detected": False,
+            "pi_footer_data": pi_footer_data,
         }
 
     def parse_blocking_output(self, stdout: str, session_id: Optional[str]) -> dict:
@@ -515,7 +543,20 @@ class PiRunner(BaseRunner):
             return f"Pi 协议错误：{redacted}"
         return f"Pi 请求失败：{redacted}"
 
-    def _update_usage(self, usage: Optional[dict], state: StreamState) -> None:
+    def _update_usage(self, usage: Optional[dict], state: StreamState,
+                      event_message: Optional[dict] = None,
+                      *, accumulate: bool = False) -> None:
+        """Refresh last-call state (always) and optionally accumulate.
+
+        ``last_call_usage``, ``peak_context_tokens``, and
+        ``context_window`` are refreshed on every call.
+        Cumulative fields (``cumulative_input``, ``cumulative_output``,
+        ``cumulative_cache_read``, ``cumulative_cache_write``,
+        ``cumulative_cost_total``, ``latest_cache_hit_rate``) are only
+        updated when *accumulate* is True — this prevents double/triple
+        counting when usage arrives on text_end, message_end, *and*
+        turn_end for the same message.
+        """
         normalized = self._normalize_usage(usage)
         if not normalized:
             return
@@ -528,13 +569,47 @@ class PiRunner(BaseRunner):
         if ctx_tokens > state.peak_context_tokens:
             state.peak_context_tokens = ctx_tokens
 
+        # contextWindow from message or usage (pi event common fields)
+        if event_message and isinstance(event_message, dict):
+            cw = event_message.get("contextWindow")
+        else:
+            cw = None
+        if cw is None and isinstance(usage, dict):
+            cw = usage.get("contextWindow")
+        if isinstance(cw, (int, float)) and cw > 0:
+            state.context_window = int(cw)
+
+        if not accumulate:
+            return
+
+        # ── Cumulative pi usage tracking ──
+        state.cumulative_input += normalized.get("input_tokens", 0)
+        state.cumulative_output += normalized.get("output_tokens", 0)
+        state.cumulative_cache_read += normalized.get("cache_read_input_tokens", 0)
+        state.cumulative_cache_write += normalized.get("cache_creation_input_tokens", 0)
+        state.cumulative_cost_total += normalized.get("cost_total", 0.0)
+
+        # Cache hit rate
+        denom = (
+            state.cumulative_input
+            + state.cumulative_cache_read
+            + state.cumulative_cache_write
+        )
+        if denom > 0:
+            state.latest_cache_hit_rate = (
+                state.cumulative_cache_read / denom * 100
+            )
+
     @staticmethod
     def _normalize_usage(usage: Optional[dict]) -> dict:
         if not isinstance(usage, dict):
             return {}
+        cost = usage.get("cost", {}) or {}
+        cost_total = float(cost.get("total", 0) or 0)
         return {
             "input_tokens": int(usage.get("input", 0) or 0),
             "cache_read_input_tokens": int(usage.get("cacheRead", 0) or 0),
             "cache_creation_input_tokens": int(usage.get("cacheWrite", 0) or 0),
             "output_tokens": int(usage.get("output", 0) or 0),
+            "cost_total": cost_total,
         }

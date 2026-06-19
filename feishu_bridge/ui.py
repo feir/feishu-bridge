@@ -742,6 +742,69 @@ def _format_usage_footer(usage: dict) -> str:
     return " · ".join(parts) if parts else ""
 
 
+def _format_pi_usage_footer(data: dict) -> str:
+    """Format cumulative pi usage/context into a TUI-style footer string.
+
+    Segments are joined with two spaces. Returns empty string when no data.
+
+    Examples:
+        "↑12.3k  ↓1.2k  R4.5k  CH85.1%  $0.123  23.4%/200k  anthropic/claude-opus-4-6"
+    """
+    if not isinstance(data, dict):
+        return ""
+
+    parts: list[str] = []
+
+    # Token counts: ↑ ↓ R W
+    ci = int(data.get("cumulative_input", 0) or 0)
+    co = int(data.get("cumulative_output", 0) or 0)
+    cr = int(data.get("cumulative_cache_read", 0) or 0)
+    cw = int(data.get("cumulative_cache_write", 0) or 0)
+    if ci > 0:
+        parts.append(f"↑{_format_tokens(ci)}")
+    if co > 0:
+        parts.append(f"↓{_format_tokens(co)}")
+    if cr > 0:
+        parts.append(f"R{_format_tokens(cr)}")
+    if cw > 0:
+        parts.append(f"W{_format_tokens(cw)}")
+
+    # Cache hit rate
+    ch_rate = data.get("latest_cache_hit_rate")
+    if (cr > 0 or cw > 0) and ch_rate is not None:
+        try:
+            parts.append(f"CH{float(ch_rate):.1f}%")
+        except (TypeError, ValueError):
+            pass
+
+    # Cost
+    cost = float(data.get("cumulative_cost_total", 0) or 0)
+    is_oauth = bool(data.get("is_oauth", False))
+    if cost > 0 or is_oauth:
+        cost_str = f"${cost:.3f}"
+        if is_oauth:
+            cost_str += " (sub)"
+        parts.append(cost_str)
+
+    # Context window — use peak_context_tokens for per-turn utilization,
+    # not cumulative (which can exceed the window across turns).
+    window = int(data.get("context_window", 0) or 0)
+    if window > 0:
+        ctx_tokens = int(data.get("context_tokens", 0) or 0)
+        if ctx_tokens > 0:
+            pct = min(ctx_tokens / window * 100, 100.0)
+            parts.append(f"{pct:.1f}%/{_format_tokens(window)}")
+        else:
+            parts.append(f"?/{_format_tokens(window)}")
+
+    # Model string (appended as-is)
+    model = data.get("model")
+    if model:
+        parts.append(str(model))
+
+    return "  ".join(parts)
+
+
 def build_cardkit_final_card(content: str, is_error: bool = False,
                              elapsed_s: float = 0,
                              total_tokens: int = 0,
@@ -753,7 +816,8 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
                              todos: list[dict] | None = None,
                              context_alert: str | None = None,
                              tool_panels: list[dict] | None = None,
-                             agents: list[dict] | None = None) -> dict:
+                             agents: list[dict] | None = None,
+                             pi_footer: str | None = None) -> dict:
     # P1: parse action markers BEFORE optimize (Finding 6 ordering fix)
     content, markers = parse_action_markers(content)
     content = optimize_markdown_style(content)
@@ -857,6 +921,8 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
 
     status_line = " · ".join([status, *detail_parts]) if detail_parts else status
     footer_lines = [status_line]
+    if pi_footer:
+        footer_lines.append(pi_footer)
     if context_alert:
         footer_lines.append(context_alert)
     from feishu_bridge.updater import get_update_banner_text
@@ -1072,7 +1138,8 @@ class ResponseHandle:
                 total_tokens: int = 0, model_name: str | None = None,
                 project_label: str | None = None,
                 context_alert: str | None = None,
-                last_call_usage: dict | None = None) -> bool:
+                last_call_usage: dict | None = None,
+                pi_footer: str | None = None) -> bool:
         """Send the final content. Returns True iff a Feishu write succeeded.
 
         bg-task completion delivery (worker post-turn hook) reads this return
@@ -1103,7 +1170,8 @@ class ResponseHandle:
                                              last_call_usage=last_call_usage,
                                              model_name=model_name,
                                              project_label=project_label,
-                                             context_alert=context_alert)
+                                             context_alert=context_alert,
+                                             pi_footer=pi_footer)
             return self._deliver_im_patch(content, is_error,
                                           context_alert=context_alert)
         finally:
@@ -1113,7 +1181,8 @@ class ResponseHandle:
                          last_call_usage: dict | None = None,
                          model_name: str | None = None,
                          project_label: str | None = None,
-                         context_alert: str | None = None) -> bool:
+                         context_alert: str | None = None,
+                         pi_footer: str | None = None) -> bool:
         card_id = self._cardkit_card_id
         seq = self._next_seq()
         settings_json = json.dumps({"config": {"streaming_mode": False}})
@@ -1155,7 +1224,8 @@ class ResponseHandle:
             model_name=model_name, project_label=project_label,
             todos=self._last_todos, context_alert=context_alert,
             tool_panels=tool_panels,
-            agents=self._active_agents if self._active_agents else None)
+            agents=self._active_agents if self._active_agents else None,
+            pi_footer=pi_footer)
         card_data = json.dumps(final_card_json, ensure_ascii=False)
         log.info("CardKit card.update: card_id=%s content_len=%d payload_bytes=%d seq=%d",
                  card_id, len(content), len(card_data.encode("utf-8")), seq)

@@ -378,6 +378,16 @@ class StreamState:
     # Pi tool-call end ids ready for on_tool_end callback (drain loop).
     pending_tool_end_ids: list[str] = field(default_factory=list)
 
+    # ── Pi cumulative usage (message_end accumulation across turns) ──
+    _current_message_accumulated: bool = False
+    cumulative_input: int = 0
+    cumulative_output: int = 0
+    cumulative_cache_read: int = 0
+    cumulative_cache_write: int = 0
+    cumulative_cost_total: float = 0.0
+    latest_cache_hit_rate: Optional[float] = None
+    context_window: int = 0
+
     # ── Todo state machine (OMP ops format) ──
 
     def apply_todo_ops(self, ops: list) -> None:

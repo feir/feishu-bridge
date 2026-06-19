@@ -22,7 +22,7 @@ from feishu_bridge.runtime import (
     build_fresh_context_prompt, pick_primary_model, resolve_dotclaude_root,
 )
 from feishu_bridge.session_journal import SessionJournal
-from feishu_bridge.ui import ResponseHandle, remove_typing_indicator
+from feishu_bridge.ui import ResponseHandle, _format_pi_usage_footer, remove_typing_indicator
 
 log = logging.getLogger("feishu-bridge")
 
@@ -1538,11 +1538,17 @@ def process_message(
             # (resolved_workspace), not the bot's global ~/.claude default that
             # runner.workspace points to. See _footer_project_label.
             project_label = _footer_project_label(bound, resolved_workspace)
+
+            # pi TUI-style usage footer (only for pi-runner paths)
+            pi_footer_data = result.get("pi_footer_data")
+            pi_footer = _format_pi_usage_footer(pi_footer_data) if pi_footer_data else None
+
             delivered = handle.deliver(result["result"], is_error=result["is_error"],
                                        last_call_usage=_last_usage,
                                        model_name=model_name,
                                        project_label=project_label,
-                                       context_alert=ctx_alert)
+                                       context_alert=ctx_alert,
+                                       pi_footer=pi_footer)
             _bg_mark_delivery_outcome(item, delivered)
 
         return handle

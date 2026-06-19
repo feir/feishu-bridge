@@ -138,6 +138,21 @@ def test_pi_parse_text_delta_and_final_usage(tmp_path):
         "type": "message_update",
         "assistantMessageEvent": {"type": "text_delta", "delta": "OK"},
     }, state)
+    # message_end (authoritative termination) triggers cumulative accumulation
+    runner.parse_streaming_line({
+        "type": "message_end",
+        "message": {
+            "stopReason": "stop",
+            "content": [{"type": "text", "text": "PI_OK"}],
+            "usage": {
+                "input": 369,
+                "output": 3,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 372,
+            },
+        },
+    }, state)
     runner.parse_streaming_line({
         "type": "turn_end",
         "message": {
@@ -165,12 +180,14 @@ def test_pi_parse_text_delta_and_final_usage(tmp_path):
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
             "output_tokens": 3,
+            "cost_total": 0.0,
         },
         "last_call_usage": {
             "input_tokens": 369,
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
             "output_tokens": 3,
+            "cost_total": 0.0,
         },
         "modelUsage": {
             "Qwen3.6-35B-A3B-mxfp4": {
@@ -183,6 +200,18 @@ def test_pi_parse_text_delta_and_final_usage(tmp_path):
         },
         "peak_context_tokens": 369,
         "compact_detected": False,
+        "pi_footer_data": {
+            "cumulative_input": 369,
+            "cumulative_output": 3,
+            "cumulative_cache_read": 0,
+            "cumulative_cache_write": 0,
+            "cumulative_cost_total": 0.0,
+            "latest_cache_hit_rate": 0.0,
+            "context_window": 0,
+            "context_tokens": 369,
+            "is_oauth": False,
+            "model": None,
+        },
     }
 
 
@@ -1072,3 +1101,248 @@ def test_tool_call_from_update_toolcall_end_prefers_top_level(tmp_path):
     }
     tc = PiRunner._tool_call_from_update(update)
     assert tc["id"] == "end_id"
+
+
+# ── Cumulative usage: dedup across text_end / message_end / turn_end ──
+
+def test_cumulative_usage_dedup_text_end_message_end_turn_end(tmp_path):
+    """text_end + message_end + turn_end with same usage → cumulative == single,
+    not ×3. last_call_usage and peak_context_tokens are still refreshed on
+    every event (no regression)."""
+    runner = _runner(tmp_path)
+    state = StreamState(session_id="s")
+
+    usage = {
+        "input": 10,
+        "output": 1,
+        "cacheRead": 2,
+        "cacheWrite": 3,
+        "cost": {"total": 0.01},
+    }
+
+    # text_end: refreshes last_call_usage + peak, does NOT accumulate
+    runner.parse_streaming_line({
+        "type": "message_update",
+        "assistantMessageEvent": {
+            "type": "text_end",
+            "partial": {"usage": usage},
+        },
+    }, state)
+    assert state.last_call_usage["input_tokens"] == 10
+    assert state.last_call_usage["output_tokens"] == 1
+    assert state.peak_context_tokens == 10 + 2 + 3  # 15
+    # Not yet accumulated
+    assert state.cumulative_input == 0
+    assert state.cumulative_output == 0
+    assert state.cumulative_cache_read == 0
+    assert state.cumulative_cache_write == 0
+    assert state.cumulative_cost_total == 0.0
+
+    # message_end: authority → now accumulate
+    runner.parse_streaming_line({
+        "type": "message_end",
+        "message": {"stopReason": "stop", "usage": usage},
+    }, state)
+    assert state.cumulative_input == 10
+    assert state.cumulative_output == 1
+    assert state.cumulative_cache_read == 2
+    assert state.cumulative_cache_write == 3
+    assert state.cumulative_cost_total == 0.01
+
+    # turn_end: refreshes last_call_usage + peak, does NOT re-accumulate
+    runner.parse_streaming_line({
+        "type": "turn_end",
+        "message": {
+            "stopReason": "stop",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": usage,
+        },
+    }, state)
+    # Cumulative must NOT double — still single usage
+    assert state.cumulative_input == 10
+    assert state.cumulative_output == 1
+    assert state.cumulative_cache_read == 2
+    assert state.cumulative_cache_write == 3
+    assert state.cumulative_cost_total == 0.01
+    # last_call_usage + peak still refreshed
+    assert state.last_call_usage["input_tokens"] == 10
+    assert state.peak_context_tokens == 15
+
+    # Build result → pi_footer_data carries the correct cumulative
+    result = runner._build_streaming_result(state, "s")
+    footer = result["pi_footer_data"]
+    assert footer["cumulative_input"] == 10
+    assert footer["cumulative_output"] == 1
+    assert footer["cumulative_cache_read"] == 2
+    assert footer["cumulative_cache_write"] == 3
+    assert footer["cumulative_cost_total"] == 0.01
+
+
+# ── Fallback accumulation: turn_end without message_end (error/aborted) ──
+
+
+def test_terminal_turn_end_without_message_end_accumulates_fallback(tmp_path):
+    """error/aborted turn_end without preceding message_end → fallback
+    accumulate once, cumulative_* equals single usage (not 0, not 2x)."""
+    runner = _runner(tmp_path)
+    state = StreamState(session_id="s")
+
+    usage = {
+        "input": 50,
+        "output": 5,
+        "cacheRead": 10,
+        "cacheWrite": 0,
+        "cost": {"total": 0.05},
+    }
+
+    # text_end with partial usage (no cumulative accumulation)
+    runner.parse_streaming_line({
+        "type": "message_update",
+        "assistantMessageEvent": {
+            "type": "text_end",
+            "partial": {"usage": usage},
+        },
+    }, state)
+    # No message_end — error/aborted path
+    runner.parse_streaming_line({
+        "type": "turn_end",
+        "message": {
+            "stopReason": "error",
+            "errorMessage": "something went wrong",
+            "usage": usage,
+        },
+    }, state)
+
+    # Stream terminated
+    assert state.done is True
+    assert state.is_error is True
+    # Cumulative_* must equal single usage (fallback accumulated exactly once)
+    assert state.cumulative_input == 50
+    assert state.cumulative_output == 5
+    assert state.cumulative_cache_read == 10
+    assert state.cumulative_cache_write == 0
+    assert state.cumulative_cost_total == 0.05
+    # last_call_usage still refreshed
+    assert state.last_call_usage["input_tokens"] == 50
+
+    # pi_footer_data reflects correct cumulative
+    result = runner._build_streaming_result(state, "s")
+    footer = result["pi_footer_data"]
+    assert footer["cumulative_input"] == 50
+    assert footer["cumulative_output"] == 5
+    assert footer["cumulative_cache_read"] == 10
+    assert footer["cumulative_cache_write"] == 0
+    assert footer["cumulative_cost_total"] == 0.05
+
+
+def test_terminal_turn_end_without_message_end_aborted(tmp_path):
+    """Same as above but with stopReason=aborted."""
+    runner = _runner(tmp_path)
+    state = StreamState(session_id="s")
+
+    usage = {"input": 20, "output": 2, "cacheRead": 0, "cacheWrite": 0,
+             "cost": {"total": 0.02}}
+
+    runner.parse_streaming_line({
+        "type": "turn_end",
+        "message": {
+            "stopReason": "aborted",
+            "content": [{"type": "text", "text": "aborted early"}],
+            "usage": usage,
+        },
+    }, state)
+
+    assert state.done is True
+    assert state.is_error is True
+    assert state.cumulative_input == 20
+    assert state.cumulative_output == 2
+    assert state.cumulative_cost_total == 0.02
+
+
+def test_message_end_then_turn_end_no_double_accumulation(tmp_path):
+    """message_end accumulated → turn_end must NOT double-accumulate.
+    Regression guard for the normal path."""
+    runner = _runner(tmp_path)
+    state = StreamState(session_id="s")
+
+    usage = {"input": 100, "output": 10, "cacheRead": 0, "cacheWrite": 0,
+             "cost": {"total": 0.10}}
+
+    # message_end accumulates
+    runner.parse_streaming_line({
+        "type": "message_end",
+        "message": {"stopReason": "stop", "usage": usage},
+    }, state)
+    assert state.cumulative_input == 100
+    assert state._current_message_accumulated is True
+
+    # turn_end must NOT accumulate again
+    runner.parse_streaming_line({
+        "type": "turn_end",
+        "message": {
+            "stopReason": "stop",
+            "content": [{"type": "text", "text": "done"}],
+            "usage": usage,
+        },
+    }, state)
+
+    assert state.done is True
+    assert state.is_error is False
+    # Still single usage — no double
+    assert state.cumulative_input == 100
+    assert state.cumulative_output == 10
+    assert state.cumulative_cost_total == 0.10
+    # Flag reset for next turn
+    assert state._current_message_accumulated is False
+
+    # pi_footer_data
+    result = runner._build_streaming_result(state, "s")
+    footer = result["pi_footer_data"]
+    assert footer["cumulative_input"] == 100
+
+
+def test_cross_turn_flag_reset_prevents_leak(tmp_path):
+    """After an error turn (fallback accumulated, flag reset),
+    the next turn must accumulate its own usage independently."""
+    runner = _runner(tmp_path)
+    state = StreamState(session_id="s")
+
+    # Turn 1: error, no message_end → fallback accumulate
+    usage1 = {"input": 30, "output": 3, "cacheRead": 0, "cacheWrite": 0,
+              "cost": {"total": 0.03}}
+    runner.parse_streaming_line({
+        "type": "turn_end",
+        "message": {
+            "stopReason": "error",
+            "errorMessage": "fail",
+            "usage": usage1,
+        },
+    }, state)
+    assert state._current_message_accumulated is False  # reset after termination
+    assert state.cumulative_input == 30
+
+    # Simulate a new turn by resetting done (the stream loop creates a new
+    # StreamState; here we reuse and clear done for test purposes).
+    state.done = False
+    state.is_error = False
+
+    # Turn 2: normal path → message_end accumulates independently
+    usage2 = {"input": 40, "output": 4, "cacheRead": 0, "cacheWrite": 0,
+              "cost": {"total": 0.04}}
+    runner.parse_streaming_line({
+        "type": "message_end",
+        "message": {"stopReason": "stop", "usage": usage2},
+    }, state)
+    runner.parse_streaming_line({
+        "type": "turn_end",
+        "message": {
+            "stopReason": "stop",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": usage2,
+        },
+    }, state)
+
+    # Cumulative = turn1 + turn2 (no leak, no skip)
+    assert state.cumulative_input == 30 + 40
+    assert state.cumulative_output == 3 + 4
+    assert state.cumulative_cost_total == 0.03 + 0.04
