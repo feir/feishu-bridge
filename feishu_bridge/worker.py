@@ -1542,16 +1542,21 @@ def process_message(
             # runner.workspace points to. See _footer_project_label.
             project_label = _footer_project_label(bound, resolved_workspace)
 
-            # pi TUI-style usage footer (only for pi-runner paths)
+            # pi TUI-style usage replaces bridge's per-call estimate in
+            # status_line; skip context/model here because they have their own
+            # footer slots already.
             pi_footer_data = result.get("pi_footer_data")
-            pi_footer = _format_pi_usage_footer(pi_footer_data) if pi_footer_data else None
+            usage_footer = (_format_pi_usage_footer(
+                pi_footer_data, include_context=False, include_model=False)
+                if pi_footer_data else None)
 
             delivered = handle.deliver(result["result"], is_error=result["is_error"],
                                        last_call_usage=_last_usage,
                                        model_name=model_name,
                                        project_label=project_label,
                                        context_alert=ctx_alert,
-                                       pi_footer=pi_footer)
+                                       usage_footer=usage_footer,
+                                       pi_footer=None)
             _bg_mark_delivery_outcome(item, delivered)
 
         return handle

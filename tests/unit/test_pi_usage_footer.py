@@ -117,6 +117,50 @@ class TestFormatPiUsageFooter:
         result = _format_pi_usage_footer(data)
         assert "anthropic/claude-opus-4-6" in result
 
+    def test_include_context_false_skips_context_window(self):
+        data = {
+            "cumulative_input": 50000,
+            "cumulative_cache_read": 25000,
+            "cumulative_cache_write": 5000,
+            "context_window": 200000,
+            "context_tokens": 80000,
+            "model": "anthropic/claude-opus-4-6",
+        }
+        result = _format_pi_usage_footer(data, include_context=False)
+        assert "↑50.0k" in result
+        assert "R25.0k" in result
+        assert "%/" not in result
+        assert "anthropic/claude-opus-4-6" in result
+
+    def test_include_model_false_skips_model(self):
+        data = {
+            "cumulative_input": 12345,
+            "cumulative_output": 5678,
+            "model": "anthropic/claude-opus-4-6",
+        }
+        result = _format_pi_usage_footer(data, include_model=False)
+        assert "↑12.3k" in result
+        assert "anthropic/claude-opus-4-6" not in result
+
+    def test_both_false_returns_only_token_cache_cost(self):
+        data = {
+            "cumulative_input": 12345,
+            "cumulative_output": 5678,
+            "cumulative_cache_read": 4500,
+            "cumulative_cost_total": 0.123,
+            "context_window": 200000,
+            "context_tokens": 80000,
+            "model": "anthropic/claude-opus-4-6",
+        }
+        result = _format_pi_usage_footer(
+            data, include_context=False, include_model=False)
+        assert "↑12.3k" in result
+        assert "↓5.7k" in result
+        assert "R4.5k" in result
+        assert "$0.123" in result
+        assert "%/" not in result
+        assert "anthropic/claude-opus-4-6" not in result
+
     def test_zero_tokens_not_output(self):
         """cumulative fields with 0 should not produce prefix lines."""
         data = {
@@ -197,6 +241,46 @@ class TestBuildCardkitFinalCardPiFooter:
         assert "✅" in lines[1]
         assert "sonnet" in lines[1]
         assert "30.0s" in lines[1]
+
+    def test_usage_footer_takes_priority_over_last_call_usage(self):
+        usage = {"input_tokens": 100, "output_tokens": 50}
+        card = build_cardkit_final_card(
+            "Hello",
+            usage_footer="PI_USAGE_HERE",
+            last_call_usage=usage,
+            model_name="claude-sonnet",
+        )
+        content = card["body"]["elements"][-1]["content"]
+        assert "PI_USAGE_HERE" in content
+        assert "100 in" not in content
+        assert "50 out" not in content
+
+    def test_usage_footer_used_in_status_line_without_pi_footer(self):
+        card = build_cardkit_final_card(
+            "Hello",
+            usage_footer="↑1k  ↓500  R200",
+            pi_footer=None,
+            model_name="claude-sonnet",
+            elapsed_s=30,
+        )
+        lines = card["body"]["elements"][-1]["content"].split("\n")
+        assert "✅" in lines[1]
+        assert "sonnet" in lines[1]
+        assert "↑1k" in lines[1]
+        assert "↓500" in lines[1]
+        assert len(lines) == 2
+
+    def test_usage_footer_falls_back_to_last_call_usage(self):
+        usage = {"input_tokens": 12000, "output_tokens": 500}
+        card = build_cardkit_final_card("Hello", last_call_usage=usage)
+        content = card["body"]["elements"][-1]["content"]
+        assert "12.0k in" in content
+        assert "500 out" in content
+
+    def test_usage_footer_falls_back_to_total_tokens(self):
+        card = build_cardkit_final_card("Hello", total_tokens=5000)
+        content = card["body"]["elements"][-1]["content"]
+        assert "5.0k tokens" in content
 
     def test_pi_footer_with_context_alert_and_banner(self):
         """pi_footer should appear between status_line and context_alert."""

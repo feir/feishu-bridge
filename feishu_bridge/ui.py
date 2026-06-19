@@ -741,7 +741,8 @@ def _format_usage_footer(usage: dict) -> str:
     return " · ".join(parts) if parts else ""
 
 
-def _format_pi_usage_footer(data: dict) -> str:
+def _format_pi_usage_footer(data: dict, *, include_context: bool = True,
+                            include_model: bool = True) -> str:
     """Format cumulative pi usage/context into a TUI-style footer string.
 
     Segments are joined with two spaces. Returns empty string when no data.
@@ -787,19 +788,21 @@ def _format_pi_usage_footer(data: dict) -> str:
 
     # Context window — use peak_context_tokens for per-turn utilization,
     # not cumulative (which can exceed the window across turns).
-    window = int(data.get("context_window", 0) or 0)
-    if window > 0:
-        ctx_tokens = int(data.get("context_tokens", 0) or 0)
-        if ctx_tokens > 0:
-            pct = min(ctx_tokens / window * 100, 100.0)
-            parts.append(f"{pct:.1f}%/{_format_tokens(window)}")
-        else:
-            parts.append(f"?/{_format_tokens(window)}")
+    if include_context:
+        window = int(data.get("context_window", 0) or 0)
+        if window > 0:
+            ctx_tokens = int(data.get("context_tokens", 0) or 0)
+            if ctx_tokens > 0:
+                pct = min(ctx_tokens / window * 100, 100.0)
+                parts.append(f"{pct:.1f}%/{_format_tokens(window)}")
+            else:
+                parts.append(f"?/{_format_tokens(window)}")
 
     # Model string (appended as-is)
-    model = data.get("model")
-    if model:
-        parts.append(str(model))
+    if include_model:
+        model = data.get("model")
+        if model:
+            parts.append(str(model))
 
     return "  ".join(parts)
 
@@ -816,6 +819,7 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
                              context_alert: str | None = None,
                              tool_panels: list[dict] | None = None,
                              agents: list[dict] | None = None,
+                             usage_footer: str | None = None,
                              pi_footer: str | None = None) -> dict:
     # P1: parse action markers BEFORE optimize (Finding 6 ordering fix)
     content, markers = parse_action_markers(content)
@@ -893,9 +897,11 @@ def build_cardkit_final_card(content: str, is_error: bool = False,
         detail_parts.append(short_model)
     if elapsed_s > 0:
         detail_parts.append(_format_elapsed(elapsed_s))
-    # Token usage: prefer detailed last_call_usage with cache hit info,
-    # fall back to simple total_tokens for backward compat.
-    if last_call_usage:
+    # Token usage: pi runner can pass usage_footer to override bridge's
+    # per-call estimate; otherwise preserve existing fallback order.
+    if usage_footer:
+        detail_parts.append(usage_footer)
+    elif last_call_usage:
         detail_parts.append(_format_usage_footer(last_call_usage))
     elif total_tokens > 0:
         detail_parts.append(f"{_format_tokens(total_tokens)} tokens")
@@ -1127,6 +1133,7 @@ class ResponseHandle:
                 project_label: str | None = None,
                 context_alert: str | None = None,
                 last_call_usage: dict | None = None,
+                usage_footer: str | None = None,
                 pi_footer: str | None = None) -> bool:
         """Send the final content. Returns True iff a Feishu write succeeded.
 
@@ -1162,6 +1169,7 @@ class ResponseHandle:
                                              model_name=model_name,
                                              project_label=project_label,
                                              context_alert=context_alert,
+                                             usage_footer=usage_footer,
                                              pi_footer=pi_footer)
             return self._deliver_im_patch(content, is_error,
                                           context_alert=context_alert)
@@ -1173,6 +1181,7 @@ class ResponseHandle:
                          model_name: str | None = None,
                          project_label: str | None = None,
                          context_alert: str | None = None,
+                         usage_footer: str | None = None,
                          pi_footer: str | None = None) -> bool:
         card_id = self._cardkit_card_id
         seq = self._next_seq()
@@ -1216,6 +1225,7 @@ class ResponseHandle:
             todos=self._last_todos, context_alert=context_alert,
             tool_panels=tool_panels,
             agents=self._active_agents if self._active_agents else None,
+            usage_footer=usage_footer,
             pi_footer=pi_footer)
         card_data = json.dumps(final_card_json, ensure_ascii=False)
         log.info("CardKit card.update: card_id=%s content_len=%d payload_bytes=%d seq=%d",
