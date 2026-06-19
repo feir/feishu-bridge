@@ -1495,3 +1495,35 @@ class TestFormatAgentsMarkdown:
         md = ResponseHandle._format_agents_markdown(agents)
         assert "❌ **失败 (developer)**" in md
         assert "boom" in md
+
+
+# ---- GetSubagentResult skip in tool_status_update ----
+
+
+def test_tool_status_update_skips_get_subagent_result():
+    """GetSubagentResult is internal polling — skipped from tool_history."""
+    from collections import deque
+    from unittest.mock import MagicMock
+    from feishu_bridge.ui import ResponseHandle
+
+    h = ResponseHandle.__new__(ResponseHandle)
+    h._tool_history = deque(maxlen=8)
+    h._terminated = False
+    h._summary_updated = False
+    h.card_message_id = "msg-1"
+    h._cardkit_card_id = "card-1"
+    h._update_summary = MagicMock()
+    h._render_progress = MagicMock()
+    h._ensure_card = MagicMock(return_value=True)
+
+    # Push a real tool first, then GetSubagentResult
+    h.tool_status_update([
+        {"name": "Read", "hint_data": "/a/foo.py"},
+        {"name": "GetSubagentResult", "hint_data": "subagent-abc"},
+    ])
+    # Only Read entry, GetSubagentResult is skipped
+    assert len(h._tool_history) == 1
+    assert h._tool_history[0]["name"] == "Read"
+
+    # Prior running entry is marked done by skip (existing behavior)
+    assert h._tool_history[0]["status"] == "done"

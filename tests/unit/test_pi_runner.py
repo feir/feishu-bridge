@@ -1440,3 +1440,154 @@ def test_non_subagent_tool_execution_end_still_routes_to_tool_status(tmp_path):
     assert len(state.pending_tool_status) == 1
     assert state.pending_tool_status[0]["id"] == "bash_call_1"
     assert state.pending_tool_status[0]["_exec_result"] is not None
+
+
+# ── tool_execution_start Subagent → pending_agent_launches ──
+
+
+def test_tool_execution_start_subagent_produces_agent_launches(tmp_path):
+    """tool_execution_start with Subagent agent+task → pending_agent_launches,
+    not pending_tool_status."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line({
+        "type": "tool_execution_start",
+        "toolCallId": "exec_sub_1",
+        "toolName": "subagent",
+        "args": {"agent": "scout", "task": "分析认证流程"},
+    }, state)
+    # Must produce agent launches, not tool status
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches == [
+        {"description": "分析认证流程", "name": None, "subagent_type": "scout",
+         "tool_call_id": "exec_sub_1"},
+    ]
+    assert "exec_sub_1" in state._tool_seen_starts
+    assert state.tool_active_count == 1
+
+
+def test_tool_execution_start_subagent_tasks_multi(tmp_path):
+    """tool_execution_start with Subagent tasks=[...] → multiple agent launches."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line({
+        "type": "tool_execution_start",
+        "toolCallId": "exec_sub_m1",
+        "toolName": "subagent",
+        "args": {
+            "tasks": [
+                {"agent": "scout", "task": "分析认证流程"},
+                {"agent": "scout", "task": "分析路由结构"},
+            ],
+        },
+    }, state)
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches == [
+        {"description": "分析认证流程", "name": None, "subagent_type": "scout",
+         "tool_call_id": "exec_sub_m1:0"},
+        {"description": "分析路由结构", "name": None, "subagent_type": "scout",
+         "tool_call_id": "exec_sub_m1:1"},
+    ]
+    assert "exec_sub_m1" in state._tool_seen_starts
+
+
+def test_tool_execution_start_subagent_dedup_with_toolcall_start(tmp_path):
+    """tool_execution_start after toolcall_start (same call_id) is deduped."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    # First, simulate toolcall_start via _emit_tool_status path
+    runner.parse_streaming_line(
+        _toolcall_event("toolcall_start", call_id="sub_dedup", name="subagent",
+                        arguments={"agent": "scout", "task": "分析"}), state)
+    assert len(state.pending_agent_launches) == 1
+    # Then tool_execution_start with same call_id → deduped
+    runner.parse_streaming_line({
+        "type": "tool_execution_start",
+        "toolCallId": "sub_dedup",
+        "toolName": "subagent",
+        "args": {"agent": "scout", "task": "分析"},
+    }, state)
+    # Still only one launch
+    assert len(state.pending_agent_launches) == 1
+    assert state.pending_tool_status == []
+
+
+def test_tool_execution_start_subagent_without_id_still_emits(tmp_path):
+    """tool_execution_start Subagent without callId still generates launches."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line({
+        "type": "tool_execution_start",
+        "toolName": "subagent",
+        "args": {"agent": "writer", "task": "写报告"},
+    }, state)
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches == [
+        {"description": "写报告", "name": None, "subagent_type": "writer"},
+    ]
+    # No call_id → _tool_seen_starts not updated (no dedup key)
+    assert len(state._tool_seen_starts) == 0
+
+
+def test_tool_execution_start_get_subagent_result_skips(tmp_path):
+    """tool_execution_start GetSubagentResult → no pending_tool_status."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line({
+        "type": "tool_execution_start",
+        "toolCallId": "gsr_1",
+        "toolName": "get_subagent_result",
+        "args": {"subagentId": "subagent-abc"},
+    }, state)
+    assert state.pending_tool_status == []
+    assert state.pending_agent_launches is None
+    # Liveness still tracked
+    assert state.tool_active_count == 1
+
+
+def test_tool_execution_end_get_subagent_result_skips(tmp_path):
+    """tool_execution_end GetSubagentResult → no pending_tool_status."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    state.tool_active_count = 1
+    runner.parse_streaming_line({
+        "type": "tool_execution_end",
+        "toolCallId": "gsr_1",
+        "toolName": "get_subagent_result",
+        "result": {"content": [{"type": "text", "text": "done"}]},
+    }, state)
+    assert state.pending_tool_status == []
+    assert state.tool_active_count == 0
+
+
+def test_normal_pi_tool_execution_start_still_emits(tmp_path):
+    """Non-Subagent, non-GetSubagentResult tool_execution_start still emits
+    _exec_args (regression guard)."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    runner.parse_streaming_line({
+        "type": "tool_execution_start",
+        "toolCallId": "bash_1",
+        "toolName": "bash",
+        "args": {"command": "echo hi"},
+    }, state)
+    assert len(state.pending_tool_status) == 1
+    assert state.pending_tool_status[0]["name"] == "Bash"
+    assert state.pending_tool_status[0]["_exec_args"] == {"command": "echo hi"}
+
+
+def test_normal_pi_tool_execution_end_still_emits(tmp_path):
+    """Non-Subagent, non-GetSubagentResult tool_execution_end still emits
+    _exec_result (regression guard)."""
+    runner = _runner(tmp_path)
+    state = StreamState()
+    state.tool_active_count = 1
+    runner.parse_streaming_line({
+        "type": "tool_execution_end",
+        "toolCallId": "read_1",
+        "toolName": "read",
+        "result": {"content": [{"type": "text", "text": "file contents"}]},
+    }, state)
+    assert len(state.pending_tool_status) == 1
+    assert state.pending_tool_status[0]["name"] == "Read"
+    assert state.pending_tool_status[0]["_exec_result"] is not None

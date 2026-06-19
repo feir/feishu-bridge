@@ -116,9 +116,20 @@ class PiRunner(BaseRunner):
             tool_name = event.get("toolName")
             call_id = event.get("toolCallId")
             exec_args = event.get("args")
+            norm_name = self._normalize_pi_tool(tool_name or "")
+            # GetSubagentResult is internal polling — hide from tool panels.
+            if norm_name == "GetSubagentResult":
+                return
+            # Subagent with args → build agent launches instead of tool status.
+            # Dedup with message_update.toolcall_start path via _tool_seen_starts.
+            if norm_name == "Subagent" and isinstance(exec_args, dict):
+                if call_id and call_id in state._tool_seen_starts:
+                    return  # already emitted via toolcall_start
+                self._try_build_subagent_launches(exec_args, call_id or None, state)
+                return
             if tool_name and call_id and isinstance(exec_args, dict):
                 state.pending_tool_status.append({
-                    "name": self._normalize_pi_tool(tool_name),
+                    "name": norm_name,
                     "hint_data": "",
                     "id": call_id,
                     "_exec_args": exec_args,
@@ -132,20 +143,24 @@ class PiRunner(BaseRunner):
             call_id = event.get("toolCallId")
             result = event.get("result")
             is_error = event.get("isError", False)
+            norm_name = self._normalize_pi_tool(tool_name or "")
             # Subagent results route to pending_agent_results for precise
             # per-agent completion tracking (not the collapsible tool panel).
-            if self._normalize_pi_tool(tool_name or "") == "Subagent" and call_id:
+            if norm_name == "Subagent" and call_id:
                 state.pending_agent_results.append({
                     "toolCallId": call_id,
                     "result": result,
                     "isError": is_error,
                 })
                 return
+            # GetSubagentResult is internal polling — hide from tool panels.
+            if norm_name == "GetSubagentResult":
+                return
             # Forward execution result to UI for rich output display
             # (pi-feishu parity: args in the expandable card).
             if tool_name and call_id:
                 state.pending_tool_status.append({
-                    "name": self._normalize_pi_tool(tool_name),
+                    "name": norm_name,
                     "hint_data": "",
                     "id": call_id,
                     "_exec_result": result,
@@ -324,6 +339,67 @@ class PiRunner(BaseRunner):
             self._emit_tool_status(update, state,
                                    is_start=(utype == "toolcall_start"))
 
+    @classmethod
+    def _try_build_subagent_launches(cls, args: dict, call_id: str | None,
+                                     state: StreamState) -> bool:
+        """Build Subagent agent launches from args dict.
+
+        Handles both multi-task parallel dispatch (tasks=[{agent, task}, ...])
+        and single agent+task path. Appends to ``state.pending_agent_launches``
+        and adds ``call_id`` to ``_tool_seen_starts`` when launches are emitted.
+
+        Returns True if at least one launch was emitted, False otherwise.
+        """
+        # Multi-task parallel dispatch: tasks=[{agent, task}, ...]
+        tasks_list = args.get("tasks")
+        if isinstance(tasks_list, list) and tasks_list:
+            emitted = False
+            for idx, entry in enumerate(tasks_list):
+                if not isinstance(entry, dict):
+                    continue
+                agent_name = entry.get("agent", "")
+                task_text = entry.get("task", "")
+                launch = {"name": None, "subagent_type": agent_name}
+                if call_id:
+                    launch["tool_call_id"] = f"{call_id}:{idx}"
+                if agent_name and task_text:
+                    if state.pending_agent_launches is None:
+                        state.pending_agent_launches = []
+                    launch["description"] = task_text
+                    state.pending_agent_launches.append(launch)
+                    emitted = True
+                elif agent_name:
+                    if state.pending_agent_launches is None:
+                        state.pending_agent_launches = []
+                    launch["description"] = agent_name
+                    state.pending_agent_launches.append(launch)
+                    emitted = True
+            if emitted:
+                if call_id:
+                    state._tool_seen_starts.add(call_id)
+                return True
+            # fall through to single-shot try then warning
+
+        # Single agent+task path
+        agent_name = args.get("agent", "")
+        task_text = args.get("task", "")
+        if agent_name and task_text:
+            if state.pending_agent_launches is None:
+                state.pending_agent_launches = []
+            launch = {
+                "description": task_text,
+                "name": None,
+                "subagent_type": agent_name,
+            }
+            if call_id:
+                launch["tool_call_id"] = call_id
+            state.pending_agent_launches.append(launch)
+            if call_id:
+                state._tool_seen_starts.add(call_id)
+            return True
+
+        return False
+
     def _emit_tool_status(self, update: dict, state: StreamState,
                           is_start: bool) -> None:
         """Surface a pi tool call as one ``{name, hint_data}`` entry.
@@ -365,52 +441,7 @@ class PiRunner(BaseRunner):
             if canonical == "Subagent":
                 if not is_start:
                     return
-                # Multi-task parallel dispatch: tasks=[{agent, task}, ...]
-                tasks_list = args.get("tasks")
-                if isinstance(tasks_list, list) and tasks_list:
-                    emitted = False
-                    for idx, entry in enumerate(tasks_list):
-                        if not isinstance(entry, dict):
-                            continue
-                        agent_name = entry.get("agent", "")
-                        task_text = entry.get("task", "")
-                        launch = {"name": None, "subagent_type": agent_name}
-                        if call_id:
-                            launch["tool_call_id"] = f"{call_id}:{idx}"
-                        if agent_name and task_text:
-                            if state.pending_agent_launches is None:
-                                state.pending_agent_launches = []
-                            launch["description"] = task_text
-                            state.pending_agent_launches.append(launch)
-                            emitted = True
-                        elif agent_name:
-                            if state.pending_agent_launches is None:
-                                state.pending_agent_launches = []
-                            launch["description"] = agent_name
-                            state.pending_agent_launches.append(launch)
-                            emitted = True
-                    if emitted:
-                        if call_id:
-                            state._tool_seen_starts.add(call_id)
-                        return
-                    # fall through to single-shot try then warning
-
-                # Single agent+task path
-                agent_name = args.get("agent", "")
-                task_text = args.get("task", "")
-                if agent_name and task_text:
-                    if state.pending_agent_launches is None:
-                        state.pending_agent_launches = []
-                    launch = {
-                        "description": task_text,
-                        "name": None,
-                        "subagent_type": agent_name,
-                    }
-                    if call_id:
-                        launch["tool_call_id"] = call_id
-                    state.pending_agent_launches.append(launch)
-                    if call_id:
-                        state._tool_seen_starts.add(call_id)
+                if self._try_build_subagent_launches(args, call_id, state):
                     return
 
                 # All extraction failed (including empty args).
