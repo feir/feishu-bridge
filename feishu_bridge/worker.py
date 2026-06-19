@@ -1543,11 +1543,11 @@ def process_message(
             project_label = _footer_project_label(bound, resolved_workspace)
 
             # pi TUI-style usage replaces bridge's per-call estimate in
-            # status_line; skip context/model here because they have their own
-            # footer slots already.
+            # status_line; keep context usage from pi_footer_data, but skip
+            # model because model_name already has its own status slot.
             pi_footer_data = result.get("pi_footer_data")
             usage_footer = (_format_pi_usage_footer(
-                pi_footer_data, include_context=False, include_model=False)
+                pi_footer_data, include_context=True, include_model=False)
                 if pi_footer_data else None)
 
             delivered = handle.deliver(result["result"], is_error=result["is_error"],
