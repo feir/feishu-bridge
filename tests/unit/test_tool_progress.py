@@ -357,29 +357,28 @@ class TestToolStatusUpdateDedup:
         ])
         assert len(handle._tool_history) == 0
 
-    def test_subagent_excluded_from_tool_history(self, handle):
-        """Subagent is always routed through agent_list_update, never tool card."""
+    def test_subagent_included_in_tool_history(self, handle):
+        """Subagent is rendered in the normal tool card."""
         handle.tool_status_update([
             {"name": "Subagent", "hint_data": "scout: 分析代码"},
         ])
-        assert len(handle._tool_history) == 0
+        assert len(handle._tool_history) == 1
+        assert handle._tool_history[0]["name"] == "Subagent"
+        assert handle._tool_history[0]["label"] == "分发子任务"
 
-    def test_tool_status_update_skip_marks_prior_running_as_done(self, handle):
-        """When a skipped tool (Subagent, etc.) arrives, prior in-flight
-        tool entries should be marked done, not left as running forever."""
-        # Push WebFetch tool_call → 1 entry status=running
+    def test_tool_status_update_subagent_marks_prior_done(self, handle):
+        """A new Subagent tool entry closes the prior in-flight tool."""
         handle.tool_status_update([
             {"name": "WebFetch", "hint_data": "https://example.com"},
         ])
         assert len(handle._tool_history) == 1
         assert handle._tool_history[0]["status"] == "running"
-        # Push Subagent tool_call → skipped, but marks prior running → done
         handle.tool_status_update([
             {"name": "Subagent", "hint_data": ""},
         ])
-        # History still has 1 entry (Subagent skipped), but WebFetch is done
-        assert len(handle._tool_history) == 1
+        assert len(handle._tool_history) == 2
         assert handle._tool_history[0]["status"] == "done"
+        assert handle._tool_history[1]["name"] == "Subagent"
 
     def test_tool_status_update_without_main_card_accumulates_history(self, handle):
         """tool_status_update accumulates _tool_history even when no main card exists.
@@ -411,30 +410,20 @@ class TestToolStatusUpdateDedup:
         assert handle._tool_history[0]["label"] == "执行命令"
         handle._render_progress.assert_called_once()
 
-    def test_repeat_after_skip_restores_running(self, handle):
-        """When a skipped tool (Subagent) marks a prior entry done,
-        repeating the same tool should restore running status."""
-        # Step 1: WebFetch → entry status=running, count=1
+    def test_repeat_after_subagent_creates_new_entry(self, handle):
+        """Subagent is no longer skipped, so following tools are separate entries."""
         handle.tool_status_update([
             {"name": "WebFetch", "hint_data": "https://example.com"},
         ])
-        assert len(handle._tool_history) == 1
-        assert handle._tool_history[0]["status"] == "running"
-        assert handle._tool_history[0]["count"] == 1
-        # Step 2: Subagent → skip, marks prior running → done
         handle.tool_status_update([
             {"name": "Subagent", "hint_data": ""},
         ])
-        assert len(handle._tool_history) == 1
-        assert handle._tool_history[0]["status"] == "done"
-        assert handle._tool_history[0]["count"] == 1
-        # Step 3: WebFetch (same hint) → repeat entry, restore running
         handle.tool_status_update([
             {"name": "WebFetch", "hint_data": "https://example.com"},
         ])
-        assert len(handle._tool_history) == 1
-        assert handle._tool_history[0]["status"] == "running"
-        assert handle._tool_history[0]["count"] == 2
+        assert len(handle._tool_history) == 3
+        assert [e["name"] for e in handle._tool_history] == ["WebFetch", "Subagent", "WebFetch"]
+        assert handle._tool_history[-1]["status"] == "running"
 
     def test_mark_agents_completed_marks_not_clears(self, handle):
         """_mark_agents_completed should mark agents as completed, not clear them."""
@@ -1497,11 +1486,11 @@ class TestFormatAgentsMarkdown:
         assert "boom" in md
 
 
-# ---- GetSubagentResult skip in tool_status_update ----
+# ---- GetSubagentResult in tool_status_update ----
 
 
-def test_tool_status_update_skips_get_subagent_result():
-    """GetSubagentResult is internal polling — skipped from tool_history."""
+def test_tool_status_update_includes_get_subagent_result():
+    """GetSubagentResult is rendered as a normal tool panel entry."""
     from collections import deque
     from unittest.mock import MagicMock
     from feishu_bridge.ui import ResponseHandle
@@ -1516,14 +1505,12 @@ def test_tool_status_update_skips_get_subagent_result():
     h._render_progress = MagicMock()
     h._ensure_card = MagicMock(return_value=True)
 
-    # Push a real tool first, then GetSubagentResult
     h.tool_status_update([
         {"name": "Read", "hint_data": "/a/foo.py"},
         {"name": "GetSubagentResult", "hint_data": "subagent-abc"},
     ])
-    # Only Read entry, GetSubagentResult is skipped
-    assert len(h._tool_history) == 1
+    assert len(h._tool_history) == 2
     assert h._tool_history[0]["name"] == "Read"
-
-    # Prior running entry is marked done by skip (existing behavior)
     assert h._tool_history[0]["status"] == "done"
+    assert h._tool_history[1]["name"] == "GetSubagentResult"
+    assert h._tool_history[1]["label"] == "查询后台任务"

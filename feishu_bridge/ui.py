@@ -1421,7 +1421,7 @@ class ResponseHandle:
                                 break
                 continue
 
-            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task", "Subagent", "GetSubagentResult"):
+            if name in ("Agent", "TodoWrite", "TeamCreate", "SendMessage", "Task"):
                 # Skipped tools (rendered elsewhere) still signal that prior tool
                 # work has moved on — mark any in-flight entries done so the user
                 # sees ✅ instead of a permanently ⌛ on the last real tool.
