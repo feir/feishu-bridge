@@ -354,6 +354,12 @@ class FeishuCalendar(FeishuAPI):
         if not token:
             return None
 
+        if not calendar_id:
+            cal = self._get_primary_calendar(token)
+            if cal is None:
+                return {"error": "no_primary_calendar"}
+            calendar_id = cal.get("calendar_id", "")
+
         body = {}
         if summary is not None:
             body["summary"] = summary
@@ -373,15 +379,16 @@ class FeishuCalendar(FeishuAPI):
 
     def delete_event(self, chat_id: str, user_open_id: str,
                      calendar_id: str, event_id: str) -> Optional[dict]:
-        """Delete a calendar event.
-
-        Args:
-            calendar_id: calendar ID
-            event_id: event ID to delete
-        """
+        """Delete a calendar event."""
         token = self.get_token(chat_id, user_open_id)
         if not token:
             return None
+
+        if not calendar_id:
+            cal = self._get_primary_calendar(token)
+            if cal is None:
+                return {"error": "no_primary_calendar"}
+            calendar_id = cal.get("calendar_id", "")
 
         return self.request(
             "DELETE", f"/calendars/{calendar_id}/events/{event_id}", token)

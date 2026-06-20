@@ -26,6 +26,7 @@ class FeishuDocs(FeishuAPI):
         "docx:document:readonly",
         "docx:document:create",
         "wiki:wiki:readonly",
+        "drive:drive",
     ]
     # No BASE_PATH — docs use MCP, not OAPI directly
 
@@ -73,7 +74,7 @@ class FeishuDocs(FeishuAPI):
             elif action == "delete":
                 result = self.delete(
                     chat_id, sender_id,
-                    doc_token=kwargs.get("doc_token", ""))
+                    doc_token=kwargs.get("doc_token") or kwargs.get("doc_id", ""))
             else:
                 return {"ok": False, "error": "unsupported_action",
                         "message": f"未知 action: {action}"}

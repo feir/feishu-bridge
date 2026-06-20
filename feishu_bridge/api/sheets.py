@@ -26,6 +26,7 @@ class FeishuSheets(FeishuAPI):
     SCOPES = [
         "sheets:spreadsheet:readonly",
         "sheets:spreadsheet",
+        "drive:drive",
     ]
     # Sheets uses mixed v2/v3 endpoints
     BASE_PATH = ""

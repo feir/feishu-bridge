@@ -52,7 +52,7 @@ class FeishuBitable(FeishuAPI):
     _READ_ACTIONS = {"list_records", "get_record", "list_fields",
                      "list_views", "list_tables", "get_view"}
     _WRITE_ACTIONS = {"create_records", "update_records", "delete_records",
-                      "create_table", "delete_table",
+                      "create_table", "patch_table", "delete_table",
                       "create_field", "update_field", "delete_field",
                       "create_view", "patch_view", "delete_view",
                       "create_app", "copy_app"}
@@ -114,6 +114,10 @@ class FeishuBitable(FeishuAPI):
                     chat_id, sender_id, app_token,
                     name=kwargs.get("name", ""),
                     fields=kwargs.get("fields"))
+            elif action == "patch_table":
+                result = self.patch_table(
+                    chat_id, sender_id, app_token, table_id,
+                    name=kwargs.get("name", ""))
             elif action == "delete_table":
                 result = self.delete_table(
                     chat_id, sender_id, app_token, table_id)
