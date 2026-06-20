@@ -106,13 +106,14 @@ Agent 通过 bridge **Control API**（Unix socket JSON-RPC）的 `call_service` 
 | 会话持久化 | session_id | thread_id | RPC 进程 | session 文件 |
 | 空闲 auto-compact | ✅ | ❌ | ✅ | ❌ |
 | 默认模型 | 由 Claude CLI 决定 | 由 Codex CLI 决定 | `~/.omp/agent/config.yml` | `~/.pi/models.json` |
+| 飞书 API | lark CLI | lark CLI | lark CLI | feishu-bridge skill |
 
 ### 安全
 - **Token 加密** — AES-256-GCM，密钥绑定 app_id + user_id + machine_id
 - **会话内授权** — 飞书 API 权限不足时弹出交互卡片，无需离开飞书
 - **Control API 鉴权** — Unix socket (0600) + 随机 token (0600) + `call_service` 活跃会话校验
-- **沙盒限制** — 内置权限规则拦截高危命令（`systemctl *feishu-bridge*`、`shutdown`、`curl` 等）
-- **删除二次确认** — 所有删除命令需 `--confirm <prefix>` 校验
+- **沙盒限制** — 默认允许 Bash 后黑名单拦截高危命令：`systemctl *feishu-bridge*`、`shutdown`、`reboot`、`mkfs`、`dd if=`、`npm publish`、`kubectl`、`kill -9`、`killall`、`curl`、`wget` 等（完整列表见 `bridge-settings.json`）
+- **删除二次确认** — feishu-cli/lark CLI 删除类操作需 `--confirm <prefix>` 二次校验
 
 ## Bridge 命令
 
@@ -135,9 +136,10 @@ Agent 通过 bridge **Control API**（Unix socket JSON-RPC）的 `call_service` 
 | `/memory-gc` | 清理和整理 memory（bridge 工作流） |
 | `/confirm` | 确认待执行的工作流草稿 |
 | `/feishu-tasks [命令]` | 飞书任务管理（list/get/subtasks/add-subtask/complete） |
-| `/feishu-doc` | 云文档读写（Markdown） |
-| `/feishu-sheet` | 电子表格读写 |
-| `/feishu-bitable` | 多维表格操作 |
+| `/feishu-doc` | 云文档 read/write/create（Markdown） |
+| `/feishu-sheet` | 电子表格 info/read（数据读取） |
+| `/feishu-bitable` | 多维表格 info/records/fields（信息与数据查看） |
+| `/project [id\|path\|clear]` | 绑定/查看/清除项目 workspace |
 | `/restart` | 重启 Bridge 进程 |
 | `/restart-all` | 重启所有 bot 实例 |
 | `/help` | 显示帮助 |
@@ -496,7 +498,7 @@ Bridge 安装后提供三个 CLI 入口：
 |------|------|
 | `feishu-bridge` | 主进程入口 |
 | `feishu-cli` | Bot 消息发送（send-message / send-image / send-audio） |
-| `bridge-cli` | Bridge 管理工具（后台任务 / Control API 调试） |
+| `bridge-cli` | Bridge 管理工具（后台任务 bg enqueue/status/list/cancel） |
 
 飞书服务 API 可用 bridge 内置 wrapper（通过 `call_service`）或独立的 [lark CLI](https://github.com/larksuite/cli)：
 
@@ -508,6 +510,36 @@ lark calendar events +list                   # 查看日历
 lark tasks +list                             # 查看任务
 lark mail +search --query "季度报告"           # 搜索邮件
 ```
+
+### Control API
+
+Bridge 通过 Unix socket JSON-RPC 暴露内部状态和控制接口（socket 0600 + token 0600）：
+
+```bash
+# 查询状态
+SOCK=~/.feishu-bridge/control-<bot-name>.sock
+TOKEN=$(cat ~/.feishu-bridge/control-<bot-name>.token)
+echo '{"method":"status","token":"'$TOKEN'","id":"1"}' | socat - UNIX-CONNECT:"$SOCK"
+
+# Agent/Provider 热切换
+echo '{"method":"set_model","token":"...","params":{"name":"sonnet"}}' | socat - UNIX-CONNECT:"$SOCK"
+```
+
+| 方法 | 说明 |
+|------|------|
+| `health` | 存活检查 |
+| `status` | 综合状态（agent/bot/sessions/queue/quota） |
+| `config` | 脱敏后的配置快照 |
+| `sessions` | 活跃会话列表 |
+| `quota` | Claude/Codex 配额快照 |
+| `logs` | 最近日志（`n` 条，`level` 过滤） |
+| `tasks` | 后台任务列表 |
+| `call_service` | 飞书 API 调用（tasks/sheets/docs/bitable/calendar/mail） |
+| `set_provider` | 热切换 LLM provider |
+| `set_model` | 热切换模型 |
+| `set_agent` | 热切换 runner（claude/codex/pi/omp） |
+| `stop_session` | 取消指定 session |
+| `shutdown` | 优雅关闭 bridge |
 
 ### 后台任务
 
