@@ -87,12 +87,19 @@ class FeishuCalendar(FeishuAPI):
                 result = self.primary_calendar(chat_id, sender_id)
             # Write
             elif action == "create_event":
+                st = kwargs.get("start_time")
+                et = kwargs.get("end_time")
+                # 支持 string timestamp → 自动包装为 API 格式
+                if isinstance(st, str):
+                    st = {"timestamp": st}
+                if isinstance(et, str):
+                    et = {"timestamp": et}
                 result = self.create_event(
                     chat_id, sender_id,
                     calendar_id=kwargs.get("calendar_id"),
                     summary=kwargs.get("summary", ""),
-                    start_time=kwargs.get("start_time"),
-                    end_time=kwargs.get("end_time"),
+                    start_time=st,
+                    end_time=et,
                     description=kwargs.get("description"))
             elif action == "update_event":
                 result = self.update_event(

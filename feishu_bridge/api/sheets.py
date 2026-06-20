@@ -100,6 +100,9 @@ class FeishuSheets(FeishuAPI):
 
             if result is None:
                 return {"ok": False, "error": "auth_failed"}
+            if isinstance(result, dict) and "error" in result:
+                return {"ok": False, "error": result["error"],
+                        "data": result}
             return {"ok": True, "data": result}
         except Exception as e:
             log.exception("Sheets dispatch error: action=%s", action)
