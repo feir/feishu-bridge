@@ -112,7 +112,7 @@ class FeishuMail(FeishuAPI):
             params["page_token"] = page_token
 
         data = self.request("GET",
-            f"/users/{self.DEFAULT_MAILBOX}/messages", token, params=params)
+            f"/user_mailboxes/{self.DEFAULT_MAILBOX}/messages", token, params=params)
 
         items = data.get("items", [])
         # Extract summary fields for each message
@@ -149,7 +149,7 @@ class FeishuMail(FeishuAPI):
 
         result = self.request(
             "GET",
-            f"/users/{self.DEFAULT_MAILBOX}/messages/{message_id}",
+            f"/user_mailboxes/{self.DEFAULT_MAILBOX}/messages/{message_id}",
             token,
             params={},
         )
@@ -187,7 +187,7 @@ class FeishuMail(FeishuAPI):
 
         result = self.request(
             "GET",
-            f"/users/{self.DEFAULT_MAILBOX}/threads/{thread_id}",
+            f"/user_mailboxes/{self.DEFAULT_MAILBOX}/threads/{thread_id}",
             token,
         )
 
