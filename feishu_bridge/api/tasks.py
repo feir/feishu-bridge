@@ -411,21 +411,27 @@ class FeishuTasks(FeishuAPI):
                             json_body={"tasklist_guid": tasklist_guid})
 
     # -------------------------------------------------------------------
-    # Dispatch (Phase 1: read-only)
+    # Dispatch (full read+write)
     # -------------------------------------------------------------------
 
     _READ_ACTIONS = {"list_tasks", "get_task", "list_subtasks",
                      "list_tasklists", "summary"}
+    _WRITE_ACTIONS = {"create_task", "update_task", "complete_task",
+                      "create_subtask", "create_tasklist",
+                      "update_tasklist", "delete_tasklist",
+                      "add_task_to_tasklist", "remove_task_from_tasklist"}
+    _ALL_ACTIONS = _READ_ACTIONS | _WRITE_ACTIONS
 
     def dispatch(self, action: str, chat_id: str, sender_id: str,
                  **kwargs) -> dict:
         """统一入口，归一化返回 {ok, data/error}."""
         try:
-            if action not in self._READ_ACTIONS:
+            if action not in self._ALL_ACTIONS:
                 return {"ok": False, "error": "unsupported_action",
-                        "message": f"Phase 1 仅支持只读操作: "
-                        f"{', '.join(sorted(self._READ_ACTIONS))}"}
+                        "message": f"支持的操作: "
+                        f"{', '.join(sorted(self._ALL_ACTIONS))}"}
 
+            # Read
             if action == "list_tasks":
                 result = self.list_tasks(chat_id, sender_id, **kwargs)
             elif action == "get_task":
@@ -438,6 +444,56 @@ class FeishuTasks(FeishuAPI):
                 result = self.list_tasklists(chat_id, sender_id)
             elif action == "summary":
                 result = self.summary(chat_id, sender_id)
+            # Write
+            elif action == "create_task":
+                result = self.create_task(
+                    chat_id, sender_id,
+                    summary=kwargs.get("summary", ""),
+                    description=kwargs.get("description"),
+                    due_timestamp=kwargs.get("due_timestamp"),
+                    tasklist_guid=kwargs.get("tasklist_guid"),
+                    section_guid=kwargs.get("section_guid"))
+            elif action == "update_task":
+                result = self.update_task(
+                    chat_id, sender_id,
+                    task_guid=kwargs.get("task_guid", ""),
+                    summary=kwargs.get("summary"),
+                    description=kwargs.get("description"),
+                    due_timestamp=kwargs.get("due_timestamp"),
+                    completed_at=kwargs.get("completed_at"))
+            elif action == "complete_task":
+                result = self.complete_task(
+                    chat_id, sender_id,
+                    kwargs.get("task_guid", ""))
+            elif action == "create_subtask":
+                result = self.create_subtask(
+                    chat_id, sender_id,
+                    parent_guid=kwargs.get("parent_guid", ""),
+                    summary=kwargs.get("summary", ""),
+                    description=kwargs.get("description"),
+                    due_timestamp=kwargs.get("due_timestamp"))
+            elif action == "create_tasklist":
+                result = self.create_tasklist(
+                    chat_id, sender_id, kwargs.get("name", ""))
+            elif action == "update_tasklist":
+                result = self.update_tasklist(
+                    chat_id, sender_id,
+                    tasklist_guid=kwargs.get("tasklist_guid", ""),
+                    name=kwargs.get("name", ""))
+            elif action == "delete_tasklist":
+                result = self.delete_tasklist(
+                    chat_id, sender_id,
+                    kwargs.get("tasklist_guid", ""))
+            elif action == "add_task_to_tasklist":
+                result = self.add_task_to_tasklist(
+                    chat_id, sender_id,
+                    task_guid=kwargs.get("task_guid", ""),
+                    tasklist_guid=kwargs.get("tasklist_guid", ""))
+            elif action == "remove_task_from_tasklist":
+                result = self.remove_task_from_tasklist(
+                    chat_id, sender_id,
+                    task_guid=kwargs.get("task_guid", ""),
+                    tasklist_guid=kwargs.get("tasklist_guid", ""))
             else:
                 return {"ok": False, "error": "unsupported_action",
                         "message": f"未知 action: {action}"}

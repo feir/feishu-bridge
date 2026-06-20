@@ -45,20 +45,23 @@ class FeishuSheets(FeishuAPI):
                             params=params, json_body=json_body)
 
     # -------------------------------------------------------------------
-    # Dispatch (Phase 1: read-only)
+    # Dispatch (full read+write)
     # -------------------------------------------------------------------
 
     _READ_ACTIONS = {"info", "read"}
+    _WRITE_ACTIONS = {"write", "append", "create", "delete"}
+    _ALL_ACTIONS = _READ_ACTIONS | _WRITE_ACTIONS
 
     def dispatch(self, action: str, chat_id: str, sender_id: str,
                  **kwargs) -> dict:
         """统一入口，归一化返回 {ok, data/error}."""
         try:
-            if action not in self._READ_ACTIONS:
+            if action not in self._ALL_ACTIONS:
                 return {"ok": False, "error": "unsupported_action",
-                        "message": f"Phase 1 仅支持只读操作: "
-                        f"{', '.join(sorted(self._READ_ACTIONS))}"}
+                        "message": f"支持的操作: "
+                        f"{', '.join(sorted(self._ALL_ACTIONS))}"}
 
+            # Read
             if action == "info":
                 result = self.info(
                     chat_id, sender_id,
@@ -68,6 +71,28 @@ class FeishuSheets(FeishuAPI):
                     chat_id, sender_id,
                     spreadsheet_token=kwargs.get("spreadsheet_token", ""),
                     range_=kwargs.get("range", ""))
+            # Write
+            elif action == "write":
+                result = self.write(
+                    chat_id, sender_id,
+                    spreadsheet_token=kwargs.get("spreadsheet_token", ""),
+                    range_=kwargs.get("range", ""),
+                    values=kwargs.get("values", []))
+            elif action == "append":
+                result = self.append(
+                    chat_id, sender_id,
+                    spreadsheet_token=kwargs.get("spreadsheet_token", ""),
+                    range_=kwargs.get("range", ""),
+                    values=kwargs.get("values", []))
+            elif action == "create":
+                result = self.create(
+                    chat_id, sender_id,
+                    title=kwargs.get("title", ""),
+                    folder_token=kwargs.get("folder_token"))
+            elif action == "delete":
+                result = self.delete(
+                    chat_id, sender_id,
+                    spreadsheet_token=kwargs.get("spreadsheet_token", ""))
             else:
                 return {"ok": False, "error": "unsupported_action",
                         "message": f"未知 action: {action}"}

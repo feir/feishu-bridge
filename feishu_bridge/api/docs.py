@@ -30,26 +30,50 @@ class FeishuDocs(FeishuAPI):
     # No BASE_PATH — docs use MCP, not OAPI directly
 
     # -------------------------------------------------------------------
-    # Dispatch (Phase 1: read-only)
+    # Dispatch (full read+write)
     # -------------------------------------------------------------------
 
     _READ_ACTIONS = {"fetch"}
+    _WRITE_ACTIONS = {"create", "update", "delete"}
+    _ALL_ACTIONS = _READ_ACTIONS | _WRITE_ACTIONS
 
     def dispatch(self, action: str, chat_id: str, sender_id: str,
                  **kwargs) -> dict:
         """统一入口，归一化返回 {ok, data/error}."""
         try:
-            if action not in self._READ_ACTIONS:
+            if action not in self._ALL_ACTIONS:
                 return {"ok": False, "error": "unsupported_action",
-                        "message": f"Phase 1 仅支持只读操作: "
-                        f"{', '.join(sorted(self._READ_ACTIONS))}"}
+                        "message": f"支持的操作: "
+                        f"{', '.join(sorted(self._ALL_ACTIONS))}"}
 
+            # Read
             if action == "fetch":
                 result = self.fetch(
                     chat_id, sender_id,
                     doc_id=kwargs.get("doc_id", ""),
                     offset=kwargs.get("offset"),
                     limit=kwargs.get("limit"))
+            # Write
+            elif action == "create":
+                result = self.create(
+                    chat_id, sender_id,
+                    title=kwargs.get("title", ""),
+                    markdown=kwargs.get("markdown", ""),
+                    folder_token=kwargs.get("folder_token"),
+                    wiki_space=kwargs.get("wiki_space"))
+            elif action == "update":
+                result = self.update(
+                    chat_id, sender_id,
+                    doc_id=kwargs.get("doc_id", ""),
+                    markdown=kwargs.get("markdown", ""),
+                    mode=kwargs.get("mode", "overwrite"),
+                    selection=kwargs.get("selection"),
+                    selection_by_title=kwargs.get("selection_by_title"),
+                    new_title=kwargs.get("new_title"))
+            elif action == "delete":
+                result = self.delete(
+                    chat_id, sender_id,
+                    doc_token=kwargs.get("doc_token", ""))
             else:
                 return {"ok": False, "error": "unsupported_action",
                         "message": f"未知 action: {action}"}

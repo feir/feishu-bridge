@@ -26,27 +26,33 @@ class FeishuCalendar(FeishuAPI):
     SCOPES = [
         "calendar:calendar:readonly",
         "calendar:calendar",
+        "calendar:calendar:create",
+        "calendar:calendar:update",
+        "calendar:calendar:delete",
     ]
     BASE_PATH = "/open-apis/calendar/v4"
 
     # -------------------------------------------------------------------
-    # Dispatch (Phase 1: read-only)
+    # Dispatch (full read+write)
     # -------------------------------------------------------------------
 
     _READ_ACTIONS = {
         "agenda", "get_event", "search_events",
         "list_calendars", "freebusy", "primary_calendar",
     }
+    _WRITE_ACTIONS = {"create_event", "update_event", "delete_event"}
+    _ALL_ACTIONS = _READ_ACTIONS | _WRITE_ACTIONS
 
     def dispatch(self, action: str, chat_id: str, sender_id: str,
                  **kwargs) -> dict:
         """统一入口，归一化返回 {ok, data/error}."""
         try:
-            if action not in self._READ_ACTIONS:
+            if action not in self._ALL_ACTIONS:
                 return {"ok": False, "error": "unsupported_action",
-                        "message": f"Phase 1 仅支持只读操作: "
-                        f"{', '.join(sorted(self._READ_ACTIONS))}"}
+                        "message": f"支持的操作: "
+                        f"{', '.join(sorted(self._ALL_ACTIONS))}"}
 
+            # Read
             if action == "agenda":
                 result = self.agenda(
                     chat_id, sender_id,
@@ -79,6 +85,29 @@ class FeishuCalendar(FeishuAPI):
                 )
             elif action == "primary_calendar":
                 result = self.primary_calendar(chat_id, sender_id)
+            # Write
+            elif action == "create_event":
+                result = self.create_event(
+                    chat_id, sender_id,
+                    calendar_id=kwargs.get("calendar_id"),
+                    summary=kwargs.get("summary", ""),
+                    start_time=kwargs.get("start_time"),
+                    end_time=kwargs.get("end_time"),
+                    description=kwargs.get("description"))
+            elif action == "update_event":
+                result = self.update_event(
+                    chat_id, sender_id,
+                    calendar_id=kwargs.get("calendar_id"),
+                    event_id=kwargs.get("event_id", ""),
+                    summary=kwargs.get("summary"),
+                    start_time=kwargs.get("start_time"),
+                    end_time=kwargs.get("end_time"),
+                    description=kwargs.get("description"))
+            elif action == "delete_event":
+                result = self.delete_event(
+                    chat_id, sender_id,
+                    calendar_id=kwargs.get("calendar_id"),
+                    event_id=kwargs.get("event_id", ""))
             else:
                 return {"ok": False, "error": "unsupported_action",
                         "message": f"未知 action: {action}"}
@@ -263,6 +292,99 @@ class FeishuCalendar(FeishuAPI):
         }
 
         return self.request("POST", "/freebusy/list", token, json_body=body)
+
+    # -------------------------------------------------------------------
+    # Event write operations
+    # -------------------------------------------------------------------
+
+    def create_event(self, chat_id: str, user_open_id: str,
+                     summary: str, start_time: dict, end_time: dict,
+                     calendar_id: str = None,
+                     description: str = None) -> Optional[dict]:
+        """Create a calendar event.
+
+        Args:
+            summary: event title
+            start_time: {"timestamp": "1609430400"} or {"date": "2021-01-01"}
+            end_time: {"timestamp": "1609434000"} or {"date": "2021-01-02"}
+            calendar_id: calendar ID (defaults to primary)
+            description: optional event description
+        """
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        if not calendar_id:
+            cal = self._get_primary_calendar(token)
+            if cal is None:
+                return {"error": "no_primary_calendar"}
+            calendar_id = cal.get("calendar_id", "")
+
+        body = {
+            "summary": summary,
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+        if description:
+            body["description"] = description
+
+        return self.request(
+            "POST", f"/calendars/{calendar_id}/events", token,
+            json_body=body)
+
+    def update_event(self, chat_id: str, user_open_id: str,
+                     calendar_id: str, event_id: str,
+                     summary: str = None,
+                     start_time: dict = None,
+                     end_time: dict = None,
+                     description: str = None) -> Optional[dict]:
+        """Update a calendar event.
+
+        Only provided fields will be updated.
+
+        Args:
+            calendar_id: calendar ID
+            event_id: event ID to update
+            summary: new event title
+            start_time: {"timestamp": "..."} or {"date": "..."}
+            end_time: {"timestamp": "..."} or {"date": "..."}
+            description: new description
+        """
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        body = {}
+        if summary is not None:
+            body["summary"] = summary
+        if start_time is not None:
+            body["start_time"] = start_time
+        if end_time is not None:
+            body["end_time"] = end_time
+        if description is not None:
+            body["description"] = description
+
+        if not body:
+            raise ValueError("update_event requires at least one field to update")
+
+        return self.request(
+            "PATCH", f"/calendars/{calendar_id}/events/{event_id}", token,
+            json_body=body)
+
+    def delete_event(self, chat_id: str, user_open_id: str,
+                     calendar_id: str, event_id: str) -> Optional[dict]:
+        """Delete a calendar event.
+
+        Args:
+            calendar_id: calendar ID
+            event_id: event ID to delete
+        """
+        token = self.get_token(chat_id, user_open_id)
+        if not token:
+            return None
+
+        return self.request(
+            "DELETE", f"/calendars/{calendar_id}/events/{event_id}", token)
 
     # -------------------------------------------------------------------
     # Internal helpers

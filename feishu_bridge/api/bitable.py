@@ -46,24 +46,31 @@ class FeishuBitable(FeishuAPI):
     BASE_PATH = "/open-apis/bitable/v1"
 
     # -------------------------------------------------------------------
-    # Dispatch (Phase 1: read-only)
+    # Dispatch (full read+write)
     # -------------------------------------------------------------------
 
     _READ_ACTIONS = {"list_records", "get_record", "list_fields",
                      "list_views", "list_tables", "get_view"}
+    _WRITE_ACTIONS = {"create_records", "update_records", "delete_records",
+                      "create_table", "delete_table",
+                      "create_field", "update_field", "delete_field",
+                      "create_view", "patch_view", "delete_view",
+                      "create_app", "copy_app"}
+    _ALL_ACTIONS = _READ_ACTIONS | _WRITE_ACTIONS
 
     def dispatch(self, action: str, chat_id: str, sender_id: str,
                  **kwargs) -> dict:
         """统一入口，归一化返回 {ok, data/error}."""
         try:
-            if action not in self._READ_ACTIONS:
+            if action not in self._ALL_ACTIONS:
                 return {"ok": False, "error": "unsupported_action",
-                        "message": f"Phase 1 仅支持只读操作: "
-                        f"{', '.join(sorted(self._READ_ACTIONS))}"}
+                        "message": f"支持的操作: "
+                        f"{', '.join(sorted(self._ALL_ACTIONS))}"}
 
             app_token = kwargs.get("app_token", "")
             table_id = kwargs.get("table_id", "")
 
+            # Read
             if action == "list_tables":
                 result = self.list_tables(chat_id, sender_id, app_token)
             elif action == "list_records":
@@ -88,6 +95,73 @@ class FeishuBitable(FeishuAPI):
                 result = self.get_view(
                     chat_id, sender_id, app_token, table_id,
                     kwargs.get("view_id", ""))
+            # Write — Records
+            elif action == "create_records":
+                result = self.create_records(
+                    chat_id, sender_id, app_token, table_id,
+                    records=kwargs.get("records", []))
+            elif action == "update_records":
+                result = self.update_records(
+                    chat_id, sender_id, app_token, table_id,
+                    records=kwargs.get("records", []))
+            elif action == "delete_records":
+                result = self.delete_records(
+                    chat_id, sender_id, app_token, table_id,
+                    record_ids=kwargs.get("record_ids", []))
+            # Write — Table
+            elif action == "create_table":
+                result = self.create_table(
+                    chat_id, sender_id, app_token,
+                    name=kwargs.get("name", ""),
+                    fields=kwargs.get("fields"))
+            elif action == "delete_table":
+                result = self.delete_table(
+                    chat_id, sender_id, app_token, table_id)
+            # Write — Field
+            elif action == "create_field":
+                result = self.create_field(
+                    chat_id, sender_id, app_token, table_id,
+                    field_name=kwargs.get("field_name", ""),
+                    field_type=kwargs.get("field_type", 1),
+                    property_=kwargs.get("property_"))
+            elif action == "update_field":
+                result = self.update_field(
+                    chat_id, sender_id, app_token, table_id,
+                    field_id=kwargs.get("field_id", ""),
+                    field_name=kwargs.get("field_name"),
+                    field_type=kwargs.get("field_type"),
+                    property_=kwargs.get("property_"))
+            elif action == "delete_field":
+                result = self.delete_field(
+                    chat_id, sender_id, app_token, table_id,
+                    field_id=kwargs.get("field_id", ""))
+            # Write — View
+            elif action == "create_view":
+                result = self.create_view(
+                    chat_id, sender_id, app_token, table_id,
+                    view_name=kwargs.get("view_name", ""),
+                    view_type=kwargs.get("view_type", "grid"))
+            elif action == "patch_view":
+                result = self.patch_view(
+                    chat_id, sender_id, app_token, table_id,
+                    view_id=kwargs.get("view_id", ""),
+                    view_name=kwargs.get("view_name", ""))
+            elif action == "delete_view":
+                result = self.delete_view(
+                    chat_id, sender_id, app_token, table_id,
+                    view_id=kwargs.get("view_id", ""))
+            # Write — App
+            elif action == "create_app":
+                result = self.create_app(
+                    chat_id, sender_id,
+                    name=kwargs.get("name", ""),
+                    folder_token=kwargs.get("folder_token"))
+            elif action == "copy_app":
+                result = self.copy_app(
+                    chat_id, sender_id,
+                    app_token=app_token,
+                    name=kwargs.get("name"),
+                    folder_token=kwargs.get("folder_token"))
             else:
                 return {"ok": False, "error": "unsupported_action",
                         "message": f"未知 action: {action}"}
