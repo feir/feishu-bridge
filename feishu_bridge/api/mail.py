@@ -111,14 +111,14 @@ class FeishuMail(FeishuAPI):
             params["page_token"] = page_token
 
         list_data = self.request(
-            "GET", f"/user_mailboxes/me/messages", token, params=params,
+            "GET", "/user_mailboxes/me/messages", token, params=params,
         )
         msg_ids = list_data.get("items", [])
         if not msg_ids:
             return {"items": [], "has_more": False, "page_token": ""}
 
         batch_data = self.request(
-            "POST", f"/user_mailboxes/me/messages/batch_get", token,
+            "POST", "/user_mailboxes/me/messages/batch_get", token,
             json_body={"message_ids": msg_ids},
         )
         return {
@@ -135,7 +135,7 @@ class FeishuMail(FeishuAPI):
         if not token:
             return None
         data = self.request(
-            "GET", f"/user_mailboxes/me/messages/{message_id}", token,
+            "GET", "/user_mailboxes/me/messages/{message_id}", token,
         )
         items = data.get("items", [data])
         msg = items[0] if items else data
@@ -148,7 +148,7 @@ class FeishuMail(FeishuAPI):
         if not token:
             return None
         data = self.request(
-            "GET", f"/user_mailboxes/me/threads/{thread_id}", token,
+            "GET", "/user_mailboxes/me/threads/{thread_id}", token,
         )
         return {
             "thread_id": thread_id,
@@ -163,7 +163,7 @@ class FeishuMail(FeishuAPI):
         if not token:
             return None
         data = self.request(
-            "GET", f"/user_mailboxes/me/drafts", token,
+            "GET", "/user_mailboxes/me/drafts", token,
             params={"page_size": min(page_size, 50)},
         )
         return {
@@ -181,7 +181,7 @@ class FeishuMail(FeishuAPI):
         if not token:
             return None
         data = self.request(
-            "GET", f"/user_mailboxes/me/drafts/{draft_id}", token,
+            "GET", "/user_mailboxes/me/drafts/{draft_id}", token,
         )
         items = data.get("items", [data])
         d = items[0] if items else data
@@ -199,7 +199,7 @@ class FeishuMail(FeishuAPI):
         if not token:
             return None
         data = self.request(
-            "GET", f"/user_mailboxes/me/profile", token,
+            "GET", "/user_mailboxes/me/profile", token,
         )
         return {"email": data.get("primary_email_address", ""),
                 "name": data.get("user_name", "")}
@@ -220,7 +220,7 @@ class FeishuMail(FeishuAPI):
             html: True for HTML body, False for plain text
             send: if True, send immediately after creating draft
         """
-        token = self.get_token(chat_id, user_open_id)
+        token = self._get_write_token(chat_id, user_open_id)
         if not token:
             return None
         try:
@@ -229,7 +229,7 @@ class FeishuMail(FeishuAPI):
             return {"error": "eml_build_failed", "message": str(e)}
 
         data = self.request(
-            "POST", f"/user_mailboxes/me/drafts", token,
+            "POST", "/user_mailboxes/me/drafts", token,
             json_body={"raw": self._b64url(eml)},
         )
         items = data.get("items", [data])
@@ -241,7 +241,7 @@ class FeishuMail(FeishuAPI):
         if send and draft_id:
             self.request(
                 "POST",
-                f"/user_mailboxes/me/drafts/{draft_id}/send", token,
+                "/user_mailboxes/me/drafts/{draft_id}/send", token,
             )
             result["sent"] = True
 
@@ -252,14 +252,14 @@ class FeishuMail(FeishuAPI):
               html: bool = True, reply_all: bool = False,
               send: bool = False) -> Optional[dict]:
         """Reply to a message, save as draft (optionally send)."""
-        token = self.get_token(chat_id, user_open_id)
+        token = self._get_write_token(chat_id, user_open_id)
         if not token:
             return None
 
         # Fetch original message for subject/to
         try:
             data = self.request(
-                "GET", f"/user_mailboxes/me/messages/{message_id}", token,
+                "GET", "/user_mailboxes/me/messages/{message_id}", token,
             )
             items = data.get("items", [data])
             orig = items[0] if items else data
@@ -298,7 +298,7 @@ class FeishuMail(FeishuAPI):
             return {"error": "eml_build_failed", "message": str(e)}
 
         data = self.request(
-            "POST", f"/user_mailboxes/me/drafts", token,
+            "POST", "/user_mailboxes/me/drafts", token,
             json_body={"raw": self._b64url(eml)},
         )
         items = data.get("items", [data])
@@ -310,7 +310,7 @@ class FeishuMail(FeishuAPI):
         if send and draft_id:
             self.request(
                 "POST",
-                f"/user_mailboxes/me/drafts/{draft_id}/send", token,
+                "/user_mailboxes/me/drafts/{draft_id}/send", token,
             )
             result["sent"] = True
 
@@ -319,34 +319,34 @@ class FeishuMail(FeishuAPI):
     def send_draft(self, chat_id: str, user_open_id: str,
                    draft_id: str) -> Optional[dict]:
         """Send an existing draft."""
-        token = self.get_token(chat_id, user_open_id)
+        token = self._get_write_token(chat_id, user_open_id)
         if not token:
             return None
         self.request(
             "POST",
-            f"/user_mailboxes/me/drafts/{draft_id}/send", token,
+            "/user_mailboxes/me/drafts/{draft_id}/send", token,
         )
         return {"draft_id": draft_id, "sent": True}
 
     def delete_draft(self, chat_id: str, user_open_id: str,
                      draft_id: str) -> Optional[dict]:
         """Delete a draft."""
-        token = self.get_token(chat_id, user_open_id)
+        token = self._get_write_token(chat_id, user_open_id)
         if not token:
             return None
         self.request(
-            "DELETE", f"/user_mailboxes/me/drafts/{draft_id}", token,
+            "DELETE", "/user_mailboxes/me/drafts/{draft_id}", token,
         )
         return {"draft_id": draft_id, "deleted": True}
 
     def mark_read(self, chat_id: str, user_open_id: str,
                   message_id: str, read: bool = True) -> Optional[dict]:
         """Mark a message as read or unread."""
-        token = self.get_token(chat_id, user_open_id)
+        token = self._get_write_token(chat_id, user_open_id)
         if not token:
             return None
         self.request(
-            "PUT", f"/user_mailboxes/me/messages/{message_id}", token,
+            "PUT", "/user_mailboxes/me/messages/{message_id}", token,
             json_body={"read": read},
         )
         return {"message_id": message_id, "read": read}
