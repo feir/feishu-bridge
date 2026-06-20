@@ -3,10 +3,11 @@ Feishu Mail API wrapper — read mail messages and threads.
 
 All operations require user_access_token (UAT).
 
-Usage:
-    mail = FeishuMail(app_id, app_secret, lark_client)
-    messages = mail.triage(chat_id, user_open_id, query="keyword")
-    msg = mail.get_message(chat_id, user_open_id, message_id="xxx")
+API pattern (learned from lark CLI):
+  list   → GET  /user_mailboxes/me/messages      → returns base64 message IDs
+  batch  → POST /user_mailboxes/me/messages/batch_get → returns message objects
+  get    → GET  /user_mailboxes/me/messages/{id} → single message with body
+  thread → GET  /user_mailboxes/me/threads/{id}  → all messages in thread
 """
 
 import logging
@@ -36,9 +37,7 @@ class FeishuMail(FeishuAPI):
     # Dispatch (Phase 1: read-only)
     # -------------------------------------------------------------------
 
-    _READ_ACTIONS = {
-        "triage", "get_message", "get_thread",
-    }
+    _READ_ACTIONS = {"triage", "get_message", "get_thread"}
 
     def dispatch(self, action: str, chat_id: str, sender_id: str,
                  **kwargs) -> dict:
@@ -55,13 +54,11 @@ class FeishuMail(FeishuAPI):
                     query=kwargs.get("query"),
                     folder_id=kwargs.get("folder_id", "INBOX"),
                     page_size=kwargs.get("page_size", self.DEFAULT_PAGE_SIZE),
-                    page_token=kwargs.get("page_token"),
                 )
             elif action == "get_message":
                 result = self.get_message(
                     chat_id, sender_id,
                     kwargs.get("message_id", ""),
-                    html=kwargs.get("html", True),
                 )
             elif action == "get_thread":
                 result = self.get_thread(
@@ -84,38 +81,47 @@ class FeishuMail(FeishuAPI):
                     "message": str(e)}
 
     # -------------------------------------------------------------------
-    # Read operations
+    # triage — list summaries (list IDs → batch_get details)
     # -------------------------------------------------------------------
 
     def triage(self, chat_id: str, user_open_id: str,
                query: str = None, folder_id: str = "INBOX",
-               page_size: int = DEFAULT_PAGE_SIZE,
-               page_token: str = None) -> Optional[dict]:
-        """List mailbox messages (summary view).
+               page_size: int = DEFAULT_PAGE_SIZE) -> Optional[dict]:
+        """List mailbox message summaries.
 
-        Args:
-            query: full-text search query
-            folder_id: folder to list (default: INBOX)
-            page_size: messages per page
-            page_token: pagination cursor
+        Steps: list IDs → batch_get details → extract summary fields.
         """
         token = self.get_token(chat_id, user_open_id)
         if not token:
             return None
 
+        # Step 1: list message IDs
         params = {
             "page_size": min(page_size, 50),
+            "folder_id": folder_id,
         }
         if query:
             params["query"] = query
-        if page_token:
-            params["page_token"] = page_token
 
-        data = self.request("GET",
-            f"/user_mailboxes/{self.DEFAULT_MAILBOX}/messages", token, params=params)
+        list_data = self.request(
+            "GET",
+            f"/user_mailboxes/{self.DEFAULT_MAILBOX}/messages",
+            token, params=params,
+        )
 
-        items = data.get("items", [])
-        # Extract summary fields for each message
+        msg_ids = list_data.get("items", [])
+        if not msg_ids:
+            return {"items": [], "has_more": False, "page_token": ""}
+
+        # Step 2: batch_get details
+        batch_data = self.request(
+            "POST",
+            f"/user_mailboxes/{self.DEFAULT_MAILBOX}/messages/batch_get",
+            token,
+            json_body={"message_ids": msg_ids},
+        )
+
+        items = batch_data.get("items", [])
         summaries = []
         for msg in items:
             summaries.append({
@@ -131,39 +137,29 @@ class FeishuMail(FeishuAPI):
 
         return {
             "items": summaries,
-            "has_more": data.get("has_more", False),
-            "page_token": data.get("page_token", ""),
+            "has_more": list_data.get("has_more", False),
+            "page_token": list_data.get("page_token", ""),
         }
 
-    def get_message(self, chat_id: str, user_open_id: str,
-                    message_id: str, html: bool = True) -> Optional[dict]:
-        """Get a single mail message with full content.
+    # -------------------------------------------------------------------
+    # get_message — single message with body
+    # -------------------------------------------------------------------
 
-        Args:
-            message_id: opaque message ID
-            html: return HTML body (True) or plain text (False)
-        """
+    def get_message(self, chat_id: str, user_open_id: str,
+                    message_id: str) -> Optional[dict]:
+        """Get a single mail message with full content."""
         token = self.get_token(chat_id, user_open_id)
         if not token:
             return None
 
-        result = self.request(
+        data = self.request(
             "GET",
             f"/user_mailboxes/{self.DEFAULT_MAILBOX}/messages/{message_id}",
             token,
-            params={},
         )
 
-        # Extract the message item from the envelope
-        items = result.get("items", [result])
-        msg = items[0] if items else result
-
-        body = msg.get("body", {})
-        body_text = ""
-        if html:
-            body_text = body.get("html", body.get("content", ""))
-        else:
-            body_text = body.get("text", body.get("plain_text", ""))
+        items = data.get("items", [data])
+        msg = items[0] if items else data
 
         return {
             "message_id": msg.get("message_id", message_id),
@@ -173,10 +169,13 @@ class FeishuMail(FeishuAPI):
             "from": self._extract_from(msg),
             "to": self._extract_to(msg),
             "cc": self._extract_address_list(msg.get("cc", [])),
-            "body": self._decode_base64_body(body_text),
+            "body_text": msg.get("body_plain_text", ""),
             "has_attachments": bool(msg.get("has_attachment")),
-            "attachments": self._extract_attachments(msg),
         }
+
+    # -------------------------------------------------------------------
+    # get_thread — all messages in a conversation
+    # -------------------------------------------------------------------
 
     def get_thread(self, chat_id: str, user_open_id: str,
                    thread_id: str) -> Optional[dict]:
@@ -185,99 +184,56 @@ class FeishuMail(FeishuAPI):
         if not token:
             return None
 
-        result = self.request(
+        data = self.request(
             "GET",
             f"/user_mailboxes/{self.DEFAULT_MAILBOX}/threads/{thread_id}",
             token,
         )
 
-        items = result.get("items", [])
+        items = data.get("items", [])
         messages = []
         for msg in items:
-            body = msg.get("body", {})
             messages.append({
                 "message_id": msg.get("message_id", ""),
                 "subject": msg.get("subject", ""),
                 "date": msg.get("internal_date", ""),
                 "from": self._extract_from(msg),
                 "to": self._extract_to(msg),
-                "body_text": self._decode_base64_body(
-                    body.get("text", body.get("plain_text", ""))
-                ),
+                "body_text": msg.get("body_plain_text", ""),
             })
 
-        return {
-            "thread_id": thread_id,
-            "messages": messages,
-            "count": len(messages),
-        }
+        return {"thread_id": thread_id, "messages": messages,
+                "count": len(messages)}
 
     # -------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------
 
     @staticmethod
-    def _decode_base64_body(text: str) -> str:
-        """Decode base64url-encoded body if needed. Passes through plain text."""
-        if not text or not isinstance(text, str):
-            return text or ""
-        # Feishu mail API may return base64url-encoded bodies
-        import base64
-        try:
-            # Add padding if needed
-            padding = 4 - len(text) % 4
-            if padding != 4:
-                text += "=" * padding
-            decoded = base64.urlsafe_b64decode(text)
-            return decoded.decode("utf-8", errors="replace")
-        except Exception:
-            return text
-
-    @staticmethod
     def _extract_from(msg: dict) -> dict:
-        """Extract from address."""
         frm = msg.get("from", [])
         if not frm:
             return {}
         addr = frm[0] if isinstance(frm, list) else frm
-        addr = addr.get("from", addr) if isinstance(addr, dict) else {}
-        return {
-            "name": addr.get("name", "") or addr.get("address_name", ""),
-            "address": addr.get("address", "") or addr.get("mail_address", ""),
-        }
+        if not isinstance(addr, dict):
+            return {}
+        return {"name": addr.get("name", ""),
+                "address": addr.get("mail_address",
+                                     addr.get("address", ""))}
 
     @staticmethod
     def _extract_to(msg: dict) -> list:
-        """Extract to addresses."""
-        to_list = msg.get("to", [])
-        return FeishuMail._extract_address_list(to_list)
+        return FeishuMail._extract_address_list(msg.get("to", []))
 
     @staticmethod
     def _extract_address_list(addr_list: list) -> list:
-        """Normalize address list."""
         if not addr_list or not isinstance(addr_list, list):
             return []
         result = []
         for a in addr_list:
             if isinstance(a, dict):
                 result.append({
-                    "name": a.get("name", "") or a.get("address_name", ""),
-                    "address": a.get("address", "") or a.get("mail_address", ""),
-                })
-        return result
-
-    @staticmethod
-    def _extract_attachments(msg: dict) -> list:
-        """Extract attachment metadata."""
-        atts = msg.get("attachments", [])
-        if not atts or not isinstance(atts, list):
-            return []
-        result = []
-        for a in atts:
-            if isinstance(a, dict):
-                result.append({
-                    "name": a.get("name", a.get("attachment_name", "")),
-                    "size": a.get("size", 0),
-                    "type": a.get("type", a.get("mime_type", "application/octet-stream")),
+                    "name": a.get("name", ""),
+                    "address": a.get("mail_address", a.get("address", "")),
                 })
         return result
