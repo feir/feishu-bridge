@@ -108,8 +108,8 @@ class FeishuCalendar(FeishuAPI):
         Defaults to today (00:00–23:59 Asia/Shanghai) if start/end not given.
 
         Args:
-            start: ISO 8601 start time
-            end: ISO 8601 end time
+            start: Unix timestamp (string) or ISO 8601
+            end: Unix timestamp (string) or ISO 8601
             calendar_id: calendar ID (defaults to primary)
         """
         token = self.get_token(chat_id, user_open_id)
@@ -123,10 +123,9 @@ class FeishuCalendar(FeishuAPI):
                         "message": "无法获取主日历"}
             calendar_id = cal.get("calendar_id", "")
 
-        if not start:
-            start = datetime.now(TZ_SHANGHAI).strftime("%Y-%m-%dT00:00+08:00")
-        if not end:
-            end = datetime.now(TZ_SHANGHAI).strftime("%Y-%m-%dT23:59+08:00")
+        # Normalize to Unix timestamps (API requires integer strings)
+        start = self._to_timestamp(start, default_hour=0)
+        end = self._to_timestamp(end, default_hour=23, default_minute=59, default_second=59)
 
         params = {
             "page_size": page_size,
@@ -268,6 +267,32 @@ class FeishuCalendar(FeishuAPI):
     # -------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------
+
+    @staticmethod
+    def _to_timestamp(value: str = None, *, default_hour: int = 0,
+                     default_minute: int = 0, default_second: int = 0) -> str:
+        """Normalize time input to Unix timestamp string.
+
+        Accepts ISO 8601 or existing integer timestamps. Returns
+        today's boundary if value is None.
+        """
+        if value is None:
+            now = datetime.now(TZ_SHANGHAI)
+            dt = now.replace(hour=default_hour, minute=default_minute,
+                             second=default_second, microsecond=0)
+            return str(int(dt.timestamp()))
+        # Already a numeric timestamp
+        if isinstance(value, str) and value.lstrip('-').isdigit():
+            return value
+        # ISO 8601 → timestamp
+        try:
+            from datetime import datetime as _dt
+            # Handle timezone offset in ISO format
+            val = value.replace('Z', '+00:00')
+            dt = _dt.fromisoformat(val)
+            return str(int(dt.timestamp()))
+        except (ValueError, TypeError):
+            return value  # pass through as-is, let API reject
 
     def _get_primary_calendar(self, token: str) -> Optional[dict]:
         """Resolve primary calendar ID.
