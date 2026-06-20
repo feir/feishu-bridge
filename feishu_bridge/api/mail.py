@@ -104,7 +104,6 @@ class FeishuMail(FeishuAPI):
             return None
 
         params = {
-            "user_mailbox_id": self.DEFAULT_MAILBOX,
             "page_size": min(page_size, 50),
         }
         if query:
@@ -112,7 +111,8 @@ class FeishuMail(FeishuAPI):
         if page_token:
             params["page_token"] = page_token
 
-        data = self.request("GET", "/messages", token, params=params)
+        data = self.request("GET",
+            f"/users/{self.DEFAULT_MAILBOX}/messages", token, params=params)
 
         items = data.get("items", [])
         # Extract summary fields for each message
@@ -148,8 +148,10 @@ class FeishuMail(FeishuAPI):
             return None
 
         result = self.request(
-            "GET", f"/messages/{message_id}", token,
-            params={"user_mailbox_id": self.DEFAULT_MAILBOX},
+            "GET",
+            f"/users/{self.DEFAULT_MAILBOX}/messages/{message_id}",
+            token,
+            params={},
         )
 
         # Extract the message item from the envelope
@@ -184,8 +186,9 @@ class FeishuMail(FeishuAPI):
             return None
 
         result = self.request(
-            "GET", f"/threads/{thread_id}", token,
-            params={"user_mailbox_id": self.DEFAULT_MAILBOX},
+            "GET",
+            f"/users/{self.DEFAULT_MAILBOX}/threads/{thread_id}",
+            token,
         )
 
         items = result.get("items", [])
