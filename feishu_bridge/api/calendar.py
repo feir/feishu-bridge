@@ -270,10 +270,16 @@ class FeishuCalendar(FeishuAPI):
     # -------------------------------------------------------------------
 
     def _get_primary_calendar(self, token: str) -> Optional[dict]:
-        """Resolve primary calendar ID."""
+        """Resolve primary calendar ID.
+
+        Returns dict with 'calendar_id' key, or None.
+        """
         try:
             data = self.request("POST", "/calendars/primary", token, json_body={})
-            return data.get("calendars", [{}])[0] if data else None
+            calendars = data.get("calendars", [])
+            if not calendars:
+                return None
+            return calendars[0].get("calendar", calendars[0])
         except Exception:
             log.warning("Failed to resolve primary calendar", exc_info=True)
             return None
