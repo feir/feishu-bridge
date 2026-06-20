@@ -80,6 +80,7 @@ from feishu_bridge.api.tasks import FeishuTasks
 from feishu_bridge.api.docs import FeishuDocs
 from feishu_bridge.api.sheets import FeishuSheets
 from feishu_bridge.api.bitable import FeishuBitable
+from feishu_bridge.api.calendar import FeishuCalendar
 
 _FEISHU_SERVICES_OK = True  # All deps are declared in pyproject.toml
 
@@ -786,11 +787,13 @@ class FeishuBot:
             self.feishu_docs = FeishuDocs(*_args)
             self.feishu_sheets = FeishuSheets(*_args)
             self.feishu_bitable = FeishuBitable(*_args)
+            self.feishu_calendar = FeishuCalendar(*_args)
         else:
             self.feishu_tasks = None
             self.feishu_docs = None
             self.feishu_sheets = None
             self.feishu_bitable = None
+            self.feishu_calendar = None
             log.warning("Feishu API services unavailable (missing dependencies)")
 
     def _reconcile_startup_config(self, state: RuntimeState) -> None:

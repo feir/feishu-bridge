@@ -287,6 +287,7 @@ def _build_dispatcher(bot: FeishuBot, log_buffer) -> dict[str, Any]:
             "sheets": bot.feishu_sheets,
             "docs": bot.feishu_docs,
             "bitable": bot.feishu_bitable,
+            "calendar": bot.feishu_calendar,
         }
         wrapper = wrapper_map.get(service)
         if wrapper is None:
