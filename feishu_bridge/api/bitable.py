@@ -46,6 +46,61 @@ class FeishuBitable(FeishuAPI):
     BASE_PATH = "/open-apis/bitable/v1"
 
     # -------------------------------------------------------------------
+    # Dispatch (Phase 1: read-only)
+    # -------------------------------------------------------------------
+
+    _READ_ACTIONS = {"list_records", "get_record", "list_fields",
+                     "list_views", "list_tables", "get_view"}
+
+    def dispatch(self, action: str, chat_id: str, sender_id: str,
+                 **kwargs) -> dict:
+        """统一入口，归一化返回 {ok, data/error}."""
+        try:
+            if action not in self._READ_ACTIONS:
+                return {"ok": False, "error": "unsupported_action",
+                        "message": f"Phase 1 仅支持只读操作: "
+                        f"{', '.join(sorted(self._READ_ACTIONS))}"}
+
+            app_token = kwargs.get("app_token", "")
+            table_id = kwargs.get("table_id", "")
+
+            if action == "list_tables":
+                result = self.list_tables(chat_id, sender_id, app_token)
+            elif action == "list_records":
+                result = self.list_records(
+                    chat_id, sender_id, app_token, table_id,
+                    filter_=kwargs.get("filter"),
+                    sort=kwargs.get("sort"),
+                    field_names=kwargs.get("field_names"),
+                    page_size=kwargs.get("page_size", DEFAULT_PAGE_SIZE),
+                    page_token=kwargs.get("page_token"))
+            elif action == "get_record":
+                result = self.get_record(
+                    chat_id, sender_id, app_token, table_id,
+                    kwargs.get("record_id", ""))
+            elif action == "list_fields":
+                result = self.list_fields(
+                    chat_id, sender_id, app_token, table_id)
+            elif action == "list_views":
+                result = self.list_views(
+                    chat_id, sender_id, app_token, table_id)
+            elif action == "get_view":
+                result = self.get_view(
+                    chat_id, sender_id, app_token, table_id,
+                    kwargs.get("view_id", ""))
+            else:
+                return {"ok": False, "error": "unsupported_action",
+                        "message": f"未知 action: {action}"}
+
+            if result is None:
+                return {"ok": False, "error": "auth_failed"}
+            return {"ok": True, "data": result}
+        except Exception as e:
+            log.exception("Bitable dispatch error: action=%s", action)
+            return {"ok": False, "error": "internal_error",
+                    "message": str(e)}
+
+    # -------------------------------------------------------------------
     # App (Bitable) operations
     # -------------------------------------------------------------------
 

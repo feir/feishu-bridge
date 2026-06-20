@@ -9,6 +9,7 @@ import threading
 import uuid
 from pathlib import Path
 
+from feishu_bridge.bg_paths import bg_home
 from feishu_bridge.parsers import (
     download_file,
     download_image,
@@ -1200,17 +1201,21 @@ def process_message(
             text = "\n".join(prompt_parts)
 
         # --- Env injection for hooks and CLI tools ---
+        bg_root = bg_home()
         env_extra = {
             "FEISHU_CHAT_ID": chat_id,
             "FEISHU_BOT_ID": bot_id,
             "FEISHU_THREAD_ID": thread_id or "",
+            "FEISHU_USER_OPEN_ID": sender_id,
+            "FEISHU_BOT_NAME": bot_config.get("name", ""),
+            "FEISHU_CONTROL_SOCKET": str(bg_root / f"control-{bot_id}.sock"),
+            "FEISHU_CONTROL_TOKEN": str(bg_root / f"control-{bot_id}.token"),
         }
         try:
             if feishu_docs and runner.wants_auth_file():
                 cli_token = feishu_docs.get_cached_token(sender_id)
                 auth_file_path = _write_auth_file(chat_id, sender_id, cli_token)
                 env_extra["FEISHU_AUTH_FILE"] = auth_file_path
-                env_extra["FEISHU_BOT_NAME"] = bot_config.get("name", "")
         except Exception:
             log.warning("Failed to create auth file for CLI", exc_info=True)
 

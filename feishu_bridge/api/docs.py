@@ -29,6 +29,39 @@ class FeishuDocs(FeishuAPI):
     ]
     # No BASE_PATH — docs use MCP, not OAPI directly
 
+    # -------------------------------------------------------------------
+    # Dispatch (Phase 1: read-only)
+    # -------------------------------------------------------------------
+
+    _READ_ACTIONS = {"fetch"}
+
+    def dispatch(self, action: str, chat_id: str, sender_id: str,
+                 **kwargs) -> dict:
+        """统一入口，归一化返回 {ok, data/error}."""
+        try:
+            if action not in self._READ_ACTIONS:
+                return {"ok": False, "error": "unsupported_action",
+                        "message": f"Phase 1 仅支持只读操作: "
+                        f"{', '.join(sorted(self._READ_ACTIONS))}"}
+
+            if action == "fetch":
+                result = self.fetch(
+                    chat_id, sender_id,
+                    doc_id=kwargs.get("doc_id", ""),
+                    offset=kwargs.get("offset"),
+                    limit=kwargs.get("limit"))
+            else:
+                return {"ok": False, "error": "unsupported_action",
+                        "message": f"未知 action: {action}"}
+
+            if result is None:
+                return {"ok": False, "error": "auth_failed"}
+            return {"ok": True, "data": result}
+        except Exception as e:
+            log.exception("Docs dispatch error: action=%s", action)
+            return {"ok": False, "error": "internal_error",
+                    "message": str(e)}
+
     def fetch(self, chat_id: str, user_open_id: str,
               doc_id: str, offset: int = None,
               limit: int = None, *,

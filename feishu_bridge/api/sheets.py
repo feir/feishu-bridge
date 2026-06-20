@@ -45,6 +45,42 @@ class FeishuSheets(FeishuAPI):
                             params=params, json_body=json_body)
 
     # -------------------------------------------------------------------
+    # Dispatch (Phase 1: read-only)
+    # -------------------------------------------------------------------
+
+    _READ_ACTIONS = {"info", "read"}
+
+    def dispatch(self, action: str, chat_id: str, sender_id: str,
+                 **kwargs) -> dict:
+        """统一入口，归一化返回 {ok, data/error}."""
+        try:
+            if action not in self._READ_ACTIONS:
+                return {"ok": False, "error": "unsupported_action",
+                        "message": f"Phase 1 仅支持只读操作: "
+                        f"{', '.join(sorted(self._READ_ACTIONS))}"}
+
+            if action == "info":
+                result = self.info(
+                    chat_id, sender_id,
+                    spreadsheet_token=kwargs.get("spreadsheet_token", ""))
+            elif action == "read":
+                result = self.read(
+                    chat_id, sender_id,
+                    spreadsheet_token=kwargs.get("spreadsheet_token", ""),
+                    range_=kwargs.get("range", ""))
+            else:
+                return {"ok": False, "error": "unsupported_action",
+                        "message": f"未知 action: {action}"}
+
+            if result is None:
+                return {"ok": False, "error": "auth_failed"}
+            return {"ok": True, "data": result}
+        except Exception as e:
+            log.exception("Sheets dispatch error: action=%s", action)
+            return {"ok": False, "error": "internal_error",
+                    "message": str(e)}
+
+    # -------------------------------------------------------------------
     # Read operations
     # -------------------------------------------------------------------
 

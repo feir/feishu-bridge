@@ -411,6 +411,49 @@ class FeishuTasks(FeishuAPI):
                             json_body={"tasklist_guid": tasklist_guid})
 
     # -------------------------------------------------------------------
+    # Dispatch (Phase 1: read-only)
+    # -------------------------------------------------------------------
+
+    _READ_ACTIONS = {"list_tasks", "get_task", "list_subtasks",
+                     "list_tasklists", "summary"}
+
+    def dispatch(self, action: str, chat_id: str, sender_id: str,
+                 **kwargs) -> dict:
+        """统一入口，归一化返回 {ok, data/error}."""
+        try:
+            if action not in self._READ_ACTIONS:
+                return {"ok": False, "error": "unsupported_action",
+                        "message": f"Phase 1 仅支持只读操作: "
+                        f"{', '.join(sorted(self._READ_ACTIONS))}"}
+
+            if action == "list_tasks":
+                result = self.list_tasks(chat_id, sender_id, **kwargs)
+            elif action == "get_task":
+                result = self.get_task(
+                    chat_id, sender_id, kwargs.get("task_guid", ""))
+            elif action == "list_subtasks":
+                result = self.list_subtasks(
+                    chat_id, sender_id, kwargs.get("task_guid", ""))
+            elif action == "list_tasklists":
+                result = self.list_tasklists(chat_id, sender_id)
+            elif action == "summary":
+                result = self.summary(chat_id, sender_id)
+            else:
+                return {"ok": False, "error": "unsupported_action",
+                        "message": f"未知 action: {action}"}
+
+            if isinstance(result, dict) and "error" in result:
+                return {"ok": False, "error": result["error"],
+                        "data": result}
+            if result is None:
+                return {"ok": False, "error": "auth_failed"}
+            return {"ok": True, "data": result}
+        except Exception as e:
+            log.exception("Tasks dispatch error: action=%s", action)
+            return {"ok": False, "error": "internal_error",
+                    "message": str(e)}
+
+    # -------------------------------------------------------------------
     # Convenience
     # -------------------------------------------------------------------
 

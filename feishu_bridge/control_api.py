@@ -29,7 +29,7 @@ API_VERSION = 1
 
 _CAPABILITIES = (
     "logs", "quota", "sessions", "provider", "model", "agent",
-    "stop", "tasks",
+    "stop", "tasks", "call_service",
 )
 
 
@@ -257,6 +257,45 @@ def _build_dispatcher(bot: FeishuBot, log_buffer) -> dict[str, Any]:
             raise _RPCError(400, msg)
         return {"ok": True, "message": msg, "command": cmd}
 
+    # -- service methods ----------------------------------------------------
+
+    def _call_service(params: dict) -> dict:
+        chat_id = params.get("chat_id", "")
+        sender_id = params.get("sender_id", "")
+        service = params.get("service", "")
+        action = params.get("action", "")
+        args = params.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
+
+        # 权限校验：chat_id 必须在活跃会话中
+        active_chats: set[str] = set()
+        with bot.session_map._lock:
+            for key in bot.session_map._data:
+                if key == bot.session_map._AGENT_TYPE_KEY:
+                    continue
+                parts = key.split(":", 2)
+                if len(parts) >= 2:
+                    active_chats.add(parts[1])
+        if chat_id not in active_chats:
+            return {"ok": False, "error": "unauthorized",
+                    "message": "会话未激活或已过期"}
+
+        # 路由到对应 wrapper
+        wrapper_map = {
+            "tasks": bot.feishu_tasks,
+            "sheets": bot.feishu_sheets,
+            "docs": bot.feishu_docs,
+            "bitable": bot.feishu_bitable,
+        }
+        wrapper = wrapper_map.get(service)
+        if wrapper is None:
+            return {"ok": False, "error": "unknown_service",
+                    "message": f"不支持的服务: {service}，"
+                    f"可用: {', '.join(sorted(wrapper_map))}"}
+
+        return wrapper.dispatch(action, chat_id, sender_id, **args)
+
     # -- session-level methods ----------------------------------------------
 
     def _stop_session(params: dict) -> dict:
@@ -317,6 +356,7 @@ def _build_dispatcher(bot: FeishuBot, log_buffer) -> dict[str, Any]:
         "quota": _quota,
         "logs": _logs,
         "tasks": _tasks,
+        "call_service": _call_service,
         "set_provider": _set_provider,
         "set_model": _set_model,
         "set_agent": _set_agent,
